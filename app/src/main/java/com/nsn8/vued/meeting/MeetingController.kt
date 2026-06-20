@@ -1,6 +1,7 @@
 package com.nsn8.vued.meeting
 
 import android.content.Context
+import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.net.OutboundQueue
@@ -74,6 +75,9 @@ object MeetingController {
         val meeting = active ?: error("No active meeting.")
         val buffer = rolling ?: error("Ambient buffer not running.")
         val endMs = System.currentTimeMillis()
+        // Resume ambient from here so it doesn't re-flush the meeting window as ambient.
+        // Done before the export so it holds even if this meeting captured no audio.
+        AmbientFlusher.resumeAfter(endMs)
 
         // Finalize the in-progress segment so the meeting tail is on disk, then export.
         buffer.flush()
