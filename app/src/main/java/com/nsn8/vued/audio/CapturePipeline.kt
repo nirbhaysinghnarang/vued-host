@@ -1,0 +1,46 @@
+package com.nsn8.vued.audio
+
+import com.nsn8.vued.capture.Uma8Capture
+import java.io.File
+import kotlin.math.abs
+
+/**
+ * The Phase-1 audio chain: UMA-8 interleaved PCM → mono downmix → anti-aliased
+ * 48→16 kHz → 30 s AAC/M4A rolling segments. [process] is the `onPcm` callback fed
+ * by [Uma8Capture]; it must run synchronously on the capture thread.
+ */
+class CapturePipeline(segmentsDir: File) {
+
+    private val downmixer = Downmixer(Uma8Capture.OUT_CHANNELS)
+    private val resampler = Resampler48to16()
+    private val rolling = RollingBuffer(segmentsDir)
+
+    /** The live rolling buffer, so the meeting flow can flush + export windows. */
+    val rollingBuffer: RollingBuffer get() = rolling
+
+    /** Peak amplitude (0..1) of the most recently processed 16 kHz block. */
+    @Volatile
+    var peak: Float = 0f
+        private set
+
+    fun process(buffer: ByteArray, length: Int) {
+        val frames = downmixer.frameCount(length)
+        if (frames == 0) return
+        val mono = downmixer.toMonoFloat(buffer, length)
+        val outCount = resampler.process(mono, frames)
+
+        var p = 0f
+        for (i in 0 until outCount) {
+            val a = abs(resampler.output[i])
+            if (a > p) p = a
+        }
+        peak = p
+
+        rolling.append(resampler.output, outCount)
+    }
+
+    val segmentCount: Int get() = rolling.segmentCount
+    val lastSegmentPath: String? get() = rolling.lastSegmentPath
+
+    fun close() = rolling.close()
+}

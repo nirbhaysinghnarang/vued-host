@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Vued</string>
+    <string name="device_admin_description">Allows Vued to run as a locked-down single-purpose recording kiosk.</string>
+</resources>
