@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -68,6 +69,10 @@ private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep the screen on so the FULL_LOW_LATENCY Wi-Fi lock stays effective
+        // (it only suppresses power-save while foreground + screen on) — the radio
+        // then answers LAN decrypt/health requests promptly instead of dozing.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         VuedAuth.init(applicationContext)
         enableEdgeToEdge()
         setContent {
