@@ -194,10 +194,13 @@ Java_com_nsn8_vued_capture_NativeUsbReader_pollStream(
                     const uint8_t* frame_ptr =
                         buffer + packet_offset + frame * stream->frame_bytes;
                     for (int channel = 0; channel < stream->out_channels; ++channel) {
-                        const int32_t raw = read_i32_le(frame_ptr + channel * 4);
-                        const int32_t scaled =
-                            static_cast<int32_t>(static_cast<uint32_t>(raw) << 8);
-                        std::memcpy(out_ptr + written, &scaled, 4);
+                        // UAC2 stores the 24-bit sample left-justified (MSB-aligned)
+                        // in the 4-byte subslot, so `raw` is already at full 32-bit
+                        // scale. Do NOT shift it up again — that would multiply by 256
+                        // (+48 dB) and integer-overflow/wrap on peaks. RAW-mode makeup
+                        // gain is applied cleanly (with clamping) downstream in Kotlin.
+                        const int32_t sample = read_i32_le(frame_ptr + channel * 4);
+                        std::memcpy(out_ptr + written, &sample, 4);
                         written += 4;
                     }
                 }

@@ -29,7 +29,7 @@ class Downmixer(private val channels: Int) {
                 sum += int32Le(buffer, offset)
                 offset += 4
             }
-            scratch[frame] = (sum / channels / INT32_FULL_SCALE).toFloat()
+            scratch[frame] = (sum / channels / INT32_FULL_SCALE * MAKEUP_GAIN).toFloat()
         }
         return scratch
     }
@@ -45,5 +45,13 @@ class Downmixer(private val channels: Int) {
 
     private companion object {
         const val INT32_FULL_SCALE = 2_147_483_648.0 // 2^31
+
+        // RAW-mode makeup gain. The UMA-8 applies NO gain in RAW mode (per the
+        // manual — gain/AGC only happens in DSP mode), so the MEMS signal is very
+        // low level and needs digital makeup gain. Applied here in float so the
+        // RollingBuffer's clamp limits peaks cleanly. Tune via the on-screen peak
+        // meter so normal speech peaks land around -12 dBFS (≈0.25); raise if too
+        // quiet, lower if it clips. ~+36 dB; sane starting point for far-field RAW.
+        const val MAKEUP_GAIN = 64.0
     }
 }
