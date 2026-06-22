@@ -83,6 +83,8 @@ object AmbientFlusher {
         }
         val sliceId = UUID.randomUUID().toString()
         val durationSecs = export.durationMs / 1000.0
+        // Device-orchestrated STT (flag-gated): transcribe + seal locally in the
+        // background. Read the bytes now, before enqueue consumes `out`.
         // Durably enqueue BEFORE any network — this consumes `out` and is the commit point.
         OutboundQueue.enqueueAmbient(context, sliceId, sessionId, windowStart / 1000.0, windowEnd / 1000.0, durationSecs, out)
         lastFlushMs = windowEnd

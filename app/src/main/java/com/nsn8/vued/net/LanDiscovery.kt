@@ -1,66 +1,103 @@
 package com.nsn8.vued.net
 
 import android.content.Context
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.util.Log
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.util.Collections
+import javax.jmdns.JmDNS
+import javax.jmdns.ServiceInfo
+import kotlin.concurrent.thread
 
 /**
  * Advertises the on-device decrypt gateway over mDNS/Bonjour so other LAN
- * devices can find it without knowing the phone's IP. Service type is the
- * custom `_vued._tcp.`; browse for that to discover the host + port.
+ * devices (the web dashboard's OS resolver) can reach it by a stable name
+ * instead of the DHCP-ephemeral IP.
  *
- * Registration is best-effort: a failure is logged, not fatal — the server
- * still serves, callers just have to reach it by IP.
+ * Uses JmDNS rather than Android's [android.net.nsd.NsdManager] for one reason:
+ * NsdManager won't tell us the device's mDNS hostname (resolve hands back an
+ * InetAddress whose name is just the IP), whereas JmDNS lets us *set* the host
+ * name we publish and *read it back* (with conflict-resolution suffix) — so the
+ * gateway can register a real `<host>.local` URL.
+ *
+ * Requires a Wi-Fi multicast lock; without it Android drops the inbound mDNS
+ * queries and nothing on the LAN can resolve us. Best-effort: a failure is
+ * logged and the callback gets null (the gateway then falls back to its IP).
  */
 class LanDiscovery(context: Context) {
 
-    private val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
-    private var listener: NsdManager.RegistrationListener? = null
+    private val appContext = context.applicationContext
+    private var jmdns: JmDNS? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
-    fun register(serviceName: String, port: Int) {
+    /**
+     * Publishes `_vued._tcp` on [port] under host [hostName] (→ `<hostName>.local`).
+     *
+     * @param onHostResolved invoked off the main thread with the actual published
+     *   host (e.g. `vued-recorder.local`, or `vued-recorder-2.local` if the name
+     *   was already taken), or null if registration failed.
+     */
+    fun register(hostName: String, port: Int, onHostResolved: ((String?) -> Unit)? = null) {
         unregister()
-        val info = NsdServiceInfo().apply {
-            this.serviceName = serviceName
-            this.serviceType = SERVICE_TYPE
-            this.port = port
-        }
-        val l = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(s: NsdServiceInfo) {
-                Log.i(TAG, "registered ${s.serviceName} ($SERVICE_TYPE) on :$port")
+        // JmDNS.create + registerService do blocking network IO — keep off main.
+        thread(name = "vued-mdns") {
+            try {
+                val wifi = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                multicastLock = wifi.createMulticastLock("vued-mdns").apply {
+                    setReferenceCounted(true)
+                    acquire()
+                }
+                val addr = lanInet4()
+                val jm = JmDNS.create(addr, hostName)
+                jmdns = jm
+                val info = ServiceInfo.create(SERVICE_TYPE, hostName, port, "")
+                jm.registerService(info)
+                val host = info.server?.trim()?.removeSuffix(".")?.takeIf { it.isNotBlank() }
+                Log.i(TAG, "registered $SERVICE_TYPE host=$host :$port (bind=${addr?.hostAddress})")
+                onHostResolved?.invoke(host)
+            } catch (e: Throwable) {
+                Log.e(TAG, "jmdns register failed: ${e.message}", e)
+                onHostResolved?.invoke(null)
             }
-            override fun onRegistrationFailed(s: NsdServiceInfo, code: Int) {
-                Log.e(TAG, "registration failed: $code")
-            }
-            override fun onServiceUnregistered(s: NsdServiceInfo) {
-                Log.i(TAG, "unregistered ${s.serviceName}")
-            }
-            override fun onUnregistrationFailed(s: NsdServiceInfo, code: Int) {
-                Log.e(TAG, "unregistration failed: $code")
-            }
-        }
-        listener = l
-        try {
-            nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l)
-        } catch (e: Exception) {
-            Log.e(TAG, "registerService threw: ${e.message}", e)
-            listener = null
         }
     }
 
     fun unregister() {
-        listener?.let {
+        val jm = jmdns
+        jmdns = null
+        val lock = multicastLock
+        multicastLock = null
+        if (jm == null && lock == null) return
+        thread(name = "vued-mdns-stop") {
             try {
-                nsd.unregisterService(it)
+                jm?.unregisterAllServices()
+                jm?.close()
             } catch (e: Exception) {
-                Log.w(TAG, "unregisterService threw: ${e.message}")
+                Log.w(TAG, "jmdns close threw: ${e.message}")
+            }
+            try {
+                lock?.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "multicast lock release threw: ${e.message}")
             }
         }
-        listener = null
+    }
+
+    /** Site-local IPv4 to bind JmDNS to (the LAN interface the dashboard reaches). */
+    private fun lanInet4(): Inet4Address? = try {
+        Collections.list(NetworkInterface.getNetworkInterfaces())
+            .asSequence()
+            .filter { runCatching { it.isUp && !it.isLoopback }.getOrDefault(false) }
+            .flatMap { Collections.list(it.inetAddresses).asSequence() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress }
+    } catch (e: Exception) {
+        null
     }
 
     companion object {
-        const val SERVICE_TYPE = "_vued._tcp."
+        const val SERVICE_TYPE = "_vued._tcp.local."
         private const val TAG = "VuedLanDiscovery"
     }
 }

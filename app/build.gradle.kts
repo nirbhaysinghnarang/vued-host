@@ -60,6 +60,7 @@ dependencies {
     implementation(libs.tink.android)
     implementation(libs.okhttp)
     implementation(libs.nanohttpd)
+    implementation(libs.jmdns)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

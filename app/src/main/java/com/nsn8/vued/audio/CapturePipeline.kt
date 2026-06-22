@@ -36,6 +36,11 @@ class CapturePipeline(segmentsDir: File) {
         }
         peak = p
 
+        // Speaker-enrollment tap: when armed, the recorder receives the same
+        // 16 kHz UMA-8 frames the rolling buffer gets. Output is reused, so the
+        // sink must copy what it keeps. Runs on the capture thread; keep it light.
+        EnrollmentTap.sink?.invoke(resampler.output, outCount)
+
         rolling.append(resampler.output, outCount)
     }
 

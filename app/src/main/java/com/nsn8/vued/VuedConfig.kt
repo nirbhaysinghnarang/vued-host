@@ -11,4 +11,9 @@ object VuedConfig {
 
     // Stateless STT / API backend (prod). Swap for -staging / -dev as needed.
     const val API_BASE_URL = "https://vued-api-dev.onrender.com"
+
+    // Org-management API (orgs, rooms, members) — a separate service from the
+    // recording backend above. Used to fetch the org's rooms so the tablet can
+    // assign itself to one.
+    const val ORG_API_BASE_URL = API_BASE_URL
 }

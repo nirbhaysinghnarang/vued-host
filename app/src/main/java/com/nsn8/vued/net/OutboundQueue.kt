@@ -132,7 +132,10 @@ object OutboundQueue {
                         .put("endedAtSec", endedAtSec)
                         .put("durationSecs", durationSecs)
                         .put("sizeBytes", dest.length())
-                        .put("metadataDone", false),
+                        .put("metadataDone", false)
+                        // Snapshot the assigned room at record time (future-only,
+                        // decision #7): changing rooms later won't retag queued slices.
+                        .putOpt("roomId", RoomConfig.roomId(context)),
                 ),
             )
             Log.i(TAG, "enqueued $kind slice $sliceId (${dest.length()} bytes)")
@@ -190,22 +193,28 @@ object OutboundQueue {
             val durationSecs = item.getDouble("durationSecs")
             val sizeBytes = item.getLong("sizeBytes")
             if (!item.optBoolean("metadataDone", false)) {
+                val roomId = item.optString("roomId", "").ifEmpty { null }
                 when (kind) {
                     Kind.AMBIENT -> VuedApi.createAmbientSlice(
                         id, item.getString("sessionId"),
                         item.getDouble("startedAtSec"), item.getDouble("endedAtSec"),
-                        durationSecs, sizeBytes,
+                        durationSecs, sizeBytes, roomId = roomId,
                     )
                     Kind.MEETING -> VuedApi.createSlice(
                         id, item.getString("sessionId"), item.getString("meetingId"),
                         item.getDouble("startedAtSec"), item.getDouble("endedAtSec"),
-                        durationSecs, sizeBytes,
+                        durationSecs, sizeBytes, roomId = roomId,
                     )
                     else -> {}
                 }
                 setMetadataDone(context, id) // persist so a retry skips re-create
             }
-            VuedApi.uploadSliceAudio(id, file.readBytes(), durationSecs, sizeBytes)
+            // When device-STT is on, the device transcribes this slice itself, so tell
+            // the server to store the audio but skip its own STT (no double transcription).
+            VuedApi.uploadSliceAudio(
+                id, file.readBytes(), durationSecs, sizeBytes,
+                clientTranscribed = false,
+            )
             file.delete()
             remove(context, id)
             Log.i(TAG, "uploaded queued slice $id")

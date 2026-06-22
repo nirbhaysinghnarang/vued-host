@@ -33,6 +33,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,7 +51,11 @@ import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.crypto.VuedCrypto
 import com.nsn8.vued.crypto.runCryptoSelfTest
 import com.nsn8.vued.meeting.MeetingController
+import com.nsn8.vued.net.DecryptGateway
+import com.nsn8.vued.net.RoomConfig
 import com.nsn8.vued.ui.ProvisioningScreen
+import com.nsn8.vued.ui.RoomPickerDialog
+import com.nsn8.vued.ui.SpeakerEnrollmentDialog
 import com.nsn8.vued.service.RecorderState
 import com.nsn8.vued.service.RecordingService
 import com.nsn8.vued.ui.LoginScreen
@@ -82,6 +87,11 @@ private fun AuthGate() {
     when (status) {
         is SessionStatus.Authenticated -> {
             val context = LocalContext.current
+            // Auth (and its token) is ready now. The gateway started back in
+            // App.onCreate — before VuedAuth.init — so its own startup register had
+            // no token. This is the reliable (re)register point, firing once per
+            // launch as the persisted session restores.
+            LaunchedEffect(Unit) { DecryptGateway.registerLanGatewayNow(context) }
             var provisioned by remember { mutableStateOf(VuedCrypto.isProvisioned(context)) }
             if (provisioned) {
                 RecorderScreen(
@@ -174,6 +184,23 @@ private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
             OutlinedButton(onClick = onSignOut) { Text("Sign out") }
         }
         userEmail?.let { StatusLine("Signed in", it) }
+
+        var roomName by remember { mutableStateOf(RoomConfig.roomName(context)) }
+        var showRoomPicker by remember { mutableStateOf(false) }
+        StatusLine("Room", roomName ?: "not set")
+        OutlinedButton(onClick = { showRoomPicker = true }) { Text("Set room") }
+        if (showRoomPicker) {
+            RoomPickerDialog(
+                onDismiss = { showRoomPicker = false },
+                onPicked = { roomName = it },
+            )
+        }
+
+        var showEnroll by remember { mutableStateOf(false) }
+        OutlinedButton(onClick = { showEnroll = true }) { Text("Enroll speaker") }
+        if (showEnroll) {
+            SpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
+        }
 
         StatusLine("UMA-8", usbState)
         StatusLine("Mic permission", if (hasAudio) "granted" else "NOT granted")

@@ -15,6 +15,7 @@ argon2kt = "1.5.0"
 tink = "1.15.0"
 okhttp = "4.12.0"
 nanohttpd = "2.3.1"
+jmdns = "3.5.9"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -39,6 +40,7 @@ argon2kt = { group = "com.lambdapioneer.argon2kt", name = "argon2kt", version.re
 tink-android = { group = "com.google.crypto.tink", name = "tink-android", version.ref = "tink" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
+jmdns = { group = "org.jmdns", name = "jmdns", version.ref = "jmdns" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
