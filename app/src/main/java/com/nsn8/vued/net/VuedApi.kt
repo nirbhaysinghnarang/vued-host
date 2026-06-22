@@ -348,13 +348,6 @@ object VuedApi {
 
     // ---- device-orchestrated STT (device transcribed + sealed; server stores ciphertext) ----
 
-    /** OpenAI key so the device can generate notes/title itself. Interim shared key. */
-    suspend fun fetchLlmKey(): String {
-        val data = request("/api/v1/tokens/llm", method = "GET")
-            ?: throw ApiException("LLM key unavailable")
-        return data.getString("api_key")
-    }
-
     /** Upload device-sealed transcript events (text_enc only; server never reads them).
      *  [sliceId] correlates the events to the uploaded audio so the server can run
      *  speaker-ID on that slice's audio by time window. */
@@ -362,15 +355,6 @@ object VuedApi {
         post(
             "/api/v1/transcript/events/sealed",
             JSONObject().put("slice_id", sliceId).put("events", events),
-        )
-    }
-
-    /** Store device-sealed notes/title on a meeting. */
-    suspend fun patchMeetingNotes(meetingId: String, notesMdEnc: String, titleEnc: String) {
-        request(
-            "/api/v1/meetings/$meetingId",
-            method = "PATCH",
-            body = JSONObject().put("notes_md_enc", notesMdEnc).put("title_enc", titleEnc),
         )
     }
 
