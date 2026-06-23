@@ -18,8 +18,7 @@ object RoomConfig {
     fun roomName(context: Context): String? = prefs(context).getString("roomName", null)
     fun orgId(context: Context): String? = prefs(context).getString("orgId", null)
 
-    /** The room's microphone id — used as the device_id when registering this
-     *  tablet's LAN gateway URL with the backend. */
+    /** The room's microphone id, sent with uploaded audio for provenance. */
     fun microphoneId(context: Context): String? = prefs(context).getString("microphoneId", null)
 
     fun set(context: Context, roomId: String, roomName: String, orgId: String, microphoneId: String) {

@@ -22,7 +22,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.nsn8.vued.net.DecryptGateway
 import com.nsn8.vued.net.OrgApi
 import com.nsn8.vued.net.RoomConfig
 
@@ -80,7 +79,6 @@ fun RoomPickerDialog(onDismiss: () -> Unit, onPicked: (String) -> Unit) {
                             modifier = Modifier.fillMaxWidth(),
                             onClick = {
                                 RoomConfig.set(context, room.id, room.displayName, orgId ?: "", room.microphoneId)
-                                DecryptGateway.registerLanGatewayNow(context)
                                 onPicked(room.displayName)
                                 onDismiss()
                             },
