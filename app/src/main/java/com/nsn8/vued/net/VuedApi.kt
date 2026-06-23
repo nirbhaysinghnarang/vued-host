@@ -1,9 +1,7 @@
 package com.nsn8.vued.net
 
-import android.content.Context
 import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.auth.VuedAuth
-import com.nsn8.vued.crypto.EventCrypto
 import com.nsn8.vued.crypto.WrappedKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -166,108 +164,6 @@ object VuedApi {
                 throw ApiException(envelope.optString("message", "HTTP $status"))
             }
         }
-    }
-
-    /** Fetches a meeting row (camelCase), including `contentEnc` for decryption. */
-    suspend fun getMeeting(meetingId: String): JSONObject? =
-        request("/api/v1/meetings/$meetingId", method = "GET")
-
-    // ---- decrypt-gateway reads (ciphertext in; the device decrypts locally) ----
-    // These are the device's two-hop fetches: app -> vued-api -> supabase -> back.
-    // Every row carries the `*Enc` fields; nothing here is plaintext content.
-
-    /** Most-recent-first meeting rows (each may carry `titleEnc`). */
-    suspend fun listMeetings(limit: Int = 100): JSONArray =
-        request("/api/v1/meetings?limit=$limit", method = "GET")
-            ?.optJSONArray("items") ?: JSONArray()
-
-    /** Transcript events linked to a meeting (each may carry `textEnc`). */
-    suspend fun meetingEvents(meetingId: String, limit: Int = 2000): JSONArray =
-        request(
-            "/api/v1/transcript/events?linked_record_id=$meetingId" +
-                "&linked_record_type=meeting&limit=$limit",
-            method = "GET",
-        )?.optJSONArray("items") ?: JSONArray()
-
-    /** Ambient transcript events in [fromSec, toSec) (each may carry `textEnc`). */
-    suspend fun ambientEvents(fromSec: Double?, toSec: Double?, limit: Int = 2000): JSONArray {
-        val q = StringBuilder("/api/v1/transcript/events?modality=ambient&limit=$limit")
-        if (fromSec != null) q.append("&from=$fromSec")
-        if (toSec != null) q.append("&to=$toSec")
-        return request(q.toString(), method = "GET")?.optJSONArray("items") ?: JSONArray()
-    }
-
-    // ---- semantic search (embeddings-only index; results carry ciphertext events) ----
-
-    /**
-     * One semantic-search hit. The vector store holds no transcript text — the
-     * server matches on embeddings, then hydrates the matched transcript events.
-     * [events] rows may carry `textEnc`; the device decrypts them locally (same
-     * model as the decrypt-gateway reads above). [score] is cosine similarity in
-     * [0,1]; [tsStart]/[tsEnd] bound the matched span.
-     */
-    data class SearchHit(
-        val recordId: String,
-        val recordType: String,
-        val sourceTable: String,
-        val score: Double,
-        val tsStart: Double?,
-        val tsEnd: Double?,
-        val eventIds: List<String>,
-        val events: JSONArray,
-    )
-
-    /**
-     * Semantic search over the user's transcripts. [recordType] optionally scopes
-     * to "meeting" or "idea". With [hydrate] (default true) each hit includes the
-     * matched transcript-event rows; pass false for ids-only (lighter).
-     *
-     * Pass [context] to decrypt the hits in place before returning (events get
-     * plaintext `text`); omit it to receive ciphertext and decrypt later via
-     * [decryptHits]. Decryption uses the device Keystore key and throws
-     * [EventCrypto.NotProvisioned] if the device isn't provisioned.
-     */
-    suspend fun searchTranscripts(
-        query: String,
-        limit: Int = 10,
-        recordType: String? = null,
-        hydrate: Boolean = true,
-        context: Context? = null,
-    ): List<SearchHit> {
-        val body = JSONObject()
-            .put("query", query)
-            .put("limit", limit)
-            .put("hydrate", hydrate)
-        if (recordType != null) body.put("record_type", recordType)
-        val data = post("/api/v1/transcript/search", body) ?: return emptyList()
-        val results = data.optJSONArray("results") ?: return emptyList()
-        val hits = (0 until results.length()).map { i ->
-            val r = results.getJSONObject(i)
-            val idsArr = r.optJSONArray("eventIds") ?: JSONArray()
-            SearchHit(
-                recordId = r.optString("recordId"),
-                recordType = r.optString("recordType"),
-                sourceTable = r.optString("sourceTable"),
-                score = r.optDouble("score", 0.0),
-                tsStart = if (r.isNull("tsStart")) null else r.optDouble("tsStart"),
-                tsEnd = if (r.isNull("tsEnd")) null else r.optDouble("tsEnd"),
-                eventIds = (0 until idsArr.length()).map { idsArr.getString(it) },
-                events = r.optJSONArray("events") ?: JSONArray(),
-            )
-        }
-        if (context != null && hits.isNotEmpty()) decryptHits(hits, context)
-        return hits
-    }
-
-    /**
-     * Decrypts each hit's `events` in place — `textEnc` becomes plaintext `text`.
-     * The device's private key never leaves the Keystore. Throws
-     * [EventCrypto.NotProvisioned] if the device has no key yet. No-op for
-     * non-encrypted users (events have no `textEnc`).
-     */
-    fun decryptHits(hits: List<SearchHit>, context: Context) {
-        val box = EventCrypto.box(context)
-        hits.forEach { EventCrypto.decryptEvents(it.events, box) }
     }
 
     // ---- speaker enrollment ----

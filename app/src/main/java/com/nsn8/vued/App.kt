@@ -3,8 +3,7 @@ package com.nsn8.vued
 import android.app.Application
 
 /**
- * Process entry point. The tablet is now an upload/provisioning appliance; it no
- * longer exposes a LAN decrypt server for desktop/web clients.
+ * Process entry point. The tablet is now an upload/provisioning appliance.
  */
 class App : Application() {
     override fun onCreate() {

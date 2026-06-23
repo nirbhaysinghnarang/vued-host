@@ -1,6 +1,5 @@
 package com.nsn8.vued.net
 
-import android.util.Log
 import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.auth.VuedAuth
 import kotlinx.coroutines.Dispatchers
@@ -67,16 +66,6 @@ object OrgApi {
         putJson(
             "/api/v1/orgs/$orgId/speaker-profile-links/$speakerProfileId",
             JSONObject().put("userId", userId),
-        )
-    }
-
-    /** Register/update this tablet's LAN decrypt-gateway URL for the org.
-     *  device_id is the tablet's microphone id. */
-    suspend fun registerLanGateway(orgId: String, deviceId: String, gatewayUrl: String) {
-        Log.d("ORG", "registering gateway for org $orgId with device $deviceId and url $gatewayUrl")
-        putJson(
-            "/api/v1/orgs/$orgId/lan-gateways/${android.net.Uri.encode(deviceId)}",
-            JSONObject().put("gatewayUrl", gatewayUrl),
         )
     }
 
