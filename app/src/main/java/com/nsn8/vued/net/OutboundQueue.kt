@@ -76,7 +76,11 @@ object OutboundQueue {
                 .put("kind", Kind.MEETING_CREATE.name)
                 .put("meetingId", meetingId)
                 .put("title", title)
-                .put("startedAtSec", startedAtSec),
+                .put("startedAtSec", startedAtSec)
+                // Snapshot the assigned room at meeting start so the in-progress
+                // placeholder is filed under the same room as the eventual audio.
+                .putOpt("roomId", RoomConfig.roomId(context))
+                .putOpt("microphoneId", RoomConfig.microphoneId(context)),
         )
         Log.i(TAG, "enqueued MEETING_CREATE $meetingId")
     }
@@ -168,7 +172,15 @@ object OutboundQueue {
     private suspend fun drainMeetingCreate(context: Context, item: JSONObject) {
         val meetingId = item.getString("meetingId")
         try {
-            VuedApi.createMeeting(meetingId, item.getString("title"), item.getDouble("startedAtSec"))
+            val roomId = item.optString("roomId", "").ifEmpty { null }
+            val microphoneId = item.optString("microphoneId", "").ifEmpty { null }
+            VuedApi.createMeeting(
+                meetingId,
+                item.getString("title"),
+                item.getDouble("startedAtSec"),
+                roomId = roomId,
+                microphoneId = microphoneId,
+            )
             remove(context, item.getString("id"))
             Log.i(TAG, "created queued meeting $meetingId")
         } catch (e: Exception) {

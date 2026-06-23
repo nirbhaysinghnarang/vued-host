@@ -26,14 +26,22 @@ object VuedApi {
     // ---- meeting recording (timeline-slice path) ----
 
     /** Creates the meeting row (legacy `meetings`). [meetingId] is no-dash hex. */
-    suspend fun createMeeting(meetingId: String, title: String, startedAtSec: Double) {
+    suspend fun createMeeting(
+        meetingId: String,
+        title: String,
+        startedAtSec: Double,
+        roomId: String? = null,
+        microphoneId: String? = null,
+    ) {
         post(
             "/api/v1/meetings",
             JSONObject()
                 .put("id", meetingId)
                 .put("title", title)
                 .put("status", "recording")
-                .put("started_at", startedAtSec),
+                .put("started_at", startedAtSec)
+                .putOpt("roomId", roomId)
+                .putOpt("microphoneId", microphoneId),
         )
     }
 
