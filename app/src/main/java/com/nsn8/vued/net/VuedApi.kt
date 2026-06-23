@@ -2,7 +2,6 @@ package com.nsn8.vued.net
 
 import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.auth.VuedAuth
-import com.nsn8.vued.crypto.WrappedKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -15,59 +14,14 @@ import org.json.JSONObject
 
 /**
  * Thin REST client for the Vued backend. Attaches the Supabase JWT and unwraps the
- * `{status, message, data, error}` envelope. Only the encrypted-client endpoints are
- * here for now (public-key registry + passphrase vault); the durable upload flow lands
- * next.
+ * `{status, message, data, error}` envelope.
  */
 object VuedApi {
 
     private val client = OkHttpClient()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
-    const val KEY_ID = "hpke-x25519-aesgcm-v1"
-
     class ApiException(message: String) : Exception(message)
-
-    /**
-     * Fetches the STT vendor credential so the device can transcribe directly
-     * (device-orchestrated STT — transcript plaintext never hits our servers).
-     * Interim: a shared key; becomes a scoped token later.
-     */
-    suspend fun fetchSttKey(): String {
-        val data = request("/api/v1/tokens/assemblyai", method = "GET")
-            ?: throw ApiException("STT key unavailable")
-        return data.getString("api_key")
-    }
-
-    suspend fun uploadPublicKey(publicKeysetB64: String, keyId: String = KEY_ID) {
-        val body = JSONObject()
-            .put("public_keyset", publicKeysetB64)
-            .put("key_id", keyId)
-        post("/api/v1/keys", body)
-    }
-
-    suspend fun uploadVault(wrapped: WrappedKey) {
-        val body = JSONObject()
-            .put("salt", wrapped.saltB64)
-            .put("nonce", wrapped.nonceB64)
-            .put("wrapped_key", wrapped.ciphertextB64)
-            .put("kdf_t_cost", wrapped.tCost)
-            .put("kdf_m_cost_kib", wrapped.mCostKib)
-            .put("kdf_parallelism", wrapped.parallelism)
-        post("/api/v1/vault", body)
-    }
-
-    suspend fun fetchVault(): WrappedKey? {
-        val data = request("/api/v1/vault", method = "GET") ?: return null
-        return WrappedKey(
-            saltB64 = data.getString("salt"),
-            nonceB64 = data.getString("nonce"),
-            ciphertextB64 = data.getString("wrapped_key"),
-            tCost = data.getInt("kdf_t_cost"),
-            mCostKib = data.getInt("kdf_m_cost_kib"),
-            parallelism = data.getInt("kdf_parallelism"),
-        )
-    }
 
     // ---- meeting recording (timeline-slice path) ----
 
@@ -135,22 +89,16 @@ object VuedApi {
         )
     }
 
-    /**
-     * Ships the raw M4A bytes. Normally this kicks the server's transcribe pipeline;
-     * with [clientTranscribed] the server stores the audio (for speaker-ID + retention)
-     * but skips server STT — the device transcribed it and posts sealed events itself.
-     */
+    /** Ships raw M4A bytes to the server transcription/finalization pipeline. */
     suspend fun uploadSliceAudio(
         sliceId: String,
         audio: ByteArray,
         durationSecs: Double,
         sizeBytes: Long,
-        clientTranscribed: Boolean = false,
     ) = withContext(Dispatchers.IO) {
         val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
-        val sttParam = if (clientTranscribed) "?stt=skip" else ""
         val request = Request.Builder()
-            .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/audio$sttParam")
+            .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/audio")
             .header("Authorization", "Bearer $token")
             .header("x-audio-duration-secs", durationSecs.toString())
             .header("x-audio-size-bytes", sizeBytes.toString())
@@ -240,18 +188,6 @@ object VuedApi {
             parseProfile(envelope.optJSONObject("data")?.optJSONObject("profile"))
                 ?: throw ApiException("enroll returned no profile")
         }
-    }
-
-    // ---- device-orchestrated STT (device transcribed + sealed; server stores ciphertext) ----
-
-    /** Upload device-sealed transcript events (text_enc only; server never reads them).
-     *  [sliceId] correlates the events to the uploaded audio so the server can run
-     *  speaker-ID on that slice's audio by time window. */
-    suspend fun postSealedEvents(events: JSONArray, sliceId: String) {
-        post(
-            "/api/v1/transcript/events/sealed",
-            JSONObject().put("slice_id", sliceId).put("events", events),
-        )
     }
 
     private suspend fun post(path: String, body: JSONObject): JSONObject? =

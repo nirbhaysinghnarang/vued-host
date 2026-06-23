@@ -209,12 +209,7 @@ object OutboundQueue {
                 }
                 setMetadataDone(context, id) // persist so a retry skips re-create
             }
-            // When device-STT is on, the device transcribes this slice itself, so tell
-            // the server to store the audio but skip its own STT (no double transcription).
-            VuedApi.uploadSliceAudio(
-                id, file.readBytes(), durationSecs, sizeBytes,
-                clientTranscribed = false,
-            )
+            VuedApi.uploadSliceAudio(id, file.readBytes(), durationSecs, sizeBytes)
             file.delete()
             remove(context, id)
             Log.i(TAG, "uploaded queued slice $id")

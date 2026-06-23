@@ -48,11 +48,8 @@ import androidx.compose.ui.unit.dp
 import com.nsn8.vued.auth.VuedAuth
 import com.nsn8.vued.capture.Uma8Capture
 import com.nsn8.vued.ambient.AmbientFlusher
-import com.nsn8.vued.crypto.VuedCrypto
-import com.nsn8.vued.crypto.runCryptoSelfTest
 import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.RoomConfig
-import com.nsn8.vued.ui.ProvisioningScreen
 import com.nsn8.vued.ui.RoomPickerDialog
 import com.nsn8.vued.ui.SpeakerEnrollmentDialog
 import com.nsn8.vued.service.RecorderState
@@ -88,16 +85,10 @@ private fun AuthGate() {
     val scope = rememberCoroutineScope()
     when (status) {
         is SessionStatus.Authenticated -> {
-            val context = LocalContext.current
-            var provisioned by remember { mutableStateOf(VuedCrypto.isProvisioned(context)) }
-            if (provisioned) {
-                RecorderScreen(
-                    userEmail = VuedAuth.currentEmail(),
-                    onSignOut = { scope.launch { VuedAuth.signOut() } },
-                )
-            } else {
-                ProvisioningScreen(onProvisioned = { provisioned = true })
-            }
+            RecorderScreen(
+                userEmail = VuedAuth.currentEmail(),
+                onSignOut = { scope.launch { VuedAuth.signOut() } },
+            )
         }
         is SessionStatus.RefreshFailure -> LoginScreen(initialError = "Session expired, sign in again")
         SessionStatus.Initializing -> LoadingScreen()
@@ -124,8 +115,7 @@ private fun LoadingScreen() {
 private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
     val context = LocalContext.current
     val status by RecorderState.state.collectAsState()
-    val cryptoScope = rememberCoroutineScope()
-    var cryptoReport by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     var hasAudio by remember {
         mutableStateOf(
@@ -234,7 +224,7 @@ private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
         var meetingMsg by remember { mutableStateOf<String?>(null) }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = {
-                cryptoScope.launch {
+                scope.launch {
                     try {
                         if (meetingActive) {
                             meetingMsg = "exporting + uploading…"
@@ -256,7 +246,7 @@ private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                 Text(if (meetingActive) "Stop Meeting" else "Start Meeting")
             }
             OutlinedButton(onClick = {
-                cryptoScope.launch {
+                scope.launch {
                     meetingMsg = "flushing ambient…"
                     meetingMsg = try {
                         "ambient: " + AmbientFlusher.flushOnce(context)
@@ -294,20 +284,6 @@ private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
         }
         kioskMessage?.let { StatusLine("Kiosk", it) }
 
-        OutlinedButton(onClick = {
-            cryptoReport = "running…"
-            cryptoScope.launch { cryptoReport = runCryptoSelfTest(context) }
-        }) {
-            Text("Run crypto self-test")
-        }
-        cryptoReport?.let {
-            Text(
-                text = it,
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF111111),
-            )
-        }
     }
 }
 

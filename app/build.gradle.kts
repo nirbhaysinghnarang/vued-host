@@ -56,8 +56,6 @@ dependencies {
     implementation(platform(libs.supabase.bom))
     implementation(libs.supabase.auth)
     implementation(libs.ktor.client.okhttp)
-    implementation(libs.argon2kt)
-    implementation(libs.tink.android)
     implementation(libs.okhttp)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

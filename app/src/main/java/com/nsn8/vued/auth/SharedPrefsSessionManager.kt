@@ -8,8 +8,8 @@ import kotlinx.serialization.json.Json
 
 /**
  * Persists the Supabase session (JWT + refresh token) to app-private storage so
- * login survives restarts. Plain SharedPreferences for now; harden to the Android
- * Keystore / EncryptedSharedPreferences alongside the Phase-3 crypto work.
+ * login survives restarts. Plain SharedPreferences for now; harden to Android
+ * Keystore / EncryptedSharedPreferences before shipping managed deployments.
  */
 class SharedPrefsSessionManager(context: Context) : SessionManager {
 

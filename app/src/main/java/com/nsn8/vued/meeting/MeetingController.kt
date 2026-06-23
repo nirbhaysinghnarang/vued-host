@@ -15,8 +15,8 @@ import java.util.UUID
  *
  *  - Start: mint a meeting id, POST /meetings, mark the window start.
  *  - Stop:  flush the rolling buffer, export the [start,end] window into one M4A,
- *           POST the audio-slice metadata, then PUT the bytes (which kicks the
- *           server's transcribe → encrypt pipeline). The server writes ciphertext.
+ *           POST the audio-slice metadata, then PUT the bytes to kick the server's
+ *           transcription/finalization pipeline.
  *
  * The active [RollingBuffer] is registered by the recording service via [attach].
  */
@@ -88,9 +88,6 @@ object MeetingController {
         val sliceId = UUID.randomUUID().toString()
         val durationSecs = export.durationMs / 1000.0
         val sizeBytes = out.length()
-        // Device-orchestrated STT (flag-gated): transcribe + seal locally in the
-        // background. Read the bytes now, before enqueue consumes `out`.
-
         // Durably enqueue BEFORE any network — consumes `out` and is the commit point,
         // so stopping a meeting never loses audio even offline. Then drain to upload.
         OutboundQueue.enqueueMeeting(
