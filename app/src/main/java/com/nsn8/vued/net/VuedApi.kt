@@ -11,6 +11,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 /**
  * Thin REST client for the Vued backend. Attaches the Supabase JWT and unwraps the
@@ -198,8 +200,31 @@ object VuedApi {
         }
     }
 
+    // ---- ambient tablet decrypt assist ----
+
+    suspend fun fetchVault(): JSONObject =
+        request("/api/v1/vault", method = "GET") ?: throw ApiException("vault not found")
+
+    suspend fun ambientProcessWindow(roomId: String): JSONObject? =
+        request("/api/v1/ambient/window?roomId=${url(roomId)}", method = "GET")
+
+    suspend fun ambientEvents(roomId: String, fromTs: Double, toTs: Double, limit: Int): JSONArray {
+        val data = request(
+            "/api/v1/transcript/events?modality=ambient&room_id=${url(roomId)}" +
+                "&from=$fromTs&to=$toTs&limit=$limit",
+            method = "GET",
+        )
+        return data?.optJSONArray("items") ?: JSONArray()
+    }
+
+    suspend fun processAmbient(roomId: String, events: JSONArray): JSONObject? =
+        post("/api/v1/ambient/process", JSONObject().put("roomId", roomId).put("events", events))
+
     private suspend fun post(path: String, body: JSONObject): JSONObject? =
         request(path, method = "POST", body = body)
+
+    private fun url(value: String): String =
+        URLEncoder.encode(value, StandardCharsets.UTF_8.toString())
 
     /** Returns the envelope's `data` object, or null when data is null/absent. */
     private suspend fun request(

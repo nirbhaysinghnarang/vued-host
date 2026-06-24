@@ -12,6 +12,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import com.nsn8.vued.ambient.AmbientFlusher
+import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.audio.CapturePipeline
 import com.nsn8.vued.capture.Uma8Capture
 import com.nsn8.vued.meeting.MeetingController
@@ -65,11 +66,15 @@ class RecordingService : Service() {
         MeetingController.attach(pipeline.rollingBuffer)
         AmbientFlusher.attach(pipeline.rollingBuffer)
         // Drain any backlog left by a previous run (offline/crash) as soon as we're up.
-        ambientScope.launch { runCatching { OutboundQueue.drain(applicationContext) } }
+        ambientScope.launch {
+            runCatching { OutboundQueue.drain(applicationContext) }
+            runCatching { AmbientProcessor.processOnce(applicationContext) }
+        }
         ambientJob = ambientScope.launch {
             while (isActive) {
                 delay(AmbientFlusher.INTERVAL_MS)
                 runCatching { AmbientFlusher.flushOnce(this@RecordingService) }
+                runCatching { AmbientProcessor.processOnce(this@RecordingService) }
             }
         }
         val capture = Uma8Capture(this)

@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -44,10 +45,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.auth.VuedAuth
 import com.nsn8.vued.capture.Uma8Capture
 import com.nsn8.vued.ambient.AmbientFlusher
+import com.nsn8.vued.crypto.AmbientDecryptor
 import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.RoomConfig
 import com.nsn8.vued.ui.RoomPickerDialog
@@ -183,6 +187,35 @@ private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
             )
         }
 
+        var ambientUnlocked by remember { mutableStateOf(AmbientDecryptor.isUnlocked(context)) }
+        var ambientPassphrase by remember { mutableStateOf("") }
+        var ambientMsg by remember { mutableStateOf(if (ambientUnlocked) "unlocked" else "locked") }
+        StatusLine("Ambient decrypt", ambientMsg)
+        if (!ambientUnlocked) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = ambientPassphrase,
+                    onValueChange = { ambientPassphrase = it },
+                    label = { Text("Passphrase") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                )
+                Button(onClick = {
+                    scope.launch {
+                        ambientMsg = "unlocking…"
+                        ambientMsg = try {
+                            AmbientDecryptor.unlock(context, ambientPassphrase)
+                            ambientPassphrase = ""
+                            ambientUnlocked = true
+                            "unlocked"
+                        } catch (e: Throwable) {
+                            "unlock failed: ${e.message}"
+                        }
+                    }
+                }) { Text("Unlock ambient") }
+            }
+        }
+
         var showEnroll by remember { mutableStateOf(false) }
         OutlinedButton(onClick = { showEnroll = true }) { Text("Enroll speaker") }
         if (showEnroll) {
@@ -249,7 +282,8 @@ private fun RecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                 scope.launch {
                     meetingMsg = "flushing ambient…"
                     meetingMsg = try {
-                        "ambient: " + AmbientFlusher.flushOnce(context)
+                        "ambient: " + AmbientFlusher.flushOnce(context) +
+                            "; " + AmbientProcessor.processOnce(context)
                     } catch (e: Throwable) {
                         "ambient flush error: ${e.message}"
                     }
