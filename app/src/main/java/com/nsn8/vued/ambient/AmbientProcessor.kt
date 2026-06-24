@@ -21,17 +21,23 @@ object AmbientProcessor {
         }
         val window = VuedApi.ambientProcessWindow(roomId) ?: return@withContext "ambient decrypt skipped"
         if (!window.optBoolean("hasWork", false)) return@withContext "ambient decrypt idle"
-        val fromTs = window.getDouble("from")
-        val toTs = window.getDouble("to")
         val limit = window.optInt("limit", 5000)
-        val events = VuedApi.ambientEvents(roomId, fromTs, toTs, limit)
+        val ranges = window.optJSONArray("ranges") ?: return@withContext "ambient decrypt skipped (no ranges)"
+        if (ranges.length() == 0) return@withContext "ambient decrypt idle"
         val decrypted = JSONArray()
-        for (i in 0 until events.length()) {
-            val event = events.optJSONObject(i) ?: continue
-            val text = AmbientDecryptor.decryptEventText(context, event) ?: continue
-            event.put("text", text)
-            decryptSegments(context, event)
-            decrypted.put(event)
+        val seen = mutableSetOf<String>()
+        for (r in 0 until ranges.length()) {
+            val range = ranges.optJSONObject(r) ?: continue
+            val events = VuedApi.ambientEvents(roomId, range.getDouble("from"), range.getDouble("to"), limit)
+            for (i in 0 until events.length()) {
+                val event = events.optJSONObject(i) ?: continue
+                val id = event.optString("id", "")
+                if (id.isBlank() || !seen.add(id)) continue
+                val text = AmbientDecryptor.decryptEventText(context, event) ?: continue
+                event.put("text", text)
+                decryptSegments(context, event)
+                decrypted.put(event)
+            }
         }
         if (decrypted.length() == 0) return@withContext "ambient decrypt found no readable events"
         val result = VuedApi.processAmbient(roomId, decrypted)
