@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -339,10 +340,65 @@ private fun ProdRecorderMainScreen() {
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
-            val ringSize = minOf(maxWidth * 0.96f, maxHeight - 112.dp)
+            val ringSize = minOf(maxWidth * 0.96f, maxHeight - 250.dp)
             Column(
+                modifier = Modifier.offset(y = (-92).dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                Button(
+                    enabled = !segmentBusy && (status.running || meetingActive),
+                    onClick = {
+                        scope.launch {
+                            segmentBusy = true
+                            try {
+                                if (meetingActive) {
+                                    meetingActive = false
+                                    nowMs = System.currentTimeMillis()
+                                    MeetingController.stop(context)
+                                } else {
+                                    MeetingController.start(context, "Meeting")
+                                    segmentStartedAt = MeetingController.active?.startMs
+                                        ?: System.currentTimeMillis()
+                                    nowMs = System.currentTimeMillis()
+                                    meetingActive = true
+                                }
+                            } catch (_: Throwable) {
+                                meetingActive = MeetingController.active != null
+                                segmentStartedAt = MeetingController.active?.startMs ?: 0L
+                            } finally {
+                                segmentBusy = false
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (meetingActive) VuedTextPrimary else VuedSuccess,
+                        contentColor = Color.White,
+                        disabledContainerColor = VuedSurface,
+                        disabledContentColor = VuedTextTertiary,
+                    ),
+                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp),
+                    modifier = Modifier
+                        .height(128.dp)
+                        .width(470.dp),
+                ) {
+                    Text(
+                        text = if (meetingActive) "End Meeting" else "Start Meeting",
+                        fontSize = 42.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 0.sp,
+                    )
+                }
+
+                Text(
+                    text = if (meetingActive) formatSegmentTime(elapsedSecs) else "     ",
+                    modifier = Modifier.padding(top = 12.dp, bottom = 10.dp),
+                    color = VuedTextTertiary.copy(alpha = 0.72f),
+                    fontSize = 52.sp,
+                    fontWeight = FontWeight.Thin,
+                    letterSpacing = 0.sp,
+                )
+
                 Box(
                     modifier = Modifier.size(ringSize),
                     contentAlignment = Alignment.Center,
@@ -378,66 +434,6 @@ private fun ProdRecorderMainScreen() {
                             letterSpacing = 0.sp,
                         )
                     }
-                }
-
-                Spacer(Modifier.height(2.dp))
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Button(
-                        enabled = !segmentBusy && (status.running || meetingActive),
-                        onClick = {
-                            scope.launch {
-                                segmentBusy = true
-                                try {
-                                    if (meetingActive) {
-                                        meetingActive = false
-                                        nowMs = System.currentTimeMillis()
-                                        MeetingController.stop(context)
-                                    } else {
-                                        MeetingController.start(context, "Meeting")
-                                        segmentStartedAt = MeetingController.active?.startMs
-                                            ?: System.currentTimeMillis()
-                                        nowMs = System.currentTimeMillis()
-                                        meetingActive = true
-                                    }
-                                } catch (_: Throwable) {
-                                    meetingActive = MeetingController.active != null
-                                    segmentStartedAt = MeetingController.active?.startMs ?: 0L
-                                } finally {
-                                    segmentBusy = false
-                                }
-                            }
-                        },
-                        shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (meetingActive) VuedTextPrimary else VuedSuccess,
-                            contentColor = Color.White,
-                            disabledContainerColor = VuedSurface,
-                            disabledContentColor = VuedTextTertiary,
-                        ),
-                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp),
-                        modifier = Modifier
-                            .height(88.dp)
-                            .width(244.dp),
-                    ) {
-                        Text(
-                            text = if (meetingActive) "Stop" else "Start",
-                            fontSize = 30.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            letterSpacing = 0.sp,
-                        )
-                    }
-                    Text(
-                        text = formatSegmentTime(elapsedSecs),
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
-                        color = VuedTextPrimary,
-                        fontSize = 48.sp,
-                        fontWeight = FontWeight.Light,
-                        letterSpacing = 0.sp,
-                    )
                 }
             }
         }

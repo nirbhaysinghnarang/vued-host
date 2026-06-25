@@ -5,7 +5,10 @@ import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.net.OutboundQueue
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
@@ -27,6 +30,7 @@ object MeetingController {
 
     // One session id per app process (matches iOS session semantics).
     private val sessionId: String = UUID.randomUUID().toString()
+    private val queueScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var rolling: RollingBuffer? = null
@@ -59,7 +63,8 @@ object MeetingController {
         val startMs = System.currentTimeMillis()
         OutboundQueue.enqueueMeetingCreate(context, meetingId, title, startMs / 1000.0)
         active = ActiveMeeting(meetingId, startMs)
-        OutboundQueue.drain(context) // attempt the create now (online); leaves it queued offline
+        val appContext = context.applicationContext
+        queueScope.launch { runCatching { OutboundQueue.drain(appContext) } }
         return meetingId
     }
 
