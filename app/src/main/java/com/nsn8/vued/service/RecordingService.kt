@@ -14,6 +14,8 @@ import android.util.Log
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.audio.CapturePipeline
+import com.nsn8.vued.capture.MicArrayConfig
+import com.nsn8.vued.capture.PROFILE_UMA8
 import com.nsn8.vued.capture.Uma8Capture
 import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.OutboundQueue
@@ -62,7 +64,15 @@ class RecordingService : Service() {
 
     private fun captureLoop() {
         val segmentsDir = File(getExternalFilesDir(null), "segments")
-        val pipeline = CapturePipeline(segmentsDir)
+        // Resolve the array profile before building the pipeline so the downmixer
+        // sees the correct channel count. Manual selection overrides auto-detect;
+        // when AUTO and no device is plugged in yet, default to UMA-8 — the stream
+        // will throw on startup and the service tears down cleanly anyway.
+        val override = MicArrayConfig.selection(this).toProfile()
+        val capture = Uma8Capture(this, override)
+        val profile = capture.resolveProfile() ?: override ?: PROFILE_UMA8
+        Log.i(TAG, "capture profile=${profile.label} channels=${profile.outChannels}")
+        val pipeline = CapturePipeline(segmentsDir, profile.outChannels)
         MeetingController.attach(pipeline.rollingBuffer)
         AmbientFlusher.attach(pipeline.rollingBuffer)
         // Drain any backlog left by a previous run (offline/crash) as soon as we're up.
@@ -77,7 +87,6 @@ class RecordingService : Service() {
                 runCatching { AmbientProcessor.processOnce(this@RecordingService) }
             }
         }
-        val capture = Uma8Capture(this)
         var lastPublish = 0L
 
         try {

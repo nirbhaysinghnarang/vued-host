@@ -73,6 +73,8 @@ import androidx.compose.ui.unit.sp
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.auth.VuedAuth
+import com.nsn8.vued.capture.MicArrayConfig
+import com.nsn8.vued.capture.MicArraySelection
 import com.nsn8.vued.capture.Uma8Capture
 import com.nsn8.vued.crypto.AmbientDecryptor
 import com.nsn8.vued.meeting.MeetingController
@@ -89,7 +91,7 @@ import io.github.jan.supabase.auth.status.SessionStatus
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
-private val HOST_UI_MODE = HostUiMode.PROD
+private val HOST_UI_MODE = HostUiMode.DEV
 
 private enum class HostUiMode { DEV, PROD }
 
@@ -639,7 +641,21 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
             SpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
         }
 
-        StatusLine("UMA-8", usbState)
+        StatusLine("Mic array", usbState)
+        var micSelection by remember { mutableStateOf(MicArrayConfig.selection(context)) }
+        StatusLine("Array config", micSelection.uiLabel())
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MicArraySelection.values().forEach { option ->
+                if (option == micSelection) {
+                    Button(onClick = {}) { Text(option.uiLabel()) }
+                } else {
+                    OutlinedButton(onClick = {
+                        MicArrayConfig.set(context, option)
+                        micSelection = option
+                    }) { Text(option.uiLabel()) }
+                }
+            }
+        }
         StatusLine("Mic permission", if (hasAudio) "granted" else "NOT granted")
         StatusLine("Service", if (status.running) "RECORDING" else "stopped")
         StatusLine("Segments written", status.segmentCount.toString())
@@ -790,6 +806,12 @@ private fun describeUsb(context: Context): String {
     val capture = Uma8Capture(context)
     val device = capture.findDevice() ?: return "not connected"
     return if (capture.hasPermission(device)) "connected (authorized)" else "connected (needs permission)"
+}
+
+private fun MicArraySelection.uiLabel(): String = when (this) {
+    MicArraySelection.AUTO -> "Auto"
+    MicArraySelection.UMA8 -> "UMA-8"
+    MicArraySelection.UMA16 -> "UMA-16"
 }
 
 private fun requestUma8Permission(context: Context) {

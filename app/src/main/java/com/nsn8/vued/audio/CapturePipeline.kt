@@ -5,13 +5,16 @@ import java.io.File
 import kotlin.math.abs
 
 /**
- * The Phase-1 audio chain: UMA-8 interleaved PCM → mono downmix → anti-aliased
+ * The Phase-1 audio chain: mic-array interleaved PCM → mono downmix → anti-aliased
  * 48→16 kHz → 30 s AAC/M4A rolling segments. [process] is the `onPcm` callback fed
  * by [Uma8Capture]; it must run synchronously on the capture thread.
+ *
+ * [inputChannels] is the array's real-mic channel count (7 for UMA-8, 16 for
+ * UMA-16); the downmix is a plain mean, so any value works.
  */
-class CapturePipeline(segmentsDir: File) {
+class CapturePipeline(segmentsDir: File, inputChannels: Int) {
 
-    private val downmixer = Downmixer(Uma8Capture.OUT_CHANNELS)
+    private val downmixer = Downmixer(inputChannels)
     private val resampler = Resampler48to16()
     private val rolling = RollingBuffer(segmentsDir)
 
