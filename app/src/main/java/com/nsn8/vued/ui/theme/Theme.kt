@@ -17,10 +17,27 @@ private val DarkColorScheme = darkColorScheme(
     tertiary = Pink80
 )
 
-private val LightColorScheme = lightColorScheme(
+private val DevLightColorScheme = lightColorScheme(
     primary = Purple40,
     secondary = PurpleGrey40,
     tertiary = Pink40
+)
+
+private val VuedLightColorScheme = lightColorScheme(
+    primary = VuedAccent,
+    secondary = VuedTextSecondary,
+    tertiary = VuedSuccess,
+    background = VuedBackground,
+    surface = VuedSurface,
+    surfaceVariant = VuedSurfaceAlt,
+    outline = VuedHairline,
+    error = VuedDanger,
+    onPrimary = VuedBackground,
+    onSecondary = VuedBackground,
+    onTertiary = VuedBackground,
+    onBackground = VuedTextPrimary,
+    onSurface = VuedTextPrimary,
+    onSurfaceVariant = VuedTextSecondary,
 
     /* Other default colors to override
     background = Color(0xFFFFFBFE),
@@ -36,23 +53,25 @@ private val LightColorScheme = lightColorScheme(
 @Composable
 fun VuedTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
+    desktopTheme: Boolean = false,
     // Dynamic color is available on Android 12+
     dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
+        desktopTheme -> VuedLightColorScheme
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val context = LocalContext.current
             if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
 
         darkTheme -> DarkColorScheme
-        else -> LightColorScheme
+        else -> DevLightColorScheme
     }
 
     MaterialTheme(
         colorScheme = colorScheme,
-        typography = Typography,
+        typography = if (desktopTheme) VuedTypography else DevTypography,
         content = content
     )
 }

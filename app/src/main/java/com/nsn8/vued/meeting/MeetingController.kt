@@ -75,6 +75,7 @@ object MeetingController {
         val meeting = active ?: error("No active meeting.")
         val buffer = rolling ?: error("Ambient buffer not running.")
         val endMs = System.currentTimeMillis()
+        active = null
         // Resume ambient from here so it doesn't re-flush the meeting window as ambient.
         // Done before the export so it holds even if this meeting captured no audio.
         AmbientFlusher.resumeAfter(endMs)
@@ -94,7 +95,6 @@ object MeetingController {
             context, sliceId, sessionId, meeting.meetingId,
             meeting.startMs / 1000.0, endMs / 1000.0, durationSecs, out,
         )
-        active = null
         OutboundQueue.drain(context) // upload this slice + any offline backlog
         StopResult(meeting.meetingId, durationSecs, sizeBytes)
     }
