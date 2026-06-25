@@ -17,8 +17,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -87,12 +85,7 @@ import com.nsn8.vued.service.RecordingService
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
 import io.github.jan.supabase.auth.status.SessionStatus
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.sin
-import kotlin.math.sqrt
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private val HOST_UI_MODE = HostUiMode.PROD
@@ -299,19 +292,11 @@ private fun ProdRecorderMainScreen() {
     var segmentBusy by remember { mutableStateOf(false) }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showEnroll by remember { mutableStateOf(false) }
-    var visualPhase by remember { mutableStateOf(0) }
 
     LaunchedEffect(meetingActive, segmentStartedAt) {
         while (meetingActive) {
             nowMs = System.currentTimeMillis()
-            delay(250)
-        }
-    }
-
-    LaunchedEffect(status.running) {
-        while (status.running) {
-            visualPhase = (visualPhase + 1) % 240
-            delay(55)
+            kotlinx.coroutines.delay(250)
         }
     }
 
@@ -332,16 +317,6 @@ private fun ProdRecorderMainScreen() {
 
     val ringColor = if (status.running) VuedSuccess else VuedIdleRing
     val ringSoftColor = if (status.running) VuedSuccessSoft else VuedSurface
-    val targetAudioLevel = if (status.running && status.peakDb.isFinite()) {
-        sqrt(((status.peakDb + 60f) / 34f).coerceIn(0f, 1f))
-    } else {
-        0f
-    }
-    val audioLevel by animateFloatAsState(
-        targetValue = targetAudioLevel,
-        animationSpec = tween(durationMillis = 36),
-        label = "audioLevel",
-    )
     val elapsedSecs = if (meetingActive) {
         ((nowMs - segmentStartedAt) / 1000).coerceAtLeast(0)
     } else {
@@ -376,8 +351,6 @@ private fun ProdRecorderMainScreen() {
                         ringColor = ringColor,
                         softColor = ringSoftColor,
                         running = status.running,
-                        audioLevel = audioLevel,
-                        phase = visualPhase,
                         modifier = Modifier.fillMaxSize(),
                     )
                     Button(
@@ -385,11 +358,9 @@ private fun ProdRecorderMainScreen() {
                             if (status.running) RecordingService.stop(context) else startCapture()
                         },
                         shape = CircleShape,
-                        modifier = Modifier
-                            .size(188.dp)
-                            .shadow(22.dp, CircleShape, clip = false),
+                        modifier = Modifier.size(188.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = VuedSurfaceRaised,
+                            containerColor = Color.Transparent,
                             contentColor = VuedTextPrimary,
                         ),
                         elevation = ButtonDefaults.buttonElevation(
@@ -398,6 +369,7 @@ private fun ProdRecorderMainScreen() {
                             focusedElevation = 0.dp,
                             hoveredElevation = 0.dp,
                         ),
+                        contentPadding = PaddingValues(0.dp),
                     ) {
                         Text(
                             text = if (status.running) "Mute" else "Unmute",
@@ -481,8 +453,6 @@ private fun RecordingRing(
     ringColor: Color,
     softColor: Color,
     running: Boolean,
-    audioLevel: Float,
-    phase: Int,
     modifier: Modifier = Modifier,
 ) {
     Canvas(modifier = modifier) {
@@ -495,70 +465,6 @@ private fun RecordingRing(
             radius = ringRadius,
             center = center,
         )
-        if (running) {
-            val level = audioLevel.coerceIn(0f, 1f)
-            val boosted = (level * 1.45f).coerceIn(0f, 1f)
-            val pulse = ((sin(phase * 0.22) + 1.0) * 0.5).toFloat()
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        ringColor.copy(alpha = 0.10f + boosted * 0.24f),
-                        ringColor.copy(alpha = 0.04f + boosted * 0.14f),
-                        Color.Transparent,
-                    ),
-                    center = center,
-                    radius = diameter * (0.22f + boosted * 0.24f),
-                ),
-                radius = diameter * (0.21f + boosted * 0.25f + pulse * boosted * 0.035f),
-                center = center,
-            )
-
-            repeat(2) { index ->
-                val progress = ((phase % 28) / 28f + index / 2f) % 1f
-                val radius = diameter * (0.18f + progress * (0.32f + boosted * 0.26f))
-                val alpha = (1f - progress) * (0.10f + boosted * 0.26f)
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(
-                            ringColor.copy(alpha = alpha),
-                            ringColor.copy(alpha = alpha * 0.34f),
-                            Color.Transparent,
-                        ),
-                        center = center,
-                        radius = radius,
-                    ),
-                    radius = radius,
-                    center = center,
-                )
-            }
-
-            val blobCount = 8
-            repeat(blobCount) { index ->
-                val angle = (index.toDouble() / blobCount.toDouble()) * 2.0 * PI
-                val trigger = ((sin(phase * 0.37 + index * 1.91) + 1.0) * 0.5).toFloat()
-                val peak = (trigger * trigger * (0.28f + boosted * 0.72f)).coerceIn(0f, 1f)
-                val offset = diameter * (0.08f + boosted * 0.22f) * (0.76f + peak * 0.28f)
-                val blobCenter = Offset(
-                    x = center.x + cos(angle).toFloat() * offset,
-                    y = center.y + sin(angle).toFloat() * offset,
-                )
-                val blobRadius = diameter * (0.08f + boosted * 0.20f + peak * 0.12f)
-                val blobAlpha = 0.10f + boosted * 0.30f + peak * 0.18f
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colors = listOf(
-                            ringColor.copy(alpha = blobAlpha),
-                            ringColor.copy(alpha = blobAlpha * 0.38f),
-                            Color.Transparent,
-                        ),
-                        center = blobCenter,
-                        radius = blobRadius,
-                    ),
-                    radius = blobRadius,
-                    center = blobCenter,
-                )
-            }
-        }
         drawCircle(
             color = ringColor,
             radius = ringRadius,
