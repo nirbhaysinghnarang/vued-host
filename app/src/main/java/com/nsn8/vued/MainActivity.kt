@@ -373,7 +373,7 @@ private fun ProdRecorderMainScreen() {
                     ) {
                         Text(
                             text = if (status.running) "Mute" else "Unmute",
-                            fontSize = 24.sp,
+                            fontSize = 38.sp,
                             fontWeight = FontWeight.SemiBold,
                             letterSpacing = 0.sp,
                         )
