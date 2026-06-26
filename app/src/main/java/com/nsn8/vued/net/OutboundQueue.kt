@@ -2,6 +2,7 @@ package com.nsn8.vued.net
 
 import android.content.Context
 import android.util.Log
+import com.nsn8.vued.audio.RollingBuffer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -50,7 +51,9 @@ object OutboundQueue {
         runCatching { JSONArray(prefs(context).getString(KEY, "[]")) }.getOrDefault(JSONArray())
 
     private fun save(context: Context, arr: JSONArray) {
-        prefs(context).edit().putString(KEY, arr.toString()).apply()
+        check(prefs(context).edit().putString(KEY, arr.toString()).commit()) {
+            "Could not persist outbound queue."
+        }
     }
 
     private fun append(context: Context, item: JSONObject) {
@@ -222,6 +225,7 @@ object OutboundQueue {
                 setMetadataDone(context, id) // persist so a retry skips re-create
             }
             VuedApi.uploadSliceAudio(id, file.readBytes(), durationSecs, sizeBytes)
+            runCatching { deleteUploadedSourceSegments(context, item) }
             file.delete()
             remove(context, id)
             Log.i(TAG, "uploaded queued slice $id")
@@ -238,6 +242,13 @@ object OutboundQueue {
                 o.getString("kind") == Kind.MEETING_CREATE.name && o.optString("meetingId") == meetingId
             }
         }
+
+    private fun deleteUploadedSourceSegments(context: Context, item: JSONObject) {
+        val segmentsDir = context.getExternalFilesDir(null)?.let { File(it, "segments") } ?: return
+        val startMs = (item.getDouble("startedAtSec") * 1000).toLong()
+        val endMs = (item.getDouble("endedAtSec") * 1000).toLong()
+        RollingBuffer.deleteSegmentsCoveredBy(segmentsDir, startMs, endMs)
+    }
 
     // ---- index mutations (whole-array rewrite under lock, like iOS UserDefaults) ----
 

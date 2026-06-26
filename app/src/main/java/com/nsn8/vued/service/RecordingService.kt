@@ -77,12 +77,14 @@ class RecordingService : Service() {
         AmbientFlusher.attach(pipeline.rollingBuffer)
         // Drain any backlog left by a previous run (offline/crash) as soon as we're up.
         ambientScope.launch {
+            MeetingController.retryPendingExports(applicationContext)
             runCatching { OutboundQueue.drain(applicationContext) }
             runCatching { AmbientProcessor.processOnce(applicationContext) }
         }
         ambientJob = ambientScope.launch {
             while (isActive) {
                 delay(AmbientFlusher.INTERVAL_MS)
+                MeetingController.retryPendingExports(applicationContext)
                 runCatching { AmbientFlusher.flushOnce(this@RecordingService) }
                 runCatching { AmbientProcessor.processOnce(this@RecordingService) }
             }

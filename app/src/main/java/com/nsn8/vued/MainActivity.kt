@@ -487,25 +487,26 @@ private fun ProdRecorderMainScreen() {
                 Button(
                     enabled = !segmentBusy && (status.running || meetingActive),
                     onClick = {
-                        scope.launch {
-                            segmentBusy = true
-                            try {
-                                if (meetingActive) {
-                                    meetingActive = false
-                                    nowMs = System.currentTimeMillis()
-                                    MeetingController.stop(context)
-                                } else {
+                        if (meetingActive) {
+                            runCatching { MeetingController.stopAsync(context) }
+                            meetingActive = MeetingController.active != null
+                            segmentStartedAt = MeetingController.active?.startMs ?: 0L
+                            nowMs = System.currentTimeMillis()
+                        } else {
+                            scope.launch {
+                                segmentBusy = true
+                                try {
                                     MeetingController.start(context, "Meeting")
                                     segmentStartedAt = MeetingController.active?.startMs
                                         ?: System.currentTimeMillis()
                                     nowMs = System.currentTimeMillis()
                                     meetingActive = true
+                                } catch (_: Throwable) {
+                                    meetingActive = MeetingController.active != null
+                                    segmentStartedAt = MeetingController.active?.startMs ?: 0L
+                                } finally {
+                                    segmentBusy = false
                                 }
-                            } catch (_: Throwable) {
-                                meetingActive = MeetingController.active != null
-                                segmentStartedAt = MeetingController.active?.startMs ?: 0L
-                            } finally {
-                                segmentBusy = false
                             }
                         }
                     },

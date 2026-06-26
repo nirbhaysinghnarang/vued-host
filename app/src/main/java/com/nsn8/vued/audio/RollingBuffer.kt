@@ -18,7 +18,7 @@ class RollingBuffer(
     private val directory: File,
     private val sampleRate: Int = 16_000,
     private val segmentSeconds: Int = 30,
-    private val retentionSeconds: Long = 2 * 60 * 60,
+    private val retentionSeconds: Long = 72 * 60 * 60,
     private val onSegmentClosed: (file: File, count: Int) -> Unit = { _, _ -> },
 ) {
     /** A finalized, readable segment and its approximate wall-clock span. */
@@ -126,7 +126,18 @@ class RollingBuffer(
         }
     }
 
-    private companion object {
-        const val TAG = "VuedRollingBuffer"
+    companion object {
+        private const val TAG = "VuedRollingBuffer"
+        const val DEFAULT_SEGMENT_SECONDS = 30
+
+        fun deleteSegmentsCoveredBy(directory: File, startMs: Long, endMs: Long) {
+            directory.listFiles { f -> f.name.endsWith(".m4a") }?.forEach { file ->
+                val segmentStartMs = (file.nameWithoutExtension.toLongOrNull() ?: return@forEach) * 1000
+                val segmentEndMs = segmentStartMs + DEFAULT_SEGMENT_SECONDS * 1000L
+                if (segmentStartMs >= startMs && segmentEndMs <= endMs) {
+                    runCatching { file.delete() }
+                }
+            }
+        }
     }
 }
