@@ -168,11 +168,148 @@ private fun LoadingScreen() {
 private fun ProdRecorderScreen() {
     val context = LocalContext.current
     var roomName by remember { mutableStateOf(RoomConfig.roomName(context)) }
+    var ambientUnlocked by remember { mutableStateOf(AmbientDecryptor.isUnlocked(context)) }
 
-    if (roomName == null) {
+    if (!ambientUnlocked) {
+        AmbientPassphraseOnboardingScreen(onUnlocked = { ambientUnlocked = true })
+    } else if (roomName == null) {
         RoomOnboardingScreen(onRoomPicked = { roomName = it })
     } else {
         ProdRecorderMainScreen()
+    }
+}
+
+@Composable
+private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var loading by remember { mutableStateOf(true) }
+    var hasVault by remember { mutableStateOf<Boolean?>(null) }
+    var passphrase by remember { mutableStateOf("") }
+    var confirmPassphrase by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        try {
+            hasVault = AmbientDecryptor.hasRemoteVault()
+        } catch (e: Exception) {
+            error = e.message ?: "Could not check encryption setup."
+        } finally {
+            loading = false
+        }
+    }
+
+    val creating = hasVault == false
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(VuedBackground)
+            .padding(32.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(0.62f),
+            shape = RoundedCornerShape(8.dp),
+            color = VuedSurfaceRaised,
+            tonalElevation = 0.dp,
+            shadowElevation = 8.dp,
+            border = BorderStroke(1.dp, VuedHairline),
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 28.dp, vertical = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(
+                    text = if (creating) "Create encryption passphrase" else "Enter encryption passphrase",
+                    color = VuedTextPrimary,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 24.sp,
+                    letterSpacing = 0.sp,
+                )
+                Text(
+                    text = if (creating) {
+                        "This tablet needs a passphrase before ambient processing can run."
+                    } else {
+                        "Unlock this tablet so it can process ambient candidates locally."
+                    },
+                    color = VuedTextTertiary,
+                    fontSize = 15.sp,
+                    letterSpacing = 0.sp,
+                )
+                if (loading) {
+                    Text("Checking encryption setup...", color = VuedTextSecondary)
+                } else {
+                    OutlinedTextField(
+                        value = passphrase,
+                        onValueChange = { passphrase = it },
+                        label = { Text("Passphrase") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (creating) {
+                        OutlinedTextField(
+                            value = confirmPassphrase,
+                            onValueChange = { confirmPassphrase = it },
+                            label = { Text("Confirm passphrase") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    Button(
+                        enabled = !busy && passphrase.isNotBlank() && (!creating || confirmPassphrase.isNotBlank()),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = VuedTextPrimary,
+                            contentColor = Color.White,
+                        ),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(58.dp),
+                        onClick = {
+                            scope.launch {
+                                busy = true
+                                error = null
+                                try {
+                                    if (creating) {
+                                        if (passphrase != confirmPassphrase) {
+                                            error = "Passphrases do not match."
+                                            return@launch
+                                        }
+                                        AmbientDecryptor.provision(context, passphrase)
+                                    } else {
+                                        AmbientDecryptor.unlock(context, passphrase)
+                                    }
+                                    passphrase = ""
+                                    confirmPassphrase = ""
+                                    onUnlocked()
+                                } catch (e: Throwable) {
+                                    error = e.message ?: "Could not unlock encryption."
+                                } finally {
+                                    busy = false
+                                }
+                            }
+                        },
+                    ) {
+                        Text(
+                            text = when {
+                                busy -> if (creating) "Creating..." else "Unlocking..."
+                                creating -> "Create passphrase"
+                                else -> "Unlock"
+                            },
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.sp,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
