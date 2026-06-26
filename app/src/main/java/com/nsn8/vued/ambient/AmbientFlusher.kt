@@ -1,6 +1,8 @@
 package com.nsn8.vued.ambient
 
 import android.content.Context
+import android.os.SystemClock
+import android.util.Log
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.meeting.MeetingController
@@ -21,6 +23,7 @@ import java.util.UUID
 object AmbientFlusher {
 
     const val INTERVAL_MS = 5 * 60 * 1000L
+    private const val TAG = "VuedAmbientFlusher"
 
     private val sessionId: String = UUID.randomUUID().toString()
 
@@ -37,10 +40,12 @@ object AmbientFlusher {
     fun attach(buffer: RollingBuffer) {
         rolling = buffer
         lastFlushMs = System.currentTimeMillis()
+        Log.i(TAG, "attached lastFlushMs=$lastFlushMs")
     }
 
     fun detach() {
         rolling = null
+        Log.i(TAG, "detached")
     }
 
     /**
@@ -50,6 +55,7 @@ object AmbientFlusher {
      */
     fun resumeAfter(endMs: Long) {
         if (endMs > lastFlushMs) lastFlushMs = endMs
+        Log.i(TAG, "resumeAfter endMs=$endMs lastFlushMs=$lastFlushMs")
     }
 
     /**
@@ -59,7 +65,11 @@ object AmbientFlusher {
      * lost, regardless of network. A failed/offline upload simply stays queued.
      */
     suspend fun flushOnce(context: Context): String = withContext(Dispatchers.IO) {
-        val buffer = rolling ?: return@withContext "not capturing"
+        val totalStartMs = SystemClock.elapsedRealtime()
+        val buffer = rolling ?: run {
+            Log.i(TAG, "flush skipped: not capturing")
+            return@withContext "not capturing"
+        }
         val now = System.currentTimeMillis()
         val windowStart = lastFlushMs
 
@@ -69,24 +79,44 @@ object AmbientFlusher {
         val meetingStart = MeetingController.active?.startMs
         val windowEnd = if (meetingStart != null) minOf(now, meetingStart) else now
         if (windowEnd <= windowStart) {
-            return@withContext if (meetingStart != null) "ambient paused (meeting active)" else "nothing to flush yet"
+            val reason = if (meetingStart != null) "ambient paused (meeting active)" else "nothing to flush yet"
+            Log.i(TAG, "flush skipped: $reason windowMs=${windowEnd - windowStart}")
+            return@withContext reason
         }
+        Log.i(TAG, "flush begin windowMs=${windowEnd - windowStart} meetingActive=${meetingStart != null}")
 
+        val flushStartMs = SystemClock.elapsedRealtime()
         buffer.flush()
+        Log.i(TAG, "flush buffer done elapsedMs=${SystemClock.elapsedRealtime() - flushStartMs}")
+        val segments = buffer.listSegments()
+        Log.i(TAG, "flush segments count=${segments.size}")
         val out = File(context.cacheDir, "ambient_$now.m4a")
-        val export = SegmentExporter.exportWindow(buffer.listSegments(), windowStart, windowEnd, out)
+        val exportStartMs = SystemClock.elapsedRealtime()
+        val export = SegmentExporter.exportWindow(segments, windowStart, windowEnd, out)
         if (export == null) {
             out.delete()
             lastFlushMs = windowEnd
+            Log.i(TAG, "flush export empty windowMs=${windowEnd - windowStart}")
             return@withContext "no audio in window"
         }
+        Log.i(
+            TAG,
+            "flush export done segments=${export.segmentCount} durationMs=${export.durationMs} " +
+                "bytes=${out.length()} elapsedMs=${SystemClock.elapsedRealtime() - exportStartMs}",
+        )
         val sliceId = UUID.randomUUID().toString()
         val durationSecs = export.durationMs / 1000.0
         // Durably enqueue BEFORE any network — this consumes `out` and is the commit point.
         OutboundQueue.enqueueAmbient(context, sliceId, sessionId, windowStart / 1000.0, windowEnd / 1000.0, durationSecs, out)
         lastFlushMs = windowEnd
         lastUploadMs = windowEnd
+        val drainStartMs = SystemClock.elapsedRealtime()
         OutboundQueue.drain(context) // upload this slice + any offline backlog
+        Log.i(
+            TAG,
+            "flush drain done slice=$sliceId pending=${OutboundQueue.size(context)} " +
+                "elapsedMs=${SystemClock.elapsedRealtime() - drainStartMs} totalElapsedMs=${SystemClock.elapsedRealtime() - totalStartMs}",
+        )
         "queued ambient slice (${"%.1f".format(durationSecs)}s); ${OutboundQueue.size(context)} pending"
     }
 }

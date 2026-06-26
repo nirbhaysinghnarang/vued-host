@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -91,6 +92,7 @@ import io.github.jan.supabase.auth.status.SessionStatus
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
+private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
 private enum class HostUiMode { DEV, PROD }
@@ -364,7 +366,8 @@ private fun ProdRecorderMainScreen() {
                                     nowMs = System.currentTimeMillis()
                                     meetingActive = true
                                 }
-                            } catch (_: Throwable) {
+                            } catch (error: Throwable) {
+                                Log.w(TAG, "meeting button failed: ${error.message}", error)
                                 meetingActive = MeetingController.active != null
                                 segmentStartedAt = MeetingController.active?.startMs ?: 0L
                             } finally {
@@ -704,6 +707,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                             meetingMsg = "Recording meeting ${id.take(8)}…"
                         }
                     } catch (e: Throwable) {
+                        Log.w(TAG, "dev meeting action failed: ${e.message}", e)
                         meetingActive = MeetingController.active != null
                         meetingMsg = "meeting error: ${e.message}"
                     }
@@ -718,6 +722,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                         "ambient: " + AmbientFlusher.flushOnce(context) +
                             "; " + AmbientProcessor.processOnce(context)
                     } catch (e: Throwable) {
+                        Log.w(TAG, "dev ambient flush failed: ${e.message}", e)
                         "ambient flush error: ${e.message}"
                     }
                 }
