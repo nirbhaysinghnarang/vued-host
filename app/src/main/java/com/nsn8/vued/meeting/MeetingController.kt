@@ -1,6 +1,7 @@
 package com.nsn8.vued.meeting
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.audio.RollingBuffer
@@ -30,10 +31,10 @@ import java.util.UUID
 object MeetingController {
 
     data class ActiveMeeting(val meetingId: String, val startMs: Long)
-    data class StopResult(val meetingId: String, val durationSecs: Double)
+    data class StopResult(val meetingId: String, val durationSecs: Double, val sizeBytes: Long)
     private data class ClosedMeeting(val meetingId: String, val startMs: Long, val endMs: Long)
 
-    private const val TAG = "VuedMeetingController"
+    private const val TAG = "VuedMeeting"
     private const val PREFS = "vued_meeting_exports"
     private const val KEY_PENDING = "pending"
 
@@ -79,10 +80,16 @@ object MeetingController {
         buffer.flush()
         val meetingId = UUID.randomUUID().toString().replace("-", "")
         val startMs = System.currentTimeMillis()
+        Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
         OutboundQueue.enqueueMeetingCreate(context, meetingId, title, startMs / 1000.0)
         active = ActiveMeeting(meetingId, startMs)
         val appContext = context.applicationContext
-        queueScope.launch { runCatching { OutboundQueue.drain(appContext) } }
+        queueScope.launch {
+            Log.i(TAG, "start drain begin meeting=$meetingId")
+            runCatching { OutboundQueue.drain(appContext) }
+                .onSuccess { Log.i(TAG, "start drain done meeting=$meetingId pending=${OutboundQueue.size(appContext)}") }
+                .onFailure { Log.w(TAG, "start drain failed meeting=$meetingId: ${it.message}", it) }
+        }
         retryPendingExports(appContext)
         return meetingId
     }
@@ -91,11 +98,18 @@ object MeetingController {
         val meeting = active ?: error("No active meeting.")
         val endMs = System.currentTimeMillis()
         active = null
+        Log.i(TAG, "stop begin meeting=${meeting.meetingId} windowMs=${endMs - meeting.startMs}")
         AmbientFlusher.resumeAfter(endMs)
         val appContext = context.applicationContext
-        val durationSecs = exportAndEnqueue(appContext, ClosedMeeting(meeting.meetingId, meeting.startMs, endMs))
+        val result = exportAndEnqueue(appContext, ClosedMeeting(meeting.meetingId, meeting.startMs, endMs))
+        val drainStartMs = SystemClock.elapsedRealtime()
         OutboundQueue.drain(appContext)
-        StopResult(meeting.meetingId, durationSecs)
+        Log.i(
+            TAG,
+            "stop drain done meeting=${meeting.meetingId} pending=${OutboundQueue.size(appContext)} " +
+                "elapsedMs=${SystemClock.elapsedRealtime() - drainStartMs}",
+        )
+        StopResult(meeting.meetingId, result.durationSecs, result.sizeBytes)
     }
 
     fun stopAsync(context: Context) {
@@ -103,6 +117,7 @@ object MeetingController {
         val closed = ClosedMeeting(meeting.meetingId, meeting.startMs, System.currentTimeMillis())
         persistPending(context.applicationContext, closed)
         active = null
+        Log.i(TAG, "stop async queued meeting=${meeting.meetingId} windowMs=${closed.endMs - meeting.startMs}")
         AmbientFlusher.resumeAfter(closed.endMs)
         retryPendingExports(context.applicationContext)
     }
@@ -114,28 +129,59 @@ object MeetingController {
     private suspend fun drainPendingExports(context: Context) {
         pendingExports(context).forEach { meeting ->
             runCatching {
-                exportAndEnqueue(context, meeting)
+                val result = exportAndEnqueue(context, meeting)
                 removePending(context, meeting.meetingId)
+                val drainStartMs = SystemClock.elapsedRealtime()
                 OutboundQueue.drain(context)
+                Log.i(
+                    TAG,
+                    "pending export done meeting=${meeting.meetingId} durationSecs=${result.durationSecs} " +
+                        "pending=${OutboundQueue.size(context)} elapsedMs=${SystemClock.elapsedRealtime() - drainStartMs}",
+                )
             }.onFailure { error ->
-                Log.w(TAG, "meeting ${meeting.meetingId} export still pending: ${error.message}")
+                Log.w(TAG, "meeting ${meeting.meetingId} export still pending: ${error.message}", error)
             }
         }
     }
 
-    private fun exportAndEnqueue(context: Context, meeting: ClosedMeeting): Double {
+    private data class ExportResult(val durationSecs: Double, val sizeBytes: Long)
+
+    private fun exportAndEnqueue(context: Context, meeting: ClosedMeeting): ExportResult {
         val buffer = rolling ?: error("Ambient buffer not running.")
+        val totalStartMs = SystemClock.elapsedRealtime()
+        val flushStartMs = SystemClock.elapsedRealtime()
         buffer.flush()
+        Log.i(TAG, "export flush done meeting=${meeting.meetingId} elapsedMs=${SystemClock.elapsedRealtime() - flushStartMs}")
+        val segments = buffer.listSegments()
+        Log.i(TAG, "export segments meeting=${meeting.meetingId} count=${segments.size}")
         val out = File(context.cacheDir, "meeting_${meeting.meetingId}.m4a")
-        val export = SegmentExporter.exportWindow(buffer.listSegments(), meeting.startMs, meeting.endMs, out)
-            ?: error("No audio captured for this meeting window.")
-        val sliceId = UUID.nameUUIDFromBytes("meeting:${meeting.meetingId}".toByteArray()).toString()
+        val exportStartMs = SystemClock.elapsedRealtime()
+        val export = SegmentExporter.exportWindow(segments, meeting.startMs, meeting.endMs, out)
+        if (export == null) {
+            out.delete()
+            Log.w(TAG, "export empty meeting=${meeting.meetingId}")
+            error("No audio captured for this meeting window.")
+        }
         val durationSecs = export.durationMs / 1000.0
+        val sizeBytes = out.length()
+        Log.i(
+            TAG,
+            "export done meeting=${meeting.meetingId} segments=${export.segmentCount} " +
+                "durationMs=${export.durationMs} bytes=$sizeBytes elapsedMs=${SystemClock.elapsedRealtime() - exportStartMs}",
+        )
+
+        val sliceId = UUID.nameUUIDFromBytes("meeting:${meeting.meetingId}".toByteArray()).toString()
+        val enqueueStartMs = SystemClock.elapsedRealtime()
         OutboundQueue.enqueueMeeting(
             context, sliceId, sessionId, meeting.meetingId,
             meeting.startMs / 1000.0, meeting.endMs / 1000.0, durationSecs, out,
         )
-        return durationSecs
+        Log.i(
+            TAG,
+            "enqueue done meeting=${meeting.meetingId} slice=$sliceId " +
+                "elapsedMs=${SystemClock.elapsedRealtime() - enqueueStartMs} totalElapsedMs=${SystemClock.elapsedRealtime() - totalStartMs}",
+        )
+        return ExportResult(durationSecs, sizeBytes)
     }
 
     private fun prefs(context: Context) =
