@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -37,6 +38,7 @@ object MeetingController {
     private const val TAG = "VuedMeeting"
     private const val PREFS = "vued_meeting_exports"
     private const val KEY_PENDING = "pending"
+    private const val ACTIVE_CREATE_RETRY_MS = 5_000L
 
     // One session id per app process (matches iOS session semantics).
     private val sessionId: String = UUID.randomUUID().toString()
@@ -90,6 +92,7 @@ object MeetingController {
                 .onSuccess { Log.i(TAG, "start drain done meeting=$meetingId pending=${OutboundQueue.size(appContext)}") }
                 .onFailure { Log.w(TAG, "start drain failed meeting=$meetingId: ${it.message}", it) }
         }
+        retryActiveMeetingCreate(appContext, meetingId)
         retryPendingExports(appContext)
         return meetingId
     }
@@ -124,6 +127,22 @@ object MeetingController {
 
     fun retryPendingExports(context: Context) {
         exportSignals.trySend(context.applicationContext)
+    }
+
+    private fun retryActiveMeetingCreate(context: Context, meetingId: String) {
+        queueScope.launch {
+            while (active?.meetingId == meetingId) {
+                delay(ACTIVE_CREATE_RETRY_MS)
+                if (active?.meetingId != meetingId) break
+                val created = runCatching { OutboundQueue.drainMeetingCreate(context, meetingId) }
+                    .onFailure { Log.w(TAG, "active create retry failed meeting=$meetingId: ${it.message}", it) }
+                    .getOrDefault(false)
+                if (created) {
+                    Log.i(TAG, "active create retry done meeting=$meetingId")
+                    break
+                }
+            }
+        }
     }
 
     private suspend fun drainPendingExports(context: Context) {

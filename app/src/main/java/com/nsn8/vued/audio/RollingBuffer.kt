@@ -79,11 +79,7 @@ class RollingBuffer(
         val inProgress = if (writer != null) currentFile else null
         directory.listFiles { f -> f.name.endsWith(".m4a") }
             ?.filter { it != inProgress }
-            ?.mapNotNull { f ->
-                f.nameWithoutExtension.toLongOrNull()?.let { sec ->
-                    Segment(f, sec * 1000, sec * 1000 + segmentSeconds * 1000L)
-                }
-            }
+            ?.mapNotNull { segmentFor(it, segmentSeconds) }
             ?.sortedBy { it.startMs }
             ?: emptyList()
     }
@@ -132,12 +128,19 @@ class RollingBuffer(
 
         fun deleteSegmentsCoveredBy(directory: File, startMs: Long, endMs: Long) {
             directory.listFiles { f -> f.name.endsWith(".m4a") }?.forEach { file ->
-                val segmentStartMs = (file.nameWithoutExtension.toLongOrNull() ?: return@forEach) * 1000
-                val segmentEndMs = segmentStartMs + DEFAULT_SEGMENT_SECONDS * 1000L
-                if (segmentStartMs >= startMs && segmentEndMs <= endMs) {
+                val segment = segmentFor(file, DEFAULT_SEGMENT_SECONDS) ?: return@forEach
+                if (segment.startMs >= startMs && segment.endMs <= endMs) {
                     runCatching { file.delete() }
                 }
             }
+        }
+
+        private fun segmentFor(file: File, segmentSeconds: Int): Segment? {
+            val startMs = (file.nameWithoutExtension.toLongOrNull() ?: return null) * 1000
+            val fallbackEndMs = startMs + segmentSeconds * 1000L
+            val modifiedMs = file.lastModified()
+            val endMs = if (modifiedMs in (startMs + 1) until fallbackEndMs) modifiedMs else fallbackEndMs
+            return Segment(file, startMs, endMs)
         }
     }
 }

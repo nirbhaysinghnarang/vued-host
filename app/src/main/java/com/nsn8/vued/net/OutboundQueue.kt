@@ -172,6 +172,20 @@ object OutboundQueue {
         }
     }
 
+    suspend fun drainMeetingCreate(context: Context, meetingId: String): Boolean {
+        val item = synchronized(lock) {
+            val arr = load(context)
+            (0 until arr.length())
+                .map { arr.getJSONObject(it) }
+                .firstOrNull {
+                    it.getString("kind") == Kind.MEETING_CREATE.name &&
+                        it.optString("meetingId") == meetingId
+                }
+        } ?: return true
+        drainMeetingCreate(context, item)
+        return !hasPendingMeetingCreate(context, meetingId)
+    }
+
     private suspend fun drainMeetingCreate(context: Context, item: JSONObject) {
         val meetingId = item.getString("meetingId")
         try {
