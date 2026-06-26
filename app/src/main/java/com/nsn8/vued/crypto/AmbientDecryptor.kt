@@ -13,10 +13,13 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.SecureRandom
 import java.security.Security
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.KeyGenerator
@@ -31,8 +34,58 @@ object AmbientDecryptor {
     private const val KEYSTORE_ALIAS = "vued-ambient-decryptor-v1"
     private const val VAULT_AAD_PREFIX = "vued-user-vault-v1:"
     private const val WRAP_INFO = "vued-content-key-wrap-v1"
+    private const val PUBLIC_KEY_PREFIX = "vued-x25519-spki-v1:"
+    private const val KDF_T_COST = 15
+    private const val KDF_M_COST_KIB = 32 * 1024
+    private const val KDF_PARALLELISM = 1
 
     fun isUnlocked(context: Context): Boolean = loadPrivateKeyDer(context) != null
+
+    suspend fun hasRemoteVault(): Boolean = withContext(Dispatchers.IO) {
+        VuedApi.fetchVaultOrNull() != null
+    }
+
+    suspend fun provision(context: Context, passphrase: String) = withContext(Dispatchers.IO) {
+        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val userId = jwtSub(token) ?: throw VuedApi.ApiException("could not read user id")
+        if (passphrase.isBlank()) throw VuedApi.ApiException("passphrase is required")
+        val pair = generateX25519KeyPair()
+        val privateDer = pair.private.encoded
+        val publicDer = pair.public.encoded
+        val salt = randomBytes(16)
+        val nonce = randomBytes(12)
+        val key = SCrypt.generate(
+            passphrase.toByteArray(StandardCharsets.UTF_8),
+            salt,
+            1 shl KDF_T_COST,
+            8,
+            KDF_PARALLELISM,
+            32,
+        )
+        val payload = JSONObject()
+            .put("privateKeyDerB64", b64(privateDer))
+            .toString()
+            .toByteArray(StandardCharsets.UTF_8)
+        val wrapped = encryptAesGcm(
+            key,
+            nonce,
+            payload,
+            (VAULT_AAD_PREFIX + userId).toByteArray(),
+        )
+        VuedApi.registerPublicKey(
+            keyId = "android-x25519-${UUID.randomUUID()}",
+            publicKeyset = PUBLIC_KEY_PREFIX + b64(publicDer),
+        )
+        VuedApi.storeVault(
+            salt = b64(salt),
+            nonce = b64(nonce),
+            wrappedKey = b64(wrapped),
+            kdfTCost = KDF_T_COST,
+            kdfMCostKiB = KDF_M_COST_KIB,
+            kdfParallelism = KDF_PARALLELISM,
+        )
+        storePrivateKeyDer(context, privateDer)
+    }
 
     suspend fun unlock(context: Context, passphrase: String) = withContext(Dispatchers.IO) {
         val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
@@ -118,6 +171,13 @@ object AmbientDecryptor {
         return agreement.generateSecret()
     }
 
+    private fun generateX25519KeyPair(): java.security.KeyPair {
+        if (Security.getProvider("BC") == null) Security.addProvider(BouncyCastleProvider())
+        val generator = runCatching { KeyPairGenerator.getInstance("X25519") }
+            .getOrElse { KeyPairGenerator.getInstance("X25519", "BC") }
+        return generator.generateKeyPair()
+    }
+
     private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(if (salt.isEmpty()) ByteArray(32) else salt, "HmacSHA256"))
@@ -146,6 +206,16 @@ object AmbientDecryptor {
         cipher.updateAAD(aad)
         return cipher.doFinal(ciphertext)
     }
+
+    private fun encryptAesGcm(key: ByteArray, nonce: ByteArray, plaintext: ByteArray, aad: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        return cipher.doFinal(plaintext)
+    }
+
+    private fun randomBytes(size: Int): ByteArray =
+        ByteArray(size).also { SecureRandom().nextBytes(it) }
 
     private fun jwtSub(token: String): String? = runCatching {
         val part = token.split(".")[1]

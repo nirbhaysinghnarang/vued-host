@@ -202,8 +202,38 @@ object VuedApi {
 
     // ---- ambient tablet decrypt assist ----
 
+    suspend fun fetchVaultOrNull(): JSONObject? =
+        request("/api/v1/vault", method = "GET")
+
     suspend fun fetchVault(): JSONObject =
-        request("/api/v1/vault", method = "GET") ?: throw ApiException("vault not found")
+        fetchVaultOrNull() ?: throw ApiException("vault not found")
+
+    suspend fun registerPublicKey(keyId: String, publicKeyset: String): JSONObject? =
+        post(
+            "/api/v1/keys",
+            JSONObject()
+                .put("key_id", keyId)
+                .put("public_keyset", publicKeyset),
+        )
+
+    suspend fun storeVault(
+        salt: String,
+        nonce: String,
+        wrappedKey: String,
+        kdfTCost: Int,
+        kdfMCostKiB: Int,
+        kdfParallelism: Int,
+    ): JSONObject? =
+        post(
+            "/api/v1/vault",
+            JSONObject()
+                .put("salt", salt)
+                .put("nonce", nonce)
+                .put("wrapped_key", wrappedKey)
+                .put("kdf_t_cost", kdfTCost)
+                .put("kdf_m_cost_kib", kdfMCostKiB)
+                .put("kdf_parallelism", kdfParallelism),
+        )
 
     suspend fun ambientProcessWindow(roomId: String): JSONObject? =
         request("/api/v1/ambient/window?roomId=${url(roomId)}", method = "GET")
