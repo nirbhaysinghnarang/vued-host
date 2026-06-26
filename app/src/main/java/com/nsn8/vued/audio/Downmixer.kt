@@ -52,6 +52,6 @@ class Downmixer(private val channels: Int) {
         // RollingBuffer's clamp limits peaks cleanly. Tune via the on-screen peak
         // meter so normal speech peaks land around -12 dBFS (≈0.25); raise if too
         // quiet, lower if it clips. ~+36 dB; sane starting point for far-field RAW.
-        const val MAKEUP_GAIN = 64.0
+        const val MAKEUP_GAIN = 128.0
     }
 }

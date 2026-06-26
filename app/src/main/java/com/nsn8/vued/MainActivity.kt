@@ -91,7 +91,7 @@ import io.github.jan.supabase.auth.status.SessionStatus
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
-private val HOST_UI_MODE = HostUiMode.DEV
+private val HOST_UI_MODE = HostUiMode.PROD
 
 private enum class HostUiMode { DEV, PROD }
 
