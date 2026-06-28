@@ -14,6 +14,7 @@ import android.util.Log
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.audio.CapturePipeline
+import com.nsn8.vued.capture.AndroidMicCapture
 import com.nsn8.vued.capture.MicArrayConfig
 import com.nsn8.vued.capture.PROFILE_UMA8
 import com.nsn8.vued.capture.Uma8Capture
@@ -30,9 +31,11 @@ import java.io.File
 import kotlin.math.log10
 
 /**
- * Always-on foreground service that streams the UMA-8, runs the [CapturePipeline],
- * and continuously writes 16 kHz mono M4A segments to disk. This is the Phase-1
- * ambient-capture foundation; mode/meeting logic and upload land in later phases.
+ * Always-on foreground service that streams the configured UMA mic array, falling
+ * back to Android microphone capture when no array is connected. The service runs
+ * the [CapturePipeline] and continuously writes 16 kHz mono M4A segments to disk.
+ * This is the Phase-1 ambient-capture foundation; mode/meeting logic and upload
+ * land in later phases.
  */
 class RecordingService : Service() {
 
@@ -66,12 +69,24 @@ class RecordingService : Service() {
         val segmentsDir = File(getExternalFilesDir(null), "segments")
         // Resolve the array profile before building the pipeline so the downmixer
         // sees the correct channel count. Manual selection overrides auto-detect;
-        // when AUTO and no device is plugged in yet, default to UMA-8 — the stream
-        // will throw on startup and the service tears down cleanly anyway.
+        // when no array is plugged in, fall back to Android's built-in microphone.
         val override = MicArrayConfig.selection(this).toProfile()
         val capture = Uma8Capture(this, override)
-        val profile = capture.resolveProfile() ?: override ?: PROFILE_UMA8
-        Log.i(TAG, "capture profile=${profile.label} channels=${profile.outChannels}")
+        val connectedArray = capture.findDevice()
+        val useAndroidMic = connectedArray == null
+        val profile = if (useAndroidMic) {
+            override ?: PROFILE_UMA8
+        } else {
+            capture.resolveProfile() ?: override ?: PROFILE_UMA8
+        }
+        Log.i(
+            TAG,
+            if (useAndroidMic) {
+                "capture profile=Android mic sampleRate=${AndroidMicCapture.SAMPLE_RATE_HZ}"
+            } else {
+                "capture profile=${profile.label} channels=${profile.outChannels}"
+            }
+        )
         val pipeline = CapturePipeline(segmentsDir, profile.outChannels)
         MeetingController.attach(pipeline.rollingBuffer)
         AmbientFlusher.attach(pipeline.rollingBuffer)
@@ -92,25 +107,24 @@ class RecordingService : Service() {
         var lastPublish = 0L
 
         try {
-            capture.streamPcm(
-                onPcm = { buffer, length ->
-                    pipeline.process(buffer, length)
-                    val now = System.currentTimeMillis()
-                    if (now - lastPublish >= PUBLISH_INTERVAL_MS) {
-                        lastPublish = now
-                        val peak = pipeline.peak
-                        val db = if (peak > 0f) 20f * log10(peak) else Float.NEGATIVE_INFINITY
-                        RecorderState.update {
-                            it.copy(
-                                segmentCount = pipeline.segmentCount,
-                                lastSegment = pipeline.lastSegmentPath,
-                                peakDb = db,
-                            )
-                        }
-                    }
-                },
-                shouldContinue = { running },
-            )
+            if (useAndroidMic) {
+                lastPublish = streamAndroidMic(pipeline, lastPublish)
+            } else {
+                try {
+                    capture.streamPcm(
+                        onPcm = { buffer, length ->
+                            pipeline.process(buffer, length)
+                            lastPublish = publishStateIfDue(pipeline, lastPublish)
+                        },
+                        shouldContinue = { running },
+                    )
+                } catch (error: Throwable) {
+                    if (!running) throw error
+                    Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
+                    RecorderState.update { it.copy(error = "UMA unavailable; using Android mic") }
+                    lastPublish = streamAndroidMic(pipeline, lastPublish)
+                }
+            }
         } catch (error: Throwable) {
             Log.e(TAG, "Capture loop ended: ${error.message}", error)
             RecorderState.update { it.copy(error = error.message ?: error.javaClass.simpleName) }
@@ -128,6 +142,33 @@ class RecordingService : Service() {
                 stopSelf()
             }
         }
+    }
+
+    private fun streamAndroidMic(pipeline: CapturePipeline, initialLastPublish: Long): Long {
+        var lastPublish = initialLastPublish
+        AndroidMicCapture().streamPcm(
+            onPcm = { samples, length ->
+                pipeline.process16kMono(samples, length)
+                lastPublish = publishStateIfDue(pipeline, lastPublish)
+            },
+            shouldContinue = { running },
+        )
+        return lastPublish
+    }
+
+    private fun publishStateIfDue(pipeline: CapturePipeline, lastPublish: Long): Long {
+        val now = System.currentTimeMillis()
+        if (now - lastPublish < PUBLISH_INTERVAL_MS) return lastPublish
+        val peak = pipeline.peak
+        val db = if (peak > 0f) 20f * log10(peak) else Float.NEGATIVE_INFINITY
+        RecorderState.update {
+            it.copy(
+                segmentCount = pipeline.segmentCount,
+                lastSegment = pipeline.lastSegmentPath,
+                peakDb = db,
+            )
+        }
+        return now
     }
 
     override fun onDestroy() {

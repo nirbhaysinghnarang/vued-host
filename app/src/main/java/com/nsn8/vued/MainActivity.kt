@@ -46,6 +46,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -69,6 +70,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nsn8.vued.ambient.AmbientFlusher
@@ -241,21 +243,17 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                 if (loading) {
                     Text("Checking encryption setup...", color = VuedTextSecondary)
                 } else {
-                    OutlinedTextField(
+                    PassphraseTextField(
                         value = passphrase,
                         onValueChange = { passphrase = it },
-                        label = { Text("Passphrase") },
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
+                        label = "Passphrase",
                         modifier = Modifier.fillMaxWidth(),
                     )
                     if (creating) {
-                        OutlinedTextField(
+                        PassphraseTextField(
                             value = confirmPassphrase,
                             onValueChange = { confirmPassphrase = it },
-                            label = { Text("Confirm passphrase") },
-                            visualTransformation = PasswordVisualTransformation(),
-                            singleLine = true,
+                            label = "Confirm passphrase",
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
@@ -311,6 +309,34 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun PassphraseTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+) {
+    var passphraseVisible by remember { mutableStateOf(false) }
+
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        visualTransformation = if (passphraseVisible) {
+            VisualTransformation.None
+        } else {
+            PasswordVisualTransformation()
+        },
+        trailingIcon = {
+            TextButton(onClick = { passphraseVisible = !passphraseVisible }) {
+                Text(if (passphraseVisible) "Hide" else "Show")
+            }
+        },
+        singleLine = true,
+        modifier = modifier,
+    )
 }
 
 @Composable
@@ -752,12 +778,10 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
         StatusLine("Ambient decrypt", ambientMsg)
         if (!ambientUnlocked) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
+                PassphraseTextField(
                     value = ambientPassphrase,
                     onValueChange = { ambientPassphrase = it },
-                    label = { Text("Passphrase") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
+                    label = "Passphrase",
                 )
                 Button(onClick = {
                     scope.launch {
