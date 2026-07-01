@@ -3,18 +3,22 @@ package com.nsn8.vued.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.audio.CapturePipeline
 import com.nsn8.vued.capture.AndroidMicCapture
+import com.nsn8.vued.capture.MicArrayProfile
 import com.nsn8.vued.capture.MicArrayConfig
 import com.nsn8.vued.capture.PROFILE_UMA8
 import com.nsn8.vued.capture.Uma8Capture
@@ -45,6 +49,8 @@ class RecordingService : Service() {
     private val ambientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var ambientJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var lastUsbPermissionRequestKey: String? = null
+    private var lastUsbPermissionRequestMs: Long = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -67,26 +73,11 @@ class RecordingService : Service() {
 
     private fun captureLoop() {
         val segmentsDir = File(getExternalFilesDir(null), "segments")
-        // Resolve the array profile before building the pipeline so the downmixer
-        // sees the correct channel count. Manual selection overrides auto-detect;
-        // when no array is plugged in, fall back to Android's built-in microphone.
+        // Manual selection overrides auto-detect. Keep a single rolling buffer alive
+        // while the physical capture source changes underneath it.
         val override = MicArrayConfig.selection(this).toProfile()
         val capture = Uma8Capture(this, override)
-        val connectedArray = capture.findDevice()
-        val useAndroidMic = connectedArray == null
-        val profile = if (useAndroidMic) {
-            override ?: PROFILE_UMA8
-        } else {
-            capture.resolveProfile() ?: override ?: PROFILE_UMA8
-        }
-        Log.i(
-            TAG,
-            if (useAndroidMic) {
-                "capture profile=Android mic sampleRate=${AndroidMicCapture.SAMPLE_RATE_HZ}"
-            } else {
-                "capture profile=${profile.label} channels=${profile.outChannels}"
-            }
-        )
+        val profile = readyUmaProfile(capture) ?: override ?: PROFILE_UMA8
         val pipeline = CapturePipeline(segmentsDir, profile.outChannels)
         MeetingController.attach(pipeline.rollingBuffer)
         AmbientFlusher.attach(pipeline.rollingBuffer)
@@ -105,24 +96,45 @@ class RecordingService : Service() {
             }
         }
         var lastPublish = 0L
+        var nextUmaAttemptMs = 0L
 
         try {
-            if (useAndroidMic) {
-                lastPublish = streamAndroidMic(pipeline, lastPublish)
-            } else {
-                try {
-                    capture.streamPcm(
-                        onPcm = { buffer, length ->
-                            pipeline.process(buffer, length)
-                            lastPublish = publishStateIfDue(pipeline, lastPublish)
+            while (running) {
+                val umaProfile = if (SystemClock.elapsedRealtime() >= nextUmaAttemptMs) {
+                    readyUmaProfile(capture)
+                } else {
+                    null
+                }
+
+                if (umaProfile != null) {
+                    try {
+                        pipeline.configureInputChannels(umaProfile.outChannels)
+                        Log.i(TAG, "capture profile=${umaProfile.label} channels=${umaProfile.outChannels}")
+                        RecorderState.update { it.copy(error = null) }
+                        capture.streamPcm(
+                            onPcm = { buffer, length ->
+                                pipeline.process(buffer, length)
+                                lastPublish = publishStateIfDue(pipeline, lastPublish)
+                            },
+                            shouldContinue = { running },
+                        )
+                        nextUmaAttemptMs = 0L
+                    } catch (error: Throwable) {
+                        if (!running) throw error
+                        Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
+                        RecorderState.update { it.copy(error = "UMA unavailable; using Android mic") }
+                        nextUmaAttemptMs = SystemClock.elapsedRealtime() + UMA_RETRY_AFTER_FAILURE_MS
+                    }
+                } else {
+                    Log.i(TAG, "capture profile=Android mic sampleRate=${AndroidMicCapture.SAMPLE_RATE_HZ}")
+                    lastPublish = streamAndroidMic(
+                        pipeline = pipeline,
+                        initialLastPublish = lastPublish,
+                        shouldContinue = {
+                            requestUmaPermissionIfNeeded(capture)
+                            running && !shouldAttemptUmaCapture(capture, nextUmaAttemptMs)
                         },
-                        shouldContinue = { running },
                     )
-                } catch (error: Throwable) {
-                    if (!running) throw error
-                    Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
-                    RecorderState.update { it.copy(error = "UMA unavailable; using Android mic") }
-                    lastPublish = streamAndroidMic(pipeline, lastPublish)
                 }
             }
         } catch (error: Throwable) {
@@ -144,14 +156,55 @@ class RecordingService : Service() {
         }
     }
 
-    private fun streamAndroidMic(pipeline: CapturePipeline, initialLastPublish: Long): Long {
+    private fun readyUmaProfile(capture: Uma8Capture): MicArrayProfile? {
+        val device = capture.findDevice() ?: return null
+        if (!capture.hasPermission(device)) return null
+        return capture.resolveProfile()
+    }
+
+    private fun requestUmaPermissionIfNeeded(capture: Uma8Capture) {
+        val device = capture.findDevice() ?: return
+        if (capture.hasPermission(device)) return
+
+        val now = SystemClock.elapsedRealtime()
+        val deviceKey = "${device.vendorId}:${device.productId}:${device.deviceName}"
+        if (
+            deviceKey == lastUsbPermissionRequestKey &&
+            now - lastUsbPermissionRequestMs < USB_PERMISSION_REQUEST_INTERVAL_MS
+        ) {
+            return
+        }
+        lastUsbPermissionRequestKey = deviceKey
+        lastUsbPermissionRequestMs = now
+
+        val intent = PendingIntent.getBroadcast(
+            this,
+            0,
+            Intent(ACTION_USB_PERMISSION).setPackage(packageName),
+            PendingIntent.FLAG_MUTABLE,
+        )
+        getSystemService(UsbManager::class.java).requestPermission(device, intent)
+        Log.i(TAG, "requested USB permission for ${device.productName ?: device.deviceName}")
+    }
+
+    private fun shouldAttemptUmaCapture(capture: Uma8Capture, nextUmaAttemptMs: Long): Boolean {
+        if (SystemClock.elapsedRealtime() < nextUmaAttemptMs) return false
+        val device = capture.findDevice() ?: return false
+        return capture.hasPermission(device)
+    }
+
+    private fun streamAndroidMic(
+        pipeline: CapturePipeline,
+        initialLastPublish: Long,
+        shouldContinue: () -> Boolean,
+    ): Long {
         var lastPublish = initialLastPublish
         AndroidMicCapture().streamPcm(
             onPcm = { samples, length ->
                 pipeline.process16kMono(samples, length)
                 lastPublish = publishStateIfDue(pipeline, lastPublish)
             },
-            shouldContinue = { running },
+            shouldContinue = shouldContinue,
         )
         return lastPublish
     }
@@ -226,9 +279,12 @@ class RecordingService : Service() {
 
     companion object {
         const val ACTION_STOP = "com.nsn8.vued.action.STOP_RECORDING"
+        private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
         private const val CHANNEL_ID = "vued_recording"
         private const val NOTIF_ID = 1001
         private const val PUBLISH_INTERVAL_MS = 300L
+        private const val UMA_RETRY_AFTER_FAILURE_MS = 5_000L
+        private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
         private const val TAG = "VuedRecordingService"
 
         fun start(context: Context) {

@@ -12,10 +12,11 @@ import kotlin.math.abs
  * [inputChannels] is the array's real-mic channel count (7 for UMA-8, 16 for
  * UMA-16); the downmix is a plain mean, so any value works.
  */
-class CapturePipeline(segmentsDir: File, inputChannels: Int) {
+class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
 
-    private val downmixer = Downmixer(inputChannels)
-    private val resampler = Resampler48to16()
+    private var inputChannels = initialInputChannels
+    private var downmixer = Downmixer(initialInputChannels)
+    private var resampler = Resampler48to16()
     private val rolling = RollingBuffer(segmentsDir)
 
     /** The live rolling buffer, so the meeting flow can flush + export windows. */
@@ -25,6 +26,13 @@ class CapturePipeline(segmentsDir: File, inputChannels: Int) {
     @Volatile
     var peak: Float = 0f
         private set
+
+    fun configureInputChannels(channels: Int) {
+        if (channels == inputChannels) return
+        inputChannels = channels
+        downmixer = Downmixer(channels)
+        resampler = Resampler48to16()
+    }
 
     fun process(buffer: ByteArray, length: Int) {
         val frames = downmixer.frameCount(length)
