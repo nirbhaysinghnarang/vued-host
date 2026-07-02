@@ -3,6 +3,7 @@ package com.nsn8.vued.ambient
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.meeting.MeetingController
@@ -97,6 +98,7 @@ object AmbientFlusher {
             out.delete()
             lastFlushMs = windowEnd
             Log.i(TAG, "flush export empty windowMs=${windowEnd - windowStart}")
+            DiagnosticsLogger.info("ambient_export_empty", mapOf("windowMs" to (windowEnd - windowStart)))
             return@withContext "no audio in window"
         }
         Log.i(
@@ -104,6 +106,12 @@ object AmbientFlusher {
             "flush export done segments=${export.segmentCount} durationMs=${export.durationMs} " +
                 "bytes=${out.length()} elapsedMs=${SystemClock.elapsedRealtime() - exportStartMs}",
         )
+        DiagnosticsLogger.info("ambient_export_completed", mapOf(
+            "segments" to export.segmentCount,
+            "durationMs" to export.durationMs,
+            "bytes" to out.length(),
+            "elapsedMs" to (SystemClock.elapsedRealtime() - exportStartMs),
+        ))
         val sliceId = UUID.randomUUID().toString()
         val durationSecs = export.durationMs / 1000.0
         // Durably enqueue BEFORE any network — this consumes `out` and is the commit point.
@@ -117,6 +125,13 @@ object AmbientFlusher {
             "flush drain done slice=$sliceId pending=${OutboundQueue.size(context)} " +
                 "elapsedMs=${SystemClock.elapsedRealtime() - drainStartMs} totalElapsedMs=${SystemClock.elapsedRealtime() - totalStartMs}",
         )
+        DiagnosticsLogger.info("ambient_flush_completed", mapOf(
+            "sliceId" to sliceId,
+            "pending" to OutboundQueue.size(context),
+            "durationSecs" to durationSecs,
+            "drainElapsedMs" to (SystemClock.elapsedRealtime() - drainStartMs),
+            "totalElapsedMs" to (SystemClock.elapsedRealtime() - totalStartMs),
+        ))
         "queued ambient slice (${"%.1f".format(durationSecs)}s); ${OutboundQueue.size(context)} pending"
     }
 }

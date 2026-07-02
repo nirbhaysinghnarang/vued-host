@@ -20,6 +20,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "SENTRY_DSN", "\"${System.getenv("VUED_HOST_SENTRY_DSN") ?: "https://cdd4abcaf4d2dc9696e575a51be4b59b@o4511363432841216.ingest.us.sentry.io/4511664076947456"}\"")
+        buildConfigField("String", "SENTRY_ENVIRONMENT", "\"${System.getenv("SENTRY_ENVIRONMENT") ?: System.getenv("VUED_ENVIRONMENT") ?: "development"}\"")
+        buildConfigField("String", "SENTRY_RELEASE", "\"${System.getenv("SENTRY_RELEASE") ?: "vued-host@${versionName}+${versionCode}"}\"")
     }
 
     buildTypes {
@@ -35,6 +38,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     externalNativeBuild {
         cmake {
@@ -58,6 +62,7 @@ dependencies {
     implementation(libs.ktor.client.okhttp)
     implementation(libs.okhttp)
     implementation(libs.bouncycastle)
+    implementation(libs.sentry.android)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

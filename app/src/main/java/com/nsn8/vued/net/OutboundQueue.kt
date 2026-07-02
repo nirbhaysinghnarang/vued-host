@@ -2,6 +2,7 @@ package com.nsn8.vued.net
 
 import android.content.Context
 import android.util.Log
+import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.audio.RollingBuffer
 import org.json.JSONArray
 import org.json.JSONObject
@@ -86,6 +87,10 @@ object OutboundQueue {
                 .putOpt("microphoneId", RoomConfig.microphoneId(context)),
         )
         Log.i(TAG, "enqueued MEETING_CREATE $meetingId")
+        DiagnosticsLogger.info("queue_meeting_create_enqueued", mapOf(
+            "meetingId" to meetingId,
+            "pending" to size(context),
+        ))
     }
 
     fun enqueueAmbient(
@@ -146,6 +151,13 @@ object OutboundQueue {
                 ),
             )
             Log.i(TAG, "enqueued $kind slice $sliceId (${dest.length()} bytes)")
+            DiagnosticsLogger.info("queue_audio_enqueued", mapOf(
+                "kind" to kind.name,
+                "sliceId" to sliceId,
+                "meetingId" to meetingId,
+                "bytes" to dest.length(),
+                "pending" to load(context).length(),
+            ))
         }
     }
 
@@ -158,15 +170,23 @@ object OutboundQueue {
      */
     suspend fun drain(context: Context) {
         if (!draining.compareAndSet(false, true)) return
+        val startedAt = System.currentTimeMillis()
+        var attempted = 0
         try {
             val items = synchronized(lock) { load(context) }
             for (i in 0 until items.length()) {
+                attempted += 1
                 val item = items.getJSONObject(i)
                 when (Kind.valueOf(item.getString("kind"))) {
                     Kind.MEETING_CREATE -> drainMeetingCreate(context, item)
                     Kind.AMBIENT, Kind.MEETING -> drainAudio(context, item)
                 }
             }
+            DiagnosticsLogger.info("queue_drain_completed", mapOf(
+                "attempted" to attempted,
+                "pending" to size(context),
+                "elapsedMs" to (System.currentTimeMillis() - startedAt),
+            ))
         } finally {
             draining.set(false)
         }
@@ -202,6 +222,7 @@ object OutboundQueue {
             Log.i(TAG, "created queued meeting $meetingId")
         } catch (e: Exception) {
             Log.w(TAG, "meeting $meetingId create still pending: ${e.message}")
+            DiagnosticsLogger.warn("queue_meeting_create_pending", mapOf("meetingId" to meetingId), e)
         }
     }
 
@@ -216,6 +237,7 @@ object OutboundQueue {
         val file = File(dir(context), "$id.m4a")
         if (!file.exists()) {
             remove(context, id) // orphan record
+            DiagnosticsLogger.warn("queue_audio_orphan_removed", mapOf("sliceId" to id, "kind" to kind.name))
             return
         }
         try {
@@ -245,6 +267,11 @@ object OutboundQueue {
             Log.i(TAG, "uploaded queued slice $id")
         } catch (e: Exception) {
             Log.w(TAG, "slice $id still pending: ${e.message}")
+            DiagnosticsLogger.warn("queue_audio_pending", mapOf(
+                "sliceId" to id,
+                "kind" to kind.name,
+                "meetingId" to item.optString("meetingId", ""),
+            ), e)
         }
     }
 

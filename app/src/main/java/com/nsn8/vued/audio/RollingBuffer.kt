@@ -1,6 +1,7 @@
 package com.nsn8.vued.audio
 
 import android.util.Log
+import com.nsn8.vued.DiagnosticsLogger
 import java.io.File
 
 /**
@@ -105,6 +106,7 @@ class RollingBuffer(
             AacM4aSegmentWriter(file, sampleRate = sampleRate)
         } catch (error: Throwable) {
             Log.e(TAG, "Failed to open segment ${file.name}: ${error.message}")
+            DiagnosticsLogger.error("rolling_buffer_segment_open_failed", mapOf("fileName" to file.name), error)
             null
         }
         samplesInSegment = 0

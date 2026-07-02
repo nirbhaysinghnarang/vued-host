@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.audio.CapturePipeline
@@ -110,6 +111,10 @@ class RecordingService : Service() {
                     try {
                         pipeline.configureInputChannels(umaProfile.outChannels)
                         Log.i(TAG, "capture profile=${umaProfile.label} channels=${umaProfile.outChannels}")
+                        DiagnosticsLogger.info("capture_profile_selected", mapOf(
+                            "profile" to umaProfile.label,
+                            "channels" to umaProfile.outChannels,
+                        ))
                         RecorderState.update { it.copy(error = null) }
                         capture.streamPcm(
                             onPcm = { buffer, length ->
@@ -122,11 +127,16 @@ class RecordingService : Service() {
                     } catch (error: Throwable) {
                         if (!running) throw error
                         Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
+                        DiagnosticsLogger.warn("uma_capture_fallback", mapOf("message" to (error.message ?: "")), error)
                         RecorderState.update { it.copy(error = "UMA unavailable; using Android mic") }
                         nextUmaAttemptMs = SystemClock.elapsedRealtime() + UMA_RETRY_AFTER_FAILURE_MS
                     }
                 } else {
                     Log.i(TAG, "capture profile=Android mic sampleRate=${AndroidMicCapture.SAMPLE_RATE_HZ}")
+                    DiagnosticsLogger.info("capture_profile_selected", mapOf(
+                        "profile" to "android_mic",
+                        "sampleRate" to AndroidMicCapture.SAMPLE_RATE_HZ,
+                    ))
                     lastPublish = streamAndroidMic(
                         pipeline = pipeline,
                         initialLastPublish = lastPublish,
@@ -139,6 +149,7 @@ class RecordingService : Service() {
             }
         } catch (error: Throwable) {
             Log.e(TAG, "Capture loop ended: ${error.message}", error)
+            DiagnosticsLogger.error("capture_loop_failed", throwable = error)
             RecorderState.update { it.copy(error = error.message ?: error.javaClass.simpleName) }
         } finally {
             ambientJob?.cancel()

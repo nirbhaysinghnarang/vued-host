@@ -3,6 +3,7 @@ package com.nsn8.vued.meeting
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
@@ -83,6 +84,7 @@ object MeetingController {
         val meetingId = UUID.randomUUID().toString().replace("-", "")
         val startMs = System.currentTimeMillis()
         Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
+        DiagnosticsLogger.info("meeting_started", mapOf("meetingId" to meetingId, "startMs" to startMs))
         OutboundQueue.enqueueMeetingCreate(context, meetingId, title, startMs / 1000.0)
         active = ActiveMeeting(meetingId, startMs)
         val appContext = context.applicationContext
@@ -90,7 +92,10 @@ object MeetingController {
             Log.i(TAG, "start drain begin meeting=$meetingId")
             runCatching { OutboundQueue.drain(appContext) }
                 .onSuccess { Log.i(TAG, "start drain done meeting=$meetingId pending=${OutboundQueue.size(appContext)}") }
-                .onFailure { Log.w(TAG, "start drain failed meeting=$meetingId: ${it.message}", it) }
+                .onFailure {
+                    Log.w(TAG, "start drain failed meeting=$meetingId: ${it.message}", it)
+                    DiagnosticsLogger.warn("meeting_start_drain_failed", mapOf("meetingId" to meetingId), it)
+                }
         }
         retryActiveMeetingCreate(appContext, meetingId)
         retryPendingExports(appContext)
@@ -102,6 +107,7 @@ object MeetingController {
         val endMs = System.currentTimeMillis()
         active = null
         Log.i(TAG, "stop begin meeting=${meeting.meetingId} windowMs=${endMs - meeting.startMs}")
+        DiagnosticsLogger.info("meeting_stop_started", mapOf("meetingId" to meeting.meetingId, "windowMs" to (endMs - meeting.startMs)))
         AmbientFlusher.resumeAfter(endMs)
         val appContext = context.applicationContext
         val result = exportAndEnqueue(appContext, ClosedMeeting(meeting.meetingId, meeting.startMs, endMs))
@@ -112,6 +118,13 @@ object MeetingController {
             "stop drain done meeting=${meeting.meetingId} pending=${OutboundQueue.size(appContext)} " +
                 "elapsedMs=${SystemClock.elapsedRealtime() - drainStartMs}",
         )
+        DiagnosticsLogger.info("meeting_stop_completed", mapOf(
+            "meetingId" to meeting.meetingId,
+            "pending" to OutboundQueue.size(appContext),
+            "durationSecs" to result.durationSecs,
+            "sizeBytes" to result.sizeBytes,
+            "drainElapsedMs" to (SystemClock.elapsedRealtime() - drainStartMs),
+        ))
         StopResult(meeting.meetingId, result.durationSecs, result.sizeBytes)
     }
 
@@ -121,6 +134,7 @@ object MeetingController {
         persistPending(context.applicationContext, closed)
         active = null
         Log.i(TAG, "stop async queued meeting=${meeting.meetingId} windowMs=${closed.endMs - meeting.startMs}")
+        DiagnosticsLogger.info("meeting_stop_async_queued", mapOf("meetingId" to meeting.meetingId, "windowMs" to (closed.endMs - meeting.startMs)))
         AmbientFlusher.resumeAfter(closed.endMs)
         retryPendingExports(context.applicationContext)
     }
@@ -159,6 +173,7 @@ object MeetingController {
                 )
             }.onFailure { error ->
                 Log.w(TAG, "meeting ${meeting.meetingId} export still pending: ${error.message}", error)
+                DiagnosticsLogger.warn("meeting_export_pending", mapOf("meetingId" to meeting.meetingId), error)
             }
         }
     }
@@ -179,6 +194,7 @@ object MeetingController {
         if (export == null) {
             out.delete()
             Log.w(TAG, "export empty meeting=${meeting.meetingId}")
+            DiagnosticsLogger.warn("meeting_export_empty", mapOf("meetingId" to meeting.meetingId))
             error("No audio captured for this meeting window.")
         }
         val durationSecs = export.durationMs / 1000.0
@@ -188,6 +204,13 @@ object MeetingController {
             "export done meeting=${meeting.meetingId} segments=${export.segmentCount} " +
                 "durationMs=${export.durationMs} bytes=$sizeBytes elapsedMs=${SystemClock.elapsedRealtime() - exportStartMs}",
         )
+        DiagnosticsLogger.info("meeting_export_completed", mapOf(
+            "meetingId" to meeting.meetingId,
+            "segments" to export.segmentCount,
+            "durationMs" to export.durationMs,
+            "bytes" to sizeBytes,
+            "elapsedMs" to (SystemClock.elapsedRealtime() - exportStartMs),
+        ))
 
         val sliceId = UUID.nameUUIDFromBytes("meeting:${meeting.meetingId}".toByteArray()).toString()
         val enqueueStartMs = SystemClock.elapsedRealtime()
@@ -200,6 +223,12 @@ object MeetingController {
             "enqueue done meeting=${meeting.meetingId} slice=$sliceId " +
                 "elapsedMs=${SystemClock.elapsedRealtime() - enqueueStartMs} totalElapsedMs=${SystemClock.elapsedRealtime() - totalStartMs}",
         )
+        DiagnosticsLogger.info("meeting_enqueue_completed", mapOf(
+            "meetingId" to meeting.meetingId,
+            "sliceId" to sliceId,
+            "elapsedMs" to (SystemClock.elapsedRealtime() - enqueueStartMs),
+            "totalElapsedMs" to (SystemClock.elapsedRealtime() - totalStartMs),
+        ))
         return ExportResult(durationSecs, sizeBytes)
     }
 
