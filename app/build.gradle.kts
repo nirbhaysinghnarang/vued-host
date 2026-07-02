@@ -21,8 +21,8 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "SENTRY_DSN", "\"${System.getenv("VUED_HOST_SENTRY_DSN") ?: "https://cdd4abcaf4d2dc9696e575a51be4b59b@o4511363432841216.ingest.us.sentry.io/4511664076947456"}\"")
-        buildConfigField("String", "SENTRY_ENVIRONMENT", "\"${System.getenv("SENTRY_ENVIRONMENT") ?: System.getenv("VUED_ENVIRONMENT") ?: "development"}\"")
-        buildConfigField("String", "SENTRY_RELEASE", "\"${System.getenv("SENTRY_RELEASE") ?: "vued-host@${versionName}+${versionCode}"}\"")
+        buildConfigField("String", "SENTRY_ENVIRONMENT", "\"${System.getenv("SENTRY_ENVIRONMENT") ?: System.getenv("VUED_ENVIRONMENT") ?: "production"}\"")
+        buildConfigField("String", "SENTRY_RELEASE", "vued-host@0.0.1")
         buildConfigField("Boolean", "SENTRY_TEST_ERROR", "${System.getenv("VUED_HOST_SENTRY_TEST_ERROR") == "1"}")
     }
 

@@ -22,12 +22,16 @@ class App : Application() {
 
     private fun initSentry() {
         val dsn = BuildConfig.SENTRY_DSN.trim()
-        if (dsn.isEmpty()) return
+        if (dsn.isEmpty()) {
+            DiagnosticsLogger.info("sentry_disabled", mapOf("reason" to "empty_dsn"))
+            return
+        }
         SentryAndroid.init(this) { options ->
             options.dsn = dsn
             options.environment = BuildConfig.SENTRY_ENVIRONMENT
             options.release = BuildConfig.SENTRY_RELEASE
             options.isSendDefaultPii = false
+            options.isDebug = BuildConfig.SENTRY_TEST_ERROR
             options.tracesSampleRate = 0.0
             options.setBeforeSend { event, _ ->
                 event.setTag("component", "vued-host")
@@ -35,6 +39,15 @@ class App : Application() {
                 event
             }
         }
-        if (BuildConfig.SENTRY_TEST_ERROR) Sentry.captureException(RuntimeException("vued sentry test error: vued-host"))
+        DiagnosticsLogger.info("sentry_initialized", mapOf(
+            "environment" to BuildConfig.SENTRY_ENVIRONMENT,
+            "release" to BuildConfig.SENTRY_RELEASE,
+            "testError" to BuildConfig.SENTRY_TEST_ERROR,
+        ))
+        if (BuildConfig.SENTRY_TEST_ERROR) {
+            val eventId = Sentry.captureException(RuntimeException("vued sentry test error: vued-host"))
+            DiagnosticsLogger.info("sentry_test_error_captured", mapOf("eventId" to eventId.toString()))
+            Sentry.flush(5_000)
+        }
     }
 }
