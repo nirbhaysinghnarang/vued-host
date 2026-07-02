@@ -4,6 +4,9 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
 android {
     namespace = "com.nsn8.vued"
     compileSdk {
@@ -20,9 +23,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "SENTRY_DSN", "\"${System.getenv("VUED_HOST_SENTRY_DSN") ?: "https://cdd4abcaf4d2dc9696e575a51be4b59b@o4511363432841216.ingest.us.sentry.io/4511664076947456"}\"")
-        buildConfigField("String", "SENTRY_ENVIRONMENT", "\"${System.getenv("SENTRY_ENVIRONMENT") ?: System.getenv("VUED_ENVIRONMENT") ?: "production"}\"")
-        buildConfigField("String", "SENTRY_RELEASE", "vued-host@0.0.1")
+        buildConfigField("String", "SENTRY_DSN", buildConfigString(System.getenv("VUED_HOST_SENTRY_DSN") ?: "https://cdd4abcaf4d2dc9696e575a51be4b59b@o4511363432841216.ingest.us.sentry.io/4511664076947456"))
+        buildConfigField("String", "SENTRY_ENVIRONMENT", buildConfigString(System.getenv("SENTRY_ENVIRONMENT") ?: System.getenv("VUED_ENVIRONMENT") ?: "production"))
+        buildConfigField("String", "SENTRY_RELEASE", buildConfigString(System.getenv("SENTRY_RELEASE") ?: "vued-host@0.0.1"))
     }
 
     buildTypes {
