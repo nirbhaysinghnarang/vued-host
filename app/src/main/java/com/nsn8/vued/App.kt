@@ -31,7 +31,6 @@ class App : Application() {
             options.environment = BuildConfig.SENTRY_ENVIRONMENT
             options.release = BuildConfig.SENTRY_RELEASE
             options.isSendDefaultPii = false
-            options.isDebug = BuildConfig.SENTRY_TEST_ERROR
             options.tracesSampleRate = 0.0
             options.setBeforeSend { event, _ ->
                 event.setTag("component", "vued-host")
@@ -42,12 +41,6 @@ class App : Application() {
         DiagnosticsLogger.info("sentry_initialized", mapOf(
             "environment" to BuildConfig.SENTRY_ENVIRONMENT,
             "release" to BuildConfig.SENTRY_RELEASE,
-            "testError" to BuildConfig.SENTRY_TEST_ERROR,
         ))
-        if (BuildConfig.SENTRY_TEST_ERROR) {
-            val eventId = Sentry.captureException(RuntimeException("vued sentry test error: vued-host"))
-            DiagnosticsLogger.info("sentry_test_error_captured", mapOf("eventId" to eventId.toString()))
-            Sentry.flush(5_000)
-        }
     }
 }
