@@ -35,5 +35,6 @@ class App : Application() {
                 event
             }
         }
+        if (BuildConfig.SENTRY_TEST_ERROR) Sentry.captureException(RuntimeException("vued sentry test error: vued-host"))
     }
 }
