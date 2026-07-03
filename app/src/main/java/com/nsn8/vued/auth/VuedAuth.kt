@@ -4,6 +4,7 @@ import android.content.Context
 import com.nsn8.vued.VuedConfig
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.Auth
+import io.github.jan.supabase.auth.SignOutScope
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.auth.status.SessionStatus
@@ -54,7 +55,7 @@ object VuedAuth {
     }
 
     suspend fun signOut() {
-        client.auth.signOut()
+        client.auth.signOut(SignOutScope.LOCAL)
     }
 
     fun currentUserId(): String? = client.auth.currentUserOrNull()?.id

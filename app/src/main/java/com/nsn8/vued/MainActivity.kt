@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -542,7 +543,7 @@ private fun ProdRecorderMainScreen() {
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
-            val buttonSize = minOf(maxHeight * 0.78f, maxWidth * 0.54f)
+            val buttonSize = minOf(maxHeight * 0.68f, maxWidth * 0.46f)
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -553,6 +554,7 @@ private fun ProdRecorderMainScreen() {
                     enabled = !segmentBusy && (status.running || meetingActive),
                     modifier = Modifier
                         .align(Alignment.Center)
+                        .offset(y = (-28).dp)
                         .size(buttonSize),
                     onClick = {
                         if (meetingActive) {
