@@ -8,6 +8,7 @@ import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.net.OutboundQueue
+import com.nsn8.vued.service.RecorderState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -60,7 +61,8 @@ object MeetingController {
     var active: ActiveMeeting? = null
         private set
 
-    val isCapturing: Boolean get() = rolling != null
+    val isCapturing: Boolean
+        get() = rolling != null && RecorderState.state.value.captureReady
 
     fun attach(buffer: RollingBuffer) {
         rolling = buffer
@@ -79,6 +81,7 @@ object MeetingController {
      */
     suspend fun start(context: Context, title: String): String {
         val buffer = rolling ?: error("Start recording first — the ambient buffer isn't running.")
+        check(RecorderState.state.value.captureReady) { "Start recording first — the microphone is not ready." }
         check(active == null) { "A meeting is already in progress." }
         buffer.flush()
         val meetingId = UUID.randomUUID().toString().replace("-", "")

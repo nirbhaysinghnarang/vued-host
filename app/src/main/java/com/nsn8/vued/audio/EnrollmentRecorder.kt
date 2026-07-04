@@ -15,8 +15,7 @@ object EnrollmentTap {
 
 /**
  * Records a speaker-enrollment clip from the UMA-8 array (the same source as
- * recording — NOT the phone mic). Requires the recording service to be running
- * (the UMA-8 stream must be live). Feeds the [EnrollmentQualityAnalyzer] and
+ * recording — NOT the phone mic). Requires live capture audio. Feeds the [EnrollmentQualityAnalyzer] and
  * accumulates 16 kHz mono PCM16, which [stop] wraps as a WAV for upload.
  */
 class EnrollmentRecorder {
@@ -40,7 +39,7 @@ class EnrollmentRecorder {
     /** Arms the tap, resetting all state so a re-record starts fresh from 0.
      *  Throws [NotCapturing] if the UMA-8 isn't streaming. */
     fun start() {
-        if (!RecorderState.state.value.running) throw NotCapturing()
+        if (!RecorderState.state.value.captureReady) throw NotCapturing()
         if (armed) return
         // Reset for a clean (re-)recording.
         analyzer.close()

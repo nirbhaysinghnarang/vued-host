@@ -100,6 +100,7 @@ class RecordingService : Service() {
         var lastPublish = 0L
         var nextUmaAttemptMs = 0L
         var shouldStopSelf = false
+        var captureReadyPublished = false
 
         try {
             while (running) {
@@ -117,10 +118,13 @@ class RecordingService : Service() {
                             "profile" to umaProfile.label,
                             "channels" to umaProfile.outChannels,
                         ))
-                        RecorderState.update { it.copy(error = null, micDisconnected = false) }
                         capture.streamPcm(
                             onPcm = { buffer, length ->
                                 pipeline.process(buffer, length)
+                                if (!captureReadyPublished) {
+                                    captureReadyPublished = true
+                                    publishCaptureReady("uma")
+                                }
                                 lastPublish = publishStateIfDue(pipeline, lastPublish)
                             },
                             shouldContinue = { running },
@@ -136,7 +140,13 @@ class RecordingService : Service() {
                         }
                         Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
                         DiagnosticsLogger.warn("uma_capture_fallback", mapOf("message" to (error.message ?: "")), error)
-                        RecorderState.update { it.copy(error = "UMA unavailable; using Android mic") }
+                        captureReadyPublished = false
+                        RecorderState.update {
+                            it.copy(
+                                captureReady = false,
+                                error = "UMA unavailable; using Android mic",
+                            )
+                        }
                         nextUmaAttemptMs = SystemClock.elapsedRealtime() + UMA_RETRY_AFTER_FAILURE_MS
                     }
                 } else {
@@ -152,10 +162,17 @@ class RecordingService : Service() {
                         "profile" to "android_mic",
                         "sampleRate" to AndroidMicCapture.SAMPLE_RATE_HZ,
                     ))
-                    RecorderState.update { it.copy(micDisconnected = false) }
+                    RecorderState.update { it.copy(captureReady = false, micDisconnected = false) }
+                    captureReadyPublished = false
                     lastPublish = streamAndroidMic(
                         pipeline = pipeline,
                         initialLastPublish = lastPublish,
+                        onReady = {
+                            if (!captureReadyPublished) {
+                                captureReadyPublished = true
+                                publishCaptureReady("android_mic")
+                            }
+                        },
                         shouldContinue = {
                             requestUmaPermissionIfNeeded(capture)
                             running && !shouldAttemptUmaCapture(capture, nextUmaAttemptMs)
@@ -166,14 +183,24 @@ class RecordingService : Service() {
         } catch (error: Throwable) {
             Log.e(TAG, "Capture loop ended: ${error.message}", error)
             DiagnosticsLogger.error("capture_loop_failed", throwable = error)
-            RecorderState.update { it.copy(error = error.message ?: error.javaClass.simpleName) }
+            RecorderState.update {
+                it.copy(
+                    captureReady = false,
+                    error = error.message ?: error.javaClass.simpleName,
+                )
+            }
         } finally {
             ambientJob?.cancel()
             AmbientFlusher.detach()
             MeetingController.detach()
             pipeline.close()
             RecorderState.update {
-                it.copy(running = false, lastSegment = pipeline.lastSegmentPath, segmentCount = pipeline.segmentCount)
+                it.copy(
+                    running = false,
+                    captureReady = false,
+                    lastSegment = pipeline.lastSegmentPath,
+                    segmentCount = pipeline.segmentCount,
+                )
             }
             if (running || shouldStopSelf) {
                 // Stream died on its own (e.g. UMA-8 unplugged); tear the service down.
@@ -197,7 +224,13 @@ class RecordingService : Service() {
             mapOf("message" to (error?.message ?: "UMA mic unavailable")),
             error,
         )
-        RecorderState.update { it.copy(error = message, micDisconnected = true) }
+        RecorderState.update {
+            it.copy(
+                captureReady = false,
+                error = message,
+                micDisconnected = true,
+            )
+        }
         runCatching {
             runBlocking {
                 if (MeetingController.active != null) {
@@ -251,17 +284,31 @@ class RecordingService : Service() {
     private fun streamAndroidMic(
         pipeline: CapturePipeline,
         initialLastPublish: Long,
+        onReady: () -> Unit,
         shouldContinue: () -> Boolean,
     ): Long {
         var lastPublish = initialLastPublish
         AndroidMicCapture().streamPcm(
             onPcm = { samples, length ->
                 pipeline.process16kMono(samples, length)
+                onReady()
                 lastPublish = publishStateIfDue(pipeline, lastPublish)
             },
             shouldContinue = shouldContinue,
         )
         return lastPublish
+    }
+
+    private fun publishCaptureReady(source: String) {
+        DiagnosticsLogger.info("capture_ready", mapOf("source" to source))
+        RecorderState.update {
+            it.copy(
+                running = true,
+                captureReady = true,
+                micDisconnected = false,
+                error = null,
+            )
+        }
     }
 
     private fun publishStateIfDue(pipeline: CapturePipeline, lastPublish: Long): Long {
@@ -284,7 +331,7 @@ class RecordingService : Service() {
         captureThread?.join(2_000)
         captureThread = null
         releaseWakeLock()
-        RecorderState.update { it.copy(running = false) }
+        RecorderState.update { it.copy(running = false, captureReady = false) }
         super.onDestroy()
     }
 

@@ -16,6 +16,7 @@ object RecorderState {
         val lastSegment: String? = null,
         val peakDb: Float = Float.NEGATIVE_INFINITY,
         val error: String? = null,
+        val captureReady: Boolean = false,
         val micDisconnected: Boolean = false,
     )
 

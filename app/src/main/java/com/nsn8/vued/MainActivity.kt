@@ -476,8 +476,10 @@ private fun ProdRecorderMainScreen() {
         }
     }
 
-    LaunchedEffect(status.running, status.micDisconnected) {
-        if (!status.running || status.micDisconnected) {
+    val captureReady = status.running && status.captureReady && !status.micDisconnected
+
+    LaunchedEffect(captureReady, status.running, status.micDisconnected) {
+        if (!captureReady) {
             val active = MeetingController.active
             meetingActive = active != null
             segmentStartedAt = active?.startMs ?: 0L
@@ -520,7 +522,7 @@ private fun ProdRecorderMainScreen() {
     } else {
         0
     }
-    val showMicDisconnected = !VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && status.micDisconnected && !meetingActive
+    val showMicDisconnected = !VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && status.micDisconnected
 
     Box(
         modifier = Modifier
@@ -543,7 +545,8 @@ private fun ProdRecorderMainScreen() {
         }
 
         AudioMuteButton(
-            unmuted = status.running,
+            unmuted = captureReady,
+            enabled = !status.running || status.captureReady,
             modifier = Modifier.align(Alignment.TopStart),
             onClick = {
                 if (status.running) RecordingService.stop(context) else startCapture()
@@ -567,7 +570,7 @@ private fun ProdRecorderMainScreen() {
             ) {
                 MeetingCircleButton(
                     meetingActive = meetingActive,
-                    enabled = !segmentBusy && (status.running || meetingActive),
+                    enabled = !segmentBusy && (captureReady || meetingActive),
                     modifier = Modifier
                         .align(Alignment.Center)
                         .offset(y = (-28).dp)
@@ -600,8 +603,8 @@ private fun ProdRecorderMainScreen() {
 
                 Text(
                     text = when {
-                        meetingActive -> formatSegmentTime(elapsedSecs)
                         showMicDisconnected -> "Mic disconnected"
+                        meetingActive -> formatSegmentTime(elapsedSecs)
                         else -> "     "
                     },
                     modifier = Modifier
@@ -669,12 +672,14 @@ private fun MeetingCircleButton(
 @Composable
 private fun AudioMuteButton(
     unmuted: Boolean,
+    enabled: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
-    val iconColor = if (unmuted) Color.White else VuedTextTertiary
+    val iconColor = if (unmuted && enabled) Color.White else VuedTextTertiary
     Button(
         onClick = onClick,
+        enabled = enabled,
         shape = CircleShape,
         modifier = modifier
             .size(112.dp)
@@ -682,6 +687,8 @@ private fun AudioMuteButton(
         colors = ButtonDefaults.buttonColors(
             containerColor = if (unmuted) VuedSuccess else VuedIdleRing,
             contentColor = iconColor,
+            disabledContainerColor = VuedIdleRing,
+            disabledContentColor = VuedTextTertiary,
         ),
         contentPadding = PaddingValues(0.dp),
         elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
@@ -928,6 +935,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
         }
         StatusLine("Mic permission", if (hasAudio) "granted" else "NOT granted")
         StatusLine("Service", if (status.running) "RECORDING" else "stopped")
+        StatusLine("Capture ready", if (status.captureReady && !status.micDisconnected) "yes" else "no")
         StatusLine("Segments written", status.segmentCount.toString())
         status.lastSegment?.let { StatusLine("Last segment", it) }
         status.error?.let { StatusLine("Error", it) }
@@ -958,28 +966,32 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
 
         var meetingActive by remember { mutableStateOf(MeetingController.active != null) }
         var meetingMsg by remember { mutableStateOf<String?>(null) }
+        val devCaptureReady = status.running && status.captureReady && !status.micDisconnected
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = {
-                scope.launch {
-                    try {
-                        if (meetingActive) {
-                            meetingMsg = "exporting + uploading…"
-                            val result = MeetingController.stop(context)
-                            meetingActive = false
-                            meetingMsg = "Uploaded ${result.meetingId.take(8)}… " +
-                                "(${"%.1f".format(result.durationSecs)}s) — transcribing"
-                        } else {
-                            val id = MeetingController.start(context, "Meeting")
-                            meetingActive = true
-                            meetingMsg = "Recording meeting ${id.take(8)}…"
+            Button(
+                enabled = meetingActive || devCaptureReady,
+                onClick = {
+                    scope.launch {
+                        try {
+                            if (meetingActive) {
+                                meetingMsg = "exporting + uploading…"
+                                val result = MeetingController.stop(context)
+                                meetingActive = false
+                                meetingMsg = "Uploaded ${result.meetingId.take(8)}… " +
+                                    "(${"%.1f".format(result.durationSecs)}s) — transcribing"
+                            } else {
+                                val id = MeetingController.start(context, "Meeting")
+                                meetingActive = true
+                                meetingMsg = "Recording meeting ${id.take(8)}…"
+                            }
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "dev meeting action failed: ${e.message}", e)
+                            meetingActive = MeetingController.active != null
+                            meetingMsg = "meeting error: ${e.message}"
                         }
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "dev meeting action failed: ${e.message}", e)
-                        meetingActive = MeetingController.active != null
-                        meetingMsg = "meeting error: ${e.message}"
                     }
-                }
-            }) {
+                },
+            ) {
                 Text(if (meetingActive) "Stop Meeting" else "Start Meeting")
             }
             OutlinedButton(onClick = {
