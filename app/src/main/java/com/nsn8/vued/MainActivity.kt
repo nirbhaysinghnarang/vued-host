@@ -476,6 +476,15 @@ private fun ProdRecorderMainScreen() {
         }
     }
 
+    LaunchedEffect(status.running, status.micDisconnected) {
+        if (!status.running || status.micDisconnected) {
+            val active = MeetingController.active
+            meetingActive = active != null
+            segmentStartedAt = active?.startMs ?: 0L
+            nowMs = System.currentTimeMillis()
+        }
+    }
+
     LaunchedEffect(assignedRoomId, assignedOrgId) {
         if (assignedRoomId.isNullOrBlank()) return@LaunchedEffect
         runCatching {
@@ -511,6 +520,7 @@ private fun ProdRecorderMainScreen() {
     } else {
         0
     }
+    val showMicDisconnected = !VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && status.micDisconnected && !meetingActive
 
     Box(
         modifier = Modifier
@@ -589,13 +599,17 @@ private fun ProdRecorderMainScreen() {
                 )
 
                 Text(
-                    text = if (meetingActive) formatSegmentTime(elapsedSecs) else "     ",
+                    text = when {
+                        meetingActive -> formatSegmentTime(elapsedSecs)
+                        showMicDisconnected -> "Mic disconnected"
+                        else -> "     "
+                    },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 2.dp),
-                    color = VuedTextTertiary.copy(alpha = 0.62f),
-                    fontSize = 52.sp,
-                    fontWeight = FontWeight.Thin,
+                    color = if (showMicDisconnected) Color(0xFFB42318) else VuedTextTertiary.copy(alpha = 0.62f),
+                    fontSize = if (showMicDisconnected) 34.sp else 52.sp,
+                    fontWeight = if (showMicDisconnected) FontWeight.Medium else FontWeight.Thin,
                     letterSpacing = 0.sp,
                 )
             }

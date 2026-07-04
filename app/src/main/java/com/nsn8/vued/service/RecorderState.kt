@@ -16,6 +16,7 @@ object RecorderState {
         val lastSegment: String? = null,
         val peakDb: Float = Float.NEGATIVE_INFINITY,
         val error: String? = null,
+        val micDisconnected: Boolean = false,
     )
 
     private val _state = MutableStateFlow(Status())

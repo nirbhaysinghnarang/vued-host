@@ -16,4 +16,6 @@ object VuedConfig {
     // recording backend above. Used to fetch the org's rooms so the tablet can
     // assign itself to one.
     const val ORG_API_BASE_URL = API_BASE_URL
+
+    const val ALLOW_BUILT_IN_MIC_FALLBACK = false
 }
