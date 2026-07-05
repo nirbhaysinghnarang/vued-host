@@ -62,7 +62,8 @@ object MeetingController {
         private set
 
     val isCapturing: Boolean
-        get() = rolling != null && RecorderState.state.value.captureReady
+        get() = rolling?.hasRecentAudio(RecorderState.CAPTURE_STALE_MS) == true &&
+            RecorderState.state.value.hasFreshAudio()
 
     fun attach(buffer: RollingBuffer) {
         rolling = buffer
@@ -81,7 +82,10 @@ object MeetingController {
      */
     suspend fun start(context: Context, title: String): String {
         val buffer = rolling ?: error("Start recording first — the ambient buffer isn't running.")
-        check(RecorderState.state.value.captureReady) { "Start recording first — the microphone is not ready." }
+        val nowMs = System.currentTimeMillis()
+        check(RecorderState.state.value.hasFreshAudio(nowMs) && buffer.hasRecentAudio(RecorderState.CAPTURE_STALE_MS, nowMs)) {
+            "Start recording first — the microphone is not ready."
+        }
         check(active == null) { "A meeting is already in progress." }
         buffer.flush()
         val meetingId = UUID.randomUUID().toString().replace("-", "")

@@ -61,6 +61,7 @@ class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
 
     val segmentCount: Int get() = rolling.segmentCount
     val lastSegmentPath: String? get() = rolling.lastSegmentPath
+    val lastAudioMs: Long get() = rolling.lastAppendMs
 
     fun close() = rolling.close()
 }

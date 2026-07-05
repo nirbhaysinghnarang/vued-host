@@ -476,7 +476,7 @@ private fun ProdRecorderMainScreen() {
         }
     }
 
-    val captureReady = status.running && status.captureReady && !status.micDisconnected
+    val captureReady = status.running && status.hasFreshAudio()
 
     LaunchedEffect(captureReady, status.running, status.micDisconnected) {
         if (!captureReady) {
@@ -935,7 +935,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
         }
         StatusLine("Mic permission", if (hasAudio) "granted" else "NOT granted")
         StatusLine("Service", if (status.running) "RECORDING" else "stopped")
-        StatusLine("Capture ready", if (status.captureReady && !status.micDisconnected) "yes" else "no")
+        StatusLine("Capture ready", if (status.hasFreshAudio()) "yes" else "no")
         StatusLine("Segments written", status.segmentCount.toString())
         status.lastSegment?.let { StatusLine("Last segment", it) }
         status.error?.let { StatusLine("Error", it) }
@@ -966,7 +966,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
 
         var meetingActive by remember { mutableStateOf(MeetingController.active != null) }
         var meetingMsg by remember { mutableStateOf<String?>(null) }
-        val devCaptureReady = status.running && status.captureReady && !status.micDisconnected
+        val devCaptureReady = status.running && status.hasFreshAudio()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 enabled = meetingActive || devCaptureReady,
