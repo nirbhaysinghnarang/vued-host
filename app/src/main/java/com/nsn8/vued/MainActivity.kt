@@ -251,7 +251,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     PassphraseTextField(
                         value = passphrase,
                         onValueChange = { passphrase = it },
-                        label = "Passphrase",
+                        label = "Enter your passphrase to be able to decrypt your meetings",
                         modifier = Modifier.fillMaxWidth(),
                     )
                     if (creating) {
@@ -372,8 +372,10 @@ private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
+            .statusBarsPadding()
+            .verticalScroll(rememberScrollState())
             .padding(32.dp),
-        contentAlignment = Alignment.Center,
+        contentAlignment = Alignment.TopCenter,
     ) {
         Surface(
             modifier = Modifier.fillMaxWidth(0.62f),
