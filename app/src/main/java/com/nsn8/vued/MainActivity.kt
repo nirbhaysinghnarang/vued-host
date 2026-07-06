@@ -119,7 +119,6 @@ class MainActivity : ComponentActivity() {
         // Keep the screen on during in-room operation so capture/upload remains
         // responsive while the recorder is foregrounded.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        VuedAuth.init(applicationContext)
         enableEdgeToEdge()
         setContent {
             VuedTheme(desktopTheme = HOST_UI_MODE == HostUiMode.PROD) {

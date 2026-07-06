@@ -260,7 +260,7 @@ object OutboundQueue {
                 }
                 setMetadataDone(context, id) // persist so a retry skips re-create
             }
-            VuedApi.uploadSliceAudio(id, file.readBytes(), durationSecs, sizeBytes)
+            VuedApi.uploadSliceAudio(id, file, durationSecs, sizeBytes)
             runCatching { deleteUploadedSourceSegments(context, item) }
             file.delete()
             remove(context, id)

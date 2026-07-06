@@ -8,9 +8,11 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
@@ -99,10 +101,10 @@ object VuedApi {
         )
     }
 
-    /** Ships raw M4A bytes to the server transcription/finalization pipeline. */
+    /** Streams an M4A file to the server transcription/finalization pipeline. */
     suspend fun uploadSliceAudio(
         sliceId: String,
-        audio: ByteArray,
+        audio: File,
         durationSecs: Double,
         sizeBytes: Long,
     ) = withContext(Dispatchers.IO) {
@@ -112,7 +114,7 @@ object VuedApi {
             .header("Authorization", "Bearer $token")
             .header("x-audio-duration-secs", durationSecs.toString())
             .header("x-audio-size-bytes", sizeBytes.toString())
-            .put(audio.toRequestBody("audio/mp4".toMediaType()))
+            .put(audio.asRequestBody("audio/mp4".toMediaType()))
             .build()
         client.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()

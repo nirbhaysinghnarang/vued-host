@@ -1,6 +1,7 @@
 package com.nsn8.vued
 
 import android.app.Application
+import com.nsn8.vued.auth.VuedAuth
 import io.sentry.Sentry
 import io.sentry.android.core.SentryAndroid
 
@@ -11,6 +12,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         DiagnosticsLogger.init(this)
+        VuedAuth.init(this)
         initSentry()
         val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
