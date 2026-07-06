@@ -9,8 +9,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -44,6 +50,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -68,6 +75,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -103,6 +111,11 @@ private val HOST_UI_MODE = HostUiMode.PROD
 
 private enum class HostUiMode { DEV, PROD }
 
+private data class WifiStatus(
+    val connected: Boolean,
+    val ssid: String?,
+)
+
 private val VuedBackground = Color(0xFFFFFFFF)
 private val VuedSurface = Color(0xFFF8F9FB)
 private val VuedSurfaceRaised = Color(0xFFFFFFFF)
@@ -126,6 +139,13 @@ class MainActivity : ComponentActivity() {
                     AuthGate()
                 }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isDeviceOwner(this)) {
+            Log.i(TAG, startKiosk(this))
         }
     }
 }
@@ -238,7 +258,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     text = if (creating) {
                         "This tablet needs a passphrase before ambient processing can run."
                     } else {
-                        "Unlock this tablet so it can process ambient candidates locally."
+                        "Unlock this tablet to process ambient candidates locally."
                     },
                     color = VuedTextTertiary,
                     fontSize = 15.sp,
@@ -469,6 +489,29 @@ private fun ProdRecorderMainScreen() {
     var segmentBusy by remember { mutableStateOf(false) }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showEnroll by remember { mutableStateOf(false) }
+    var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
+
+    DisposableEffect(Unit) {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                wifiStatus = currentWifiStatus(context)
+            }
+
+            override fun onLost(network: Network) {
+                wifiStatus = currentWifiStatus(context)
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                wifiStatus = currentWifiStatus(context)
+            }
+        }
+        connectivity.registerDefaultNetworkCallback(callback)
+        onDispose { connectivity.unregisterNetworkCallback(callback) }
+    }
 
     LaunchedEffect(meetingActive, segmentStartedAt) {
         while (meetingActive) {
@@ -554,10 +597,22 @@ private fun ProdRecorderMainScreen() {
             },
         )
 
-        AddSpeakerButton(
+        Row(
             modifier = Modifier.align(Alignment.TopEnd),
-            onClick = { showEnroll = true },
-        )
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+                WifiSettingsButton(
+                    status = wifiStatus,
+                    onClick = {
+                        openWifiSettings(context)
+                        wifiStatus = currentWifiStatus(context)
+                    },
+                )
+            }
+            AddSpeakerButton(onClick = { showEnroll = true })
+        }
 
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize(),
@@ -808,6 +863,56 @@ private fun AddSpeakerButton(modifier: Modifier = Modifier, onClick: () -> Unit)
     }
 }
 
+@Composable
+private fun WifiSettingsButton(
+    status: WifiStatus,
+    onClick: () -> Unit,
+) {
+    val color = if (status.connected) VuedSuccess else Color(0xFFB42318)
+    val label = when {
+        status.ssid != null -> status.ssid
+        status.connected -> "Wi-Fi"
+        else -> "No Wi-Fi"
+    }
+    OutlinedButton(
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, VuedHairline),
+        modifier = Modifier
+            .semantics {
+                contentDescription = if (status.connected) {
+                    "Wi-Fi connected: $label"
+                } else {
+                    "Wi-Fi disconnected"
+                }
+            },
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = VuedSurfaceRaised.copy(alpha = 0.92f),
+            contentColor = color,
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_wifi_24),
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(20.dp),
+            )
+            Text(
+                text = label,
+                color = VuedTextTertiary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.sp,
+            )
+        }
+    }
+}
+
 private fun formatSegmentTime(totalSecs: Long): String {
     val minutes = totalSecs / 60
     val seconds = totalSecs % 60
@@ -1033,6 +1138,12 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
             }) {
                 Text("Unlock")
             }
+            OutlinedButton(onClick = {
+                openWifiSettings(context)
+                kioskMessage = "Opened Wi-Fi settings"
+            }) {
+                Text("Wi-Fi Settings")
+            }
         }
         kioskMessage?.let { StatusLine("Kiosk", it) }
 
@@ -1110,4 +1221,51 @@ private fun requestUma8Permission(context: Context) {
         PendingIntent.FLAG_MUTABLE,
     )
     usbManager.requestPermission(device, intent)
+}
+
+private fun openWifiSettings(context: Context) {
+    (context as? Activity)?.let { activity ->
+        if (isKioskLocked(activity)) stopKiosk(activity)
+    }
+    val wifiIntent = Intent(Settings.ACTION_WIFI_SETTINGS)
+    val fallbackIntent = Intent(Settings.ACTION_SETTINGS)
+    runCatching {
+        context.startActivity(wifiIntent)
+    }.recoverCatching {
+        context.startActivity(fallbackIntent)
+    }.onFailure { error ->
+        Log.w(TAG, "Failed to open Wi-Fi settings: ${error.message}", error)
+    }
+}
+
+private fun currentWifiStatus(context: Context): WifiStatus {
+    val connectivity = context.getSystemService(ConnectivityManager::class.java)
+    val network = connectivity.activeNetwork ?: return WifiStatus(false, null)
+    val capabilities = connectivity.getNetworkCapabilities(network) ?: return WifiStatus(false, null)
+    if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+        return WifiStatus(false, null)
+    }
+
+    val ssidFromCapabilities = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        (capabilities.transportInfo as? WifiInfo)?.ssid.cleanSsid()
+    } else {
+        null
+    }
+    val ssidFromManager = runCatching {
+        context.getSystemService(WifiManager::class.java).connectionInfo?.ssid.cleanSsid()
+    }.getOrNull()
+
+    return WifiStatus(true, ssidFromCapabilities ?: ssidFromManager)
+}
+
+private fun String?.cleanSsid(): String? {
+    val value = this
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() && it != "<unknown ssid>" }
+        ?: return null
+    return if (value.length >= 2 && value.first() == '"' && value.last() == '"') {
+        value.substring(1, value.lastIndex)
+    } else {
+        value
+    }
 }
