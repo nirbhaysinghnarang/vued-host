@@ -7,10 +7,13 @@ import android.util.Log
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED || !isDeviceOwner(context)) return
+        val action = intent.action
+        val isBootAction = action == Intent.ACTION_BOOT_COMPLETED ||
+            action == Intent.ACTION_LOCKED_BOOT_COMPLETED
+        if (!isBootAction || !isDeviceOwner(context)) return
 
-        Log.i("VuedBootReceiver", "Boot completed; launching Vued kiosk")
-        DiagnosticsLogger.info("boot_completed_launching_kiosk")
+        Log.i("VuedBootReceiver", "$action; launching Vued kiosk")
+        DiagnosticsLogger.info("boot_completed_launching_kiosk", mapOf("action" to (action ?: "")))
 
         val launchIntent = Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)

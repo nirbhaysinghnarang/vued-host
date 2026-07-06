@@ -5,6 +5,8 @@ import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.BatteryManager
 import android.provider.Settings
 
@@ -50,6 +52,14 @@ private fun applyKioskPolicy(
 ) {
     dpm.setLockTaskPackages(admin, arrayOf(context.packageName))
     dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+    dpm.addPersistentPreferredActivity(
+        admin,
+        IntentFilter(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            addCategory(Intent.CATEGORY_DEFAULT)
+        },
+        ComponentName(context, MainActivity::class.java),
+    )
     dpm.setStatusBarDisabled(admin, true)
     dpm.setKeyguardDisabled(admin, true)
     dpm.setGlobalSetting(
