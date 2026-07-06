@@ -12,15 +12,28 @@ import kotlin.math.abs
  * [inputChannels] is the array's real-mic channel count (7 for UMA-8, 16 for
  * UMA-16); the downmix is a plain mean, so any value works.
  */
-class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
+class CapturePipeline(
+    segmentsDir: File,
+    initialInputChannels: Int,
+    private val sourceSegmentsDir: File? = null,
+) {
 
     private var inputChannels = initialInputChannels
     private var downmixer = Downmixer(initialInputChannels)
     private var resampler = Resampler48to16()
     private val rolling = RollingBuffer(segmentsDir)
+    @Volatile
+    private var sourceRolling: MultiChannelWavRollingBuffer? = createSourceRolling(initialInputChannels)
+    @Volatile
+    private var lastSourceWriteMs: Long = 0
+    private var closedSourceSegmentCount = 0
+    private var closedLastSourceSegmentPath: String? = null
 
     /** The live rolling buffer, so the meeting flow can flush + export windows. */
     val rollingBuffer: RollingBuffer get() = rolling
+
+    /** Optional UMA-16 source WAV buffer. Null for UMA-8 and Android mic capture. */
+    val sourceRollingBuffer: MultiChannelWavRollingBuffer? get() = sourceRolling
 
     /** Peak amplitude (0..1) of the most recently processed 16 kHz block. */
     @Volatile
@@ -32,11 +45,16 @@ class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
         inputChannels = channels
         downmixer = Downmixer(channels)
         resampler = Resampler48to16()
+        configureSourceRolling(channels)
     }
 
     fun process(buffer: ByteArray, length: Int) {
         val frames = downmixer.frameCount(length)
         if (frames == 0) return
+        val sourceFrames = sourceRolling?.append48kInt32Le(buffer, length) ?: 0
+        if (sourceFrames > 0) {
+            lastSourceWriteMs = System.currentTimeMillis()
+        }
         val mono = downmixer.toMonoFloat(buffer, length)
         val outCount = resampler.process(mono, frames)
         process16kMono(resampler.output, outCount)
@@ -61,6 +79,49 @@ class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
 
     val segmentCount: Int get() = rolling.segmentCount
     val lastSegmentPath: String? get() = rolling.lastSegmentPath
+    val sourceWavRecording: Boolean
+        get() {
+            val rolling = sourceRolling ?: return false
+            return rolling.segmentCount > 0 &&
+                System.currentTimeMillis() - lastSourceWriteMs <= SOURCE_WRITE_ACTIVE_WINDOW_MS
+        }
+    val sourceSegmentCount: Int get() = closedSourceSegmentCount + (sourceRolling?.segmentCount ?: 0)
+    val lastSourceSegmentPath: String?
+        get() = sourceRolling?.lastSegmentPath ?: closedLastSourceSegmentPath
 
-    fun close() = rolling.close()
+    fun close() {
+        closeSourceRolling()
+        rolling.close()
+    }
+
+    private fun configureSourceRolling(channels: Int) {
+        val shouldRecordSource = channels == MultiChannelWavRollingBuffer.CHANNELS_UMA16 &&
+            sourceSegmentsDir != null
+        if (shouldRecordSource) {
+            if (sourceRolling == null) {
+                sourceRolling = createSourceRolling(channels)
+            }
+        } else {
+            closeSourceRolling()
+        }
+    }
+
+    private fun createSourceRolling(channels: Int): MultiChannelWavRollingBuffer? {
+        val directory = sourceSegmentsDir ?: return null
+        if (channels != MultiChannelWavRollingBuffer.CHANNELS_UMA16) return null
+        return MultiChannelWavRollingBuffer(directory)
+    }
+
+    private fun closeSourceRolling() {
+        val rolling = sourceRolling ?: return
+        closedSourceSegmentCount += rolling.segmentCount
+        closedLastSourceSegmentPath = rolling.lastSegmentPath ?: closedLastSourceSegmentPath
+        rolling.close()
+        sourceRolling = null
+        lastSourceWriteMs = 0
+    }
+
+    companion object {
+        private const val SOURCE_WRITE_ACTIVE_WINDOW_MS = 2_000L
+    }
 }

@@ -4,9 +4,12 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.nsn8.vued.DiagnosticsLogger
+import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.ambient.AmbientFlusher
+import com.nsn8.vued.audio.MultiChannelWavRollingBuffer
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
+import com.nsn8.vued.audio.WavSegmentExporter
 import com.nsn8.vued.net.OutboundQueue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,7 +36,12 @@ import java.util.UUID
 object MeetingController {
 
     data class ActiveMeeting(val meetingId: String, val startMs: Long)
-    data class StopResult(val meetingId: String, val durationSecs: Double, val sizeBytes: Long)
+    data class StopResult(
+        val meetingId: String,
+        val durationSecs: Double,
+        val sizeBytes: Long,
+        val sourceWavPath: String? = null,
+    )
     private data class ClosedMeeting(val meetingId: String, val startMs: Long, val endMs: Long)
 
     private const val TAG = "VuedMeeting"
@@ -55,6 +63,12 @@ object MeetingController {
 
     @Volatile
     private var rolling: RollingBuffer? = null
+    private var sourceRollingProvider: () -> MultiChannelWavRollingBuffer? = { null }
+
+    // Application context captured at meeting start so segment-close callbacks
+    // can drive incremental source-WAV upload drains.
+    @Volatile
+    private var meetingAppContext: Context? = null
 
     @Volatile
     var active: ActiveMeeting? = null
@@ -62,12 +76,17 @@ object MeetingController {
 
     val isCapturing: Boolean get() = rolling != null
 
-    fun attach(buffer: RollingBuffer) {
+    fun attach(
+        buffer: RollingBuffer,
+        sourceBufferProvider: () -> MultiChannelWavRollingBuffer? = { null },
+    ) {
         rolling = buffer
+        sourceRollingProvider = sourceBufferProvider
     }
 
     fun detach() {
         rolling = null
+        sourceRollingProvider = { null }
     }
 
     /**
@@ -81,6 +100,7 @@ object MeetingController {
         val buffer = rolling ?: error("Start recording first — the ambient buffer isn't running.")
         check(active == null) { "A meeting is already in progress." }
         buffer.flush()
+        flushSourceForMeetingStart()
         val meetingId = UUID.randomUUID().toString().replace("-", "")
         val startMs = System.currentTimeMillis()
         Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
@@ -88,6 +108,10 @@ object MeetingController {
         OutboundQueue.enqueueMeetingCreate(context, meetingId, title, startMs / 1000.0)
         active = ActiveMeeting(meetingId, startMs)
         val appContext = context.applicationContext
+        meetingAppContext = appContext
+        if (VuedConfig.INCREMENTAL_SOURCE_WAV_UPLOAD) {
+            startStreamingSourceWav(appContext, meetingId, startMs)
+        }
         queueScope.launch {
             Log.i(TAG, "start drain begin meeting=$meetingId")
             runCatching { OutboundQueue.drain(appContext) }
@@ -106,6 +130,7 @@ object MeetingController {
         val meeting = active ?: error("No active meeting.")
         val endMs = System.currentTimeMillis()
         active = null
+        stopStreamingSourceWavTrigger()
         Log.i(TAG, "stop begin meeting=${meeting.meetingId} windowMs=${endMs - meeting.startMs}")
         DiagnosticsLogger.info("meeting_stop_started", mapOf("meetingId" to meeting.meetingId, "windowMs" to (endMs - meeting.startMs)))
         AmbientFlusher.resumeAfter(endMs)
@@ -123,14 +148,19 @@ object MeetingController {
             "pending" to OutboundQueue.size(appContext),
             "durationSecs" to result.durationSecs,
             "sizeBytes" to result.sizeBytes,
+            "sourceWavPath" to (result.sourceWavPath ?: ""),
             "drainElapsedMs" to (SystemClock.elapsedRealtime() - drainStartMs),
         ))
-        StopResult(meeting.meetingId, result.durationSecs, result.sizeBytes)
+        StopResult(meeting.meetingId, result.durationSecs, result.sizeBytes, result.sourceWavPath)
     }
 
     fun stopAsync(context: Context) {
         val meeting = active ?: error("No active meeting.")
         val closed = ClosedMeeting(meeting.meetingId, meeting.startMs, System.currentTimeMillis())
+        stopStreamingSourceWavTrigger()
+        // Bound + mark the streaming source-WAV ended now (synchronous), so any
+        // drain before the deferred export never streams past the meeting window.
+        finalizeStreamingSourceWav(context.applicationContext, closed)
         persistPending(context.applicationContext, closed)
         active = null
         Log.i(TAG, "stop async queued meeting=${meeting.meetingId} windowMs=${closed.endMs - meeting.startMs}")
@@ -178,7 +208,11 @@ object MeetingController {
         }
     }
 
-    private data class ExportResult(val durationSecs: Double, val sizeBytes: Long)
+    private data class ExportResult(
+        val durationSecs: Double,
+        val sizeBytes: Long,
+        val sourceWavPath: String?,
+    )
 
     private fun exportAndEnqueue(context: Context, meeting: ClosedMeeting): ExportResult {
         val buffer = rolling ?: error("Ambient buffer not running.")
@@ -229,7 +263,135 @@ object MeetingController {
             "elapsedMs" to (SystemClock.elapsedRealtime() - enqueueStartMs),
             "totalElapsedMs" to (SystemClock.elapsedRealtime() - totalStartMs),
         ))
-        return ExportResult(durationSecs, sizeBytes)
+        val sourceWavPath: String? = if (VuedConfig.INCREMENTAL_SOURCE_WAV_UPLOAD) {
+            // Incremental path: segments have been streaming during the meeting.
+            // Flush the tail and mark the queued item ended so the drain uploads
+            // the remainder and completes; no whole-file export needed.
+            finalizeStreamingSourceWav(context, meeting)
+            null
+        } else {
+            exportSourceMeeting(context, meeting)?.let { sourcePath ->
+                OutboundQueue.enqueueMeetingSourceWav(
+                    context = context,
+                    sliceId = sliceId,
+                    sessionId = sessionId,
+                    meetingId = meeting.meetingId,
+                    startedAtSec = meeting.startMs / 1000.0,
+                    endedAtSec = meeting.endMs / 1000.0,
+                    durationSecs = durationSecs,
+                    monoSizeBytes = sizeBytes,
+                    source = File(sourcePath),
+                ).absolutePath
+            }
+        }
+        return ExportResult(durationSecs, sizeBytes, sourceWavPath)
+    }
+
+    private fun flushSourceForMeetingStart() {
+        runCatching { sourceRollingProvider()?.flush() }
+            .onFailure { error ->
+                Log.w(TAG, "source wav start flush failed: ${error.message}", error)
+                DiagnosticsLogger.warn("meeting_source_wav_start_flush_failed", throwable = error)
+            }
+    }
+
+    private fun sliceIdFor(meetingId: String): String =
+        UUID.nameUUIDFromBytes("meeting:$meetingId".toByteArray()).toString()
+
+    /** Opens the durable streaming source-WAV item and subscribes to segment
+     *  closes so each closed 30s segment is uploaded during the meeting. */
+    private fun startStreamingSourceWav(context: Context, meetingId: String, startMs: Long) {
+        val buffer = sourceRollingProvider() ?: return
+        OutboundQueue.enqueueMeetingSourceWavStreaming(
+            context = context,
+            sliceId = sliceIdFor(meetingId),
+            sessionId = sessionId,
+            meetingId = meetingId,
+            startedAtSec = startMs / 1000.0,
+            segmentsDir = buffer.directory.absolutePath,
+            codec = VuedConfig.SOURCE_WAV_CODEC,
+        )
+        buffer.onSegmentClosed = { _, _ -> onSourceSegmentClosed() }
+    }
+
+    private fun onSourceSegmentClosed() {
+        val context = meetingAppContext ?: return
+        if (active == null) return
+        queueScope.launch {
+            runCatching { OutboundQueue.drain(context) }
+                .onFailure { Log.w(TAG, "source segment drain failed: ${it.message}", it) }
+        }
+    }
+
+    private fun stopStreamingSourceWavTrigger() {
+        runCatching { sourceRollingProvider()?.onSegmentClosed = { _, _ -> } }
+        meetingAppContext = null
+    }
+
+    /** Flushes the source tail and marks the queued streaming item ended so the
+     *  drain uploads the remainder and completes. No-op (returns false) when
+     *  there is no streaming item (feature off, or non-UMA16 capture). */
+    private fun finalizeStreamingSourceWav(context: Context, meeting: ClosedMeeting): Boolean {
+        val sliceId = sliceIdFor(meeting.meetingId)
+        if (!OutboundQueue.hasStreamingSourceWav(context, sliceId)) return false
+        runCatching { sourceRollingProvider()?.flush() }
+            .onFailure { error ->
+                Log.w(TAG, "source wav finalize flush failed: ${error.message}", error)
+                DiagnosticsLogger.warn(
+                    "meeting_source_wav_finalize_flush_failed",
+                    mapOf("meetingId" to meeting.meetingId),
+                    error,
+                )
+            }
+        OutboundQueue.markMeetingSourceWavEnded(
+            context, sliceId, meeting.endMs / 1000.0, durationSecs = 0.0,
+        )
+        return true
+    }
+
+    private fun exportSourceMeeting(context: Context, meeting: ClosedMeeting): String? {
+        val source = sourceRollingProvider() ?: return null
+        return runCatching {
+            val flushStartMs = SystemClock.elapsedRealtime()
+            source.flush()
+            Log.i(
+                TAG,
+                "source wav flush done meeting=${meeting.meetingId} " +
+                    "elapsedMs=${SystemClock.elapsedRealtime() - flushStartMs}",
+            )
+            val segments = source.listSegments()
+            if (segments.isEmpty()) return@runCatching null
+            val directory = File(
+                context.getExternalFilesDir(null) ?: context.filesDir,
+                "uma16_meetings",
+            ).apply { mkdirs() }
+            val out = File(directory, "meeting_${meeting.meetingId}_16ch_16k.wav")
+            val exportStartMs = SystemClock.elapsedRealtime()
+            val export = WavSegmentExporter.exportWindow(segments, meeting.startMs, meeting.endMs, out)
+                ?: return@runCatching null
+            Log.i(
+                TAG,
+                "source wav export done meeting=${meeting.meetingId} " +
+                    "segments=${export.segmentCount} durationMs=${export.durationMs} " +
+                    "bytes=${out.length()} elapsedMs=${SystemClock.elapsedRealtime() - exportStartMs}",
+            )
+            DiagnosticsLogger.info("meeting_source_wav_export_completed", mapOf(
+                "meetingId" to meeting.meetingId,
+                "segments" to export.segmentCount,
+                "durationMs" to export.durationMs,
+                "bytes" to out.length(),
+                "path" to out.absolutePath,
+                "elapsedMs" to (SystemClock.elapsedRealtime() - exportStartMs),
+            ))
+            out.absolutePath
+        }.onFailure { error ->
+            Log.w(TAG, "source wav export failed meeting=${meeting.meetingId}: ${error.message}", error)
+            DiagnosticsLogger.warn(
+                "meeting_source_wav_export_failed",
+                mapOf("meetingId" to meeting.meetingId),
+                error,
+            )
+        }.getOrNull()
     }
 
     private fun prefs(context: Context) =

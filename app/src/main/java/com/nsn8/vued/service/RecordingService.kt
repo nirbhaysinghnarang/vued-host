@@ -74,13 +74,14 @@ class RecordingService : Service() {
 
     private fun captureLoop() {
         val segmentsDir = File(getExternalFilesDir(null), "segments")
+        val sourceSegmentsDir = File(getExternalFilesDir(null), "uma16_segments")
         // Manual selection overrides auto-detect. Keep a single rolling buffer alive
         // while the physical capture source changes underneath it.
         val override = MicArrayConfig.selection(this).toProfile()
         val capture = Uma8Capture(this, override)
         val profile = readyUmaProfile(capture) ?: override ?: PROFILE_UMA8
-        val pipeline = CapturePipeline(segmentsDir, profile.outChannels)
-        MeetingController.attach(pipeline.rollingBuffer)
+        val pipeline = CapturePipeline(segmentsDir, profile.outChannels, sourceSegmentsDir)
+        MeetingController.attach(pipeline.rollingBuffer) { pipeline.sourceRollingBuffer }
         AmbientFlusher.attach(pipeline.rollingBuffer)
         // Drain any backlog left by a previous run (offline/crash) as soon as we're up.
         ambientScope.launch {
@@ -157,7 +158,14 @@ class RecordingService : Service() {
             MeetingController.detach()
             pipeline.close()
             RecorderState.update {
-                it.copy(running = false, lastSegment = pipeline.lastSegmentPath, segmentCount = pipeline.segmentCount)
+                it.copy(
+                    running = false,
+                    lastSegment = pipeline.lastSegmentPath,
+                    segmentCount = pipeline.segmentCount,
+                    sourceWavRecording = false,
+                    sourceWavSegmentCount = pipeline.sourceSegmentCount,
+                    lastSourceWavSegment = pipeline.lastSourceSegmentPath,
+                )
             }
             if (running) {
                 // Stream died on its own (e.g. UMA-8 unplugged); tear the service down.
@@ -229,6 +237,9 @@ class RecordingService : Service() {
             it.copy(
                 segmentCount = pipeline.segmentCount,
                 lastSegment = pipeline.lastSegmentPath,
+                sourceWavRecording = pipeline.sourceWavRecording,
+                sourceWavSegmentCount = pipeline.sourceSegmentCount,
+                lastSourceWavSegment = pipeline.lastSourceSegmentPath,
                 peakDb = db,
             )
         }
@@ -240,7 +251,7 @@ class RecordingService : Service() {
         captureThread?.join(2_000)
         captureThread = null
         releaseWakeLock()
-        RecorderState.update { it.copy(running = false) }
+        RecorderState.update { it.copy(running = false, sourceWavRecording = false) }
         super.onDestroy()
     }
 

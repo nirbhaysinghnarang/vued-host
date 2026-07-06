@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -498,6 +499,15 @@ private fun ProdRecorderMainScreen() {
             .statusBarsPadding()
             .padding(horizontal = 16.dp, vertical = 0.dp),
     ) {
+        SourceWavIndicator(
+            status = status,
+            meetingActive = meetingActive,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = 4.dp)
+                .widthIn(max = 280.dp),
+        )
+
         AddSpeakerButton(
             modifier = Modifier.align(Alignment.TopEnd),
             onClick = { showEnroll = true },
@@ -636,6 +646,66 @@ private fun RecordingRing(
             style = Stroke(width = stroke, cap = StrokeCap.Round),
         )
     }
+}
+
+@Composable
+private fun SourceWavIndicator(
+    status: RecorderState.Status,
+    meetingActive: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val active = status.sourceWavRecording
+    val tone = if (active) VuedSuccess else VuedTextTertiary
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(8.dp),
+        color = if (active) VuedSuccessSoft else VuedSurface,
+        border = BorderStroke(1.dp, if (active) VuedSuccess.copy(alpha = 0.38f) else VuedHairline),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(tone)
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                Text(
+                    text = "16ch WAV",
+                    color = VuedTextPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.sp,
+                )
+                Text(
+                    text = sourceWavStatusText(status, meetingActive),
+                    color = VuedTextTertiary,
+                    fontSize = 12.sp,
+                    letterSpacing = 0.sp,
+                )
+            }
+        }
+    }
+}
+
+private fun sourceWavStatusText(status: RecorderState.Status, meetingActive: Boolean): String {
+    if (!status.running) {
+        return if (status.sourceWavSegmentCount > 0) {
+            "stopped · ${status.sourceWavSegmentCount} chunks saved"
+        } else {
+            "stopped"
+        }
+    }
+    if (!status.sourceWavRecording && status.sourceWavSegmentCount == 0) {
+        return "waiting for UMA-16"
+    }
+    val scope = if (meetingActive) "meeting + ambient" else "ambient chunks"
+    val verb = if (status.sourceWavRecording) "saving" else "paused"
+    return "$verb $scope · ${status.sourceWavSegmentCount} chunks"
 }
 
 @Composable
@@ -820,10 +890,16 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                 }
             }
         }
+        var meetingActive by remember { mutableStateOf(MeetingController.active != null) }
+        var meetingMsg by remember { mutableStateOf<String?>(null) }
+
         StatusLine("Mic permission", if (hasAudio) "granted" else "NOT granted")
         StatusLine("Service", if (status.running) "RECORDING" else "stopped")
         StatusLine("Segments written", status.segmentCount.toString())
         status.lastSegment?.let { StatusLine("Last segment", it) }
+        StatusLine("16ch WAV", sourceWavStatusText(status, meetingActive))
+        StatusLine("16ch chunks", status.sourceWavSegmentCount.toString())
+        status.lastSourceWavSegment?.let { StatusLine("Last 16ch chunk", it) }
         status.error?.let { StatusLine("Error", it) }
 
         PeakMeter(status.peakDb)
@@ -850,8 +926,6 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
             }
         }
 
-        var meetingActive by remember { mutableStateOf(MeetingController.active != null) }
-        var meetingMsg by remember { mutableStateOf<String?>(null) }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = {
                 scope.launch {
@@ -861,7 +935,8 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                             val result = MeetingController.stop(context)
                             meetingActive = false
                             meetingMsg = "Uploaded ${result.meetingId.take(8)}… " +
-                                "(${"%.1f".format(result.durationSecs)}s) — transcribing"
+                                "(${"%.1f".format(result.durationSecs)}s) — transcribing" +
+                                if (result.sourceWavPath != null) "; 16ch WAV queued" else ""
                         } else {
                             val id = MeetingController.start(context, "Meeting")
                             meetingActive = true

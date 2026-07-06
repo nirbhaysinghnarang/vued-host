@@ -14,6 +14,9 @@ object RecorderState {
         val running: Boolean = false,
         val segmentCount: Int = 0,
         val lastSegment: String? = null,
+        val sourceWavRecording: Boolean = false,
+        val sourceWavSegmentCount: Int = 0,
+        val lastSourceWavSegment: String? = null,
         val peakDb: Float = Float.NEGATIVE_INFINITY,
         val error: String? = null,
     )

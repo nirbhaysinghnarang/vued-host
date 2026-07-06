@@ -22,7 +22,8 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Vued">
+        android:theme="@style/Theme.Vued"
+        android:usesCleartextTraffic="true">
         <meta-data
             android:name="io.sentry.auto-init"
             android:value="false" />

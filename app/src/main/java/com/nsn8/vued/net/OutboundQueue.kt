@@ -3,7 +3,13 @@ package com.nsn8.vued.net
 import android.content.Context
 import android.util.Log
 import com.nsn8.vued.DiagnosticsLogger
+import com.nsn8.vued.audio.MultiChannelWavRollingBuffer
 import com.nsn8.vued.audio.RollingBuffer
+import com.nsn8.vued.audio.SourceUploadPlan
+import com.nsn8.vued.audio.SourceWavContainerPlan
+import com.nsn8.vued.audio.SourceWavSegmentEncoder
+import com.nsn8.vued.audio.SourceWavStreamPlan
+import com.nsn8.vued.audio.WavSegmentExporter
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -14,7 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * iOS `AdaptiveOggStorage` cache-and-retry pattern, extended to also make the
  * `POST /meetings` create durable and ordered ahead of its audio.
  *
- *  - **Never miss audio / never lose a meeting:** both the exported m4a *and* the
+ *  - **Never miss audio / never lose a meeting:** exported audio artifacts and the
  *    meeting-create are committed to a persisted index before any network call. The
  *    capture/flush cursor advances on enqueue, not on upload.
  *  - **Ordering:** a meeting's audio slice will not upload until that meeting's
@@ -37,7 +43,7 @@ object OutboundQueue {
     private const val PREFS = "vued_outbound"
     private const val KEY = "queue"
 
-    enum class Kind { MEETING_CREATE, AMBIENT, MEETING }
+    enum class Kind { MEETING_CREATE, AMBIENT, MEETING, MEETING_SOURCE_WAV }
 
     private val lock = Any()
     private val draining = AtomicBoolean(false)
@@ -114,6 +120,136 @@ object OutboundQueue {
         source: File,
     ) = enqueueAudio(context, Kind.MEETING, sliceId, sessionId, meetingId, startedAtSec, endedAtSec, durationSecs, source)
 
+    fun enqueueMeetingSourceWav(
+        context: Context,
+        sliceId: String,
+        sessionId: String,
+        meetingId: String,
+        startedAtSec: Double,
+        endedAtSec: Double,
+        durationSecs: Double,
+        monoSizeBytes: Long,
+        source: File,
+    ): File =
+        synchronized(lock) {
+            val dest = File(dir(context), "$sliceId.source.wav")
+            if (!source.renameTo(dest)) {
+                source.copyTo(dest, overwrite = true)
+                source.delete()
+            }
+            save(
+                context,
+                load(context).put(
+                    JSONObject()
+                        .put("id", sourceItemId(sliceId))
+                        .put("kind", Kind.MEETING_SOURCE_WAV.name)
+                        .put("sliceId", sliceId)
+                        .put("sessionId", sessionId)
+                        .put("meetingId", meetingId)
+                        .put("startedAtSec", startedAtSec)
+                        .put("endedAtSec", endedAtSec)
+                        .put("durationSecs", durationSecs)
+                        .put("monoSizeBytes", monoSizeBytes)
+                        .put("sourceSizeBytes", dest.length())
+                        .put("sourceChannels", SOURCE_WAV_CHANNELS)
+                        .put("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ)
+                        .put("metadataDone", false)
+                        .putOpt("roomId", RoomConfig.roomId(context)),
+                ),
+            )
+            Log.i(TAG, "enqueued MEETING_SOURCE_WAV slice $sliceId (${dest.length()} bytes)")
+            DiagnosticsLogger.info("queue_source_wav_enqueued", mapOf(
+                "sliceId" to sliceId,
+                "meetingId" to meetingId,
+                "bytes" to dest.length(),
+                "pending" to load(context).length(),
+            ))
+            dest
+        }
+
+    /**
+     * Enqueues a durable *streaming* source-WAV item at meeting start. Unlike
+     * [enqueueMeetingSourceWav] there is no file yet — the durable chunks are
+     * the 30s segments already on disk under [segmentsDir]. Each [drain] (driven
+     * by segment closes) pushes more bytes; [markMeetingSourceWavEnded] at stop
+     * lets the drain finalize.
+     */
+    fun enqueueMeetingSourceWavStreaming(
+        context: Context,
+        sliceId: String,
+        sessionId: String,
+        meetingId: String,
+        startedAtSec: Double,
+        segmentsDir: String,
+        channels: Int = SOURCE_WAV_CHANNELS,
+        sampleRateHz: Int = SOURCE_WAV_SAMPLE_RATE_HZ,
+        codec: String = "pcm",
+    ) = synchronized(lock) {
+        val id = sourceItemId(sliceId)
+        val arr = load(context)
+        if ((0 until arr.length()).any { arr.getJSONObject(it).getString("id") == id }) {
+            return@synchronized  // already enqueued for this slice
+        }
+        arr.put(
+            JSONObject()
+                .put("id", id)
+                .put("kind", Kind.MEETING_SOURCE_WAV.name)
+                .put("streaming", true)
+                .put("ended", false)
+                .put("sliceId", sliceId)
+                .put("sessionId", sessionId)
+                .put("meetingId", meetingId)
+                .put("startedAtSec", startedAtSec)
+                .put("endedAtSec", 0.0)
+                .put("durationSecs", 0.0)
+                .put("segmentsDir", segmentsDir)
+                .put("sourceChannels", channels)
+                .put("sourceSampleRateHz", sampleRateHz)
+                .put("codec", codec)
+                .put("createdAtMs", System.currentTimeMillis())
+                .put("metadataDone", false)
+                .putOpt("roomId", RoomConfig.roomId(context)),
+        )
+        save(context, arr)
+        Log.i(TAG, "enqueued streaming MEETING_SOURCE_WAV slice $sliceId")
+        DiagnosticsLogger.info("queue_source_wav_stream_enqueued", mapOf(
+            "sliceId" to sliceId,
+            "meetingId" to meetingId,
+            "pending" to arr.length(),
+        ))
+    }
+
+    /** True if a streaming source-WAV item exists for [sliceId]. */
+    fun hasStreamingSourceWav(context: Context, sliceId: String): Boolean = synchronized(lock) {
+        val arr = load(context)
+        val id = sourceItemId(sliceId)
+        (0 until arr.length()).any {
+            val o = arr.getJSONObject(it)
+            o.getString("id") == id && o.optBoolean("streaming", false)
+        }
+    }
+
+    /** Marks the streaming source-WAV item ended so the next drain finalizes it. */
+    fun markMeetingSourceWavEnded(
+        context: Context,
+        sliceId: String,
+        endedAtSec: Double,
+        durationSecs: Double,
+    ) = synchronized(lock) {
+        val arr = load(context)
+        val id = sourceItemId(sliceId)
+        for (i in 0 until arr.length()) {
+            val it = arr.getJSONObject(i)
+            if (it.getString("id") == id && it.optBoolean("streaming", false)) {
+                it.put("ended", true)
+                it.put("endedAtSec", endedAtSec)
+                it.put("durationSecs", durationSecs)
+            }
+        }
+        save(context, arr)
+        Log.i(TAG, "marked streaming MEETING_SOURCE_WAV ended slice $sliceId")
+    }
+
     /** Moves [source] into the durable queue dir and records its metadata. Consumes [source]. */
     private fun enqueueAudio(
         context: Context,
@@ -173,13 +309,19 @@ object OutboundQueue {
         val startedAt = System.currentTimeMillis()
         var attempted = 0
         try {
-            val items = synchronized(lock) { load(context) }
-            for (i in 0 until items.length()) {
+            val snapshot = synchronized(lock) {
+                val items = load(context)
+                (0 until items.length()).map { items.getJSONObject(it) }
+            }
+            val ordered = snapshot
+                .filter { Kind.valueOf(it.getString("kind")) != Kind.MEETING_SOURCE_WAV } +
+                snapshot.filter { Kind.valueOf(it.getString("kind")) == Kind.MEETING_SOURCE_WAV }
+            for (item in ordered) {
                 attempted += 1
-                val item = items.getJSONObject(i)
                 when (Kind.valueOf(item.getString("kind"))) {
                     Kind.MEETING_CREATE -> drainMeetingCreate(context, item)
                     Kind.AMBIENT, Kind.MEETING -> drainAudio(context, item)
+                    Kind.MEETING_SOURCE_WAV -> drainMeetingSourceWav(context, item)
                 }
             }
             DiagnosticsLogger.info("queue_drain_completed", mapOf(
@@ -275,6 +417,166 @@ object OutboundQueue {
         }
     }
 
+    private suspend fun drainMeetingSourceWav(context: Context, item: JSONObject) {
+        if (item.optBoolean("streaming", false)) {
+            drainStreamingSourceWav(context, item)
+            return
+        }
+        val itemId = item.getString("id")
+        val sliceId = item.getString("sliceId")
+        val meetingId = item.getString("meetingId")
+        if (hasPendingMeetingCreate(context, meetingId)) {
+            Log.i(TAG, "source wav $sliceId waiting on meeting-create $meetingId")
+            return
+        }
+        val file = File(dir(context), "$sliceId.source.wav")
+        if (!file.exists()) {
+            remove(context, itemId)
+            DiagnosticsLogger.warn("queue_source_wav_orphan_removed", mapOf(
+                "sliceId" to sliceId,
+                "meetingId" to meetingId,
+            ))
+            return
+        }
+        try {
+            val durationSecs = item.getDouble("durationSecs")
+            val monoSizeBytes = item.getLong("monoSizeBytes")
+            if (!item.optBoolean("metadataDone", false)) {
+                val roomId = item.optString("roomId", "").ifEmpty { null }
+                VuedApi.createSlice(
+                    sliceId,
+                    item.getString("sessionId"),
+                    meetingId,
+                    item.getDouble("startedAtSec"),
+                    item.getDouble("endedAtSec"),
+                    durationSecs,
+                    monoSizeBytes,
+                    roomId = roomId,
+                )
+                setMetadataDone(context, itemId)
+            }
+
+            val sourceSizeBytes = file.length()
+            VuedApi.uploadSliceSourceWav(
+                sliceId = sliceId,
+                source = file,
+                durationSecs = durationSecs,
+                sizeBytes = sourceSizeBytes,
+                channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS),
+                sampleRateHz = item.optInt("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ),
+            )
+            file.delete()
+            remove(context, itemId)
+            Log.i(TAG, "uploaded queued source wav $sliceId")
+        } catch (e: Exception) {
+            Log.w(TAG, "source wav $sliceId still pending: ${e.message}")
+            DiagnosticsLogger.warn("queue_source_wav_pending", mapOf(
+                "sliceId" to sliceId,
+                "meetingId" to meetingId,
+            ), e)
+        }
+    }
+
+    private suspend fun drainStreamingSourceWav(context: Context, item: JSONObject) {
+        val itemId = item.getString("id")
+        val sliceId = item.getString("sliceId")
+        val meetingId = item.getString("meetingId")
+        val ended = item.optBoolean("ended", false)
+
+        // Orphan reclaim: an un-ended item far past creation means the meeting was
+        // abandoned (e.g. an app crash mid-meeting never reached stop). The server
+        // sweeps its temp session separately.
+        if (!ended) {
+            val ageMs = System.currentTimeMillis() - item.optLong("createdAtMs", 0L)
+            if (ageMs > STREAMING_SOURCE_WAV_TTL_MS) {
+                remove(context, itemId)
+                runCatching { wvBlobDir(context, sliceId).deleteRecursively() }
+                DiagnosticsLogger.warn("queue_source_wav_stream_orphaned", mapOf(
+                    "sliceId" to sliceId, "meetingId" to meetingId, "ageMs" to ageMs,
+                ))
+                return
+            }
+        }
+
+        if (hasPendingMeetingCreate(context, meetingId)) {
+            Log.i(TAG, "source wav stream $sliceId waiting on meeting-create $meetingId")
+            return
+        }
+
+        val segmentsPath = item.optString("segmentsDir", "")
+        val segmentsDir = File(segmentsPath)
+        if (segmentsPath.isEmpty() || !segmentsDir.isDirectory) {
+            return  // segment dir not available yet; retry on the next drain
+        }
+        val startMs = (item.getDouble("startedAtSec") * 1000).toLong()
+        val channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS)
+        val sampleRate = item.optInt("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ)
+        val codec = item.optString("codec", "pcm")
+
+        try {
+            val endMs: Long? = if (ended) (item.getDouble("endedAtSec") * 1000).toLong() else null
+            val overlapping = WavSegmentExporter.overlappingSegments(
+                MultiChannelWavRollingBuffer.listSegmentsIn(segmentsDir, sampleRate, channels),
+                startMs,
+                endMs ?: Long.MAX_VALUE,
+            )
+            // While recording, withhold the most recent segment — it may still be
+            // growing or turn out to be the meeting's last (tail-trimmed) segment.
+            val selected = if (ended) overlapping else overlapping.dropLast(1)
+            val plan: SourceUploadPlan = if (codec == "wavpack") {
+                // Encode each safe, trimmed segment to a cached .wv blob, then lay
+                // them out as the length-prefixed container the server stores and
+                // Modal decodes.
+                val blobs = selected.mapNotNull {
+                    SourceWavSegmentEncoder.encodeSegment(it, startMs, endMs, wvBlobDir(context, sliceId))
+                }
+                SourceWavContainerPlan.build(blobs)
+            } else {
+                SourceWavStreamPlan.build(selected, startMs, endMs, sampleRate, channels)
+            }
+            val durationSecs = if (ended) {
+                (item.getDouble("endedAtSec") - item.getDouble("startedAtSec")).coerceAtLeast(0.0)
+            } else 0.0
+
+            if (ended && !item.optBoolean("metadataDone", false)) {
+                // /complete needs the slice row. The mono MEETING item drains
+                // ahead of source-wav (so it usually wins the ON CONFLICT DO
+                // NOTHING race with its own metadata); this is the safety net
+                // that guarantees the row exists before we finalize.
+                val roomId = item.optString("roomId", "").ifEmpty { null }
+                VuedApi.createSlice(
+                    sliceId,
+                    item.getString("sessionId"),
+                    meetingId,
+                    item.getDouble("startedAtSec"),
+                    item.getDouble("endedAtSec"),
+                    durationSecs,
+                    plan.totalBytes,
+                    roomId = roomId,
+                )
+                setMetadataDone(context, itemId)
+            }
+
+            VuedApi.uploadSourceWavStream(
+                sliceId, plan, ended, channels, sampleRate, codec = codec, durationSecs = durationSecs,
+            )
+
+            if (ended) {
+                remove(context, itemId)
+                runCatching { wvBlobDir(context, sliceId).deleteRecursively() }
+                Log.i(TAG, "completed streaming source wav $sliceId (${plan.totalBytes} bytes, codec=$codec)")
+                DiagnosticsLogger.info("queue_source_wav_stream_completed", mapOf(
+                    "sliceId" to sliceId, "meetingId" to meetingId, "bytes" to plan.totalBytes, "codec" to codec,
+                ))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "streaming source wav $sliceId still pending: ${e.message}")
+            DiagnosticsLogger.warn("queue_source_wav_stream_pending", mapOf(
+                "sliceId" to sliceId, "meetingId" to meetingId, "ended" to ended,
+            ), e)
+        }
+    }
+
     private fun hasPendingMeetingCreate(context: Context, meetingId: String): Boolean =
         synchronized(lock) {
             val arr = load(context)
@@ -315,4 +617,16 @@ object OutboundQueue {
             save(context, arr)
         }
     }
+
+    private fun sourceItemId(sliceId: String): String = "source:$sliceId"
+
+    /** Per-slice cache of encoded WavPack segment blobs (durable across restarts). */
+    private fun wvBlobDir(context: Context, sliceId: String): File =
+        File(context.filesDir, "wv_blobs/$sliceId")
+
+    private const val SOURCE_WAV_CHANNELS = 16
+    private const val SOURCE_WAV_SAMPLE_RATE_HZ = 16_000
+    // Longer than any plausible single meeting, so a still-recording meeting is
+    // never reclaimed — only a streaming item whose meeting was truly abandoned.
+    private const val STREAMING_SOURCE_WAV_TTL_MS = 12L * 60 * 60 * 1000
 }

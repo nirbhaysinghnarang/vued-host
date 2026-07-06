@@ -1,6 +1,7 @@
 package com.nsn8.vued.net
 
 import com.nsn8.vued.VuedConfig
+import com.nsn8.vued.audio.SourceUploadPlan
 import com.nsn8.vued.auth.VuedAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -11,8 +12,12 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.RandomAccessFile
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.TimeUnit
+import kotlin.math.min
 
 /**
  * Thin REST client for the Vued backend. Attaches the Supabase JWT and unwraps the
@@ -20,8 +25,15 @@ import java.nio.charset.StandardCharsets
  */
 object VuedApi {
 
-    private val client = OkHttpClient()
+    private const val SOURCE_WAV_CHUNK_BYTES = 4 * 1024 * 1024
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .writeTimeout(2, TimeUnit.MINUTES)
+        .build()
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
+    private val sourceChunkMedia = "application/octet-stream".toMediaType()
 
     class ApiException(message: String) : Exception(message)
 
@@ -122,6 +134,193 @@ object VuedApi {
                 throw ApiException(envelope.optString("message", "HTTP $status"))
             }
         }
+    }
+
+    /** Ships the 16-channel source WAV sidecar. This does not trigger normal transcription. */
+    suspend fun uploadSliceSourceWav(
+        sliceId: String,
+        source: File,
+        durationSecs: Double,
+        sizeBytes: Long,
+        channels: Int,
+        sampleRateHz: Int,
+    ) = withContext(Dispatchers.IO) {
+        if (!source.exists()) throw ApiException("source WAV missing")
+        val actualSizeBytes = source.length()
+        if (actualSizeBytes != sizeBytes) {
+            throw ApiException("source WAV size changed: expected $sizeBytes, found $actualSizeBytes")
+        }
+        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        var session = createSourceWavUploadSession(
+            token = token,
+            sliceId = sliceId,
+            durationSecs = durationSecs,
+            sizeBytes = sizeBytes,
+            channels = channels,
+            sampleRateHz = sampleRateHz,
+        )
+        if (session.complete) return@withContext
+
+        var offset = session.offset.coerceIn(0L, sizeBytes)
+        RandomAccessFile(source, "r").use { raf ->
+            val buffer = ByteArray(SOURCE_WAV_CHUNK_BYTES)
+            while (offset < sizeBytes) {
+                val toRead = min(buffer.size.toLong(), sizeBytes - offset).toInt()
+                raf.seek(offset)
+                raf.readFully(buffer, 0, toRead)
+                val next = uploadSourceWavChunk(
+                    token = token,
+                    sliceId = sliceId,
+                    uploadId = session.uploadId,
+                    offset = offset,
+                    buffer = buffer,
+                    byteCount = toRead,
+                )
+                if (next.offset <= offset && next.offset < sizeBytes) {
+                    throw ApiException("source WAV upload did not advance: ${next.offset}/$sizeBytes")
+                }
+                offset = next.offset.coerceAtMost(sizeBytes)
+                session = next
+            }
+        }
+
+        completeSourceWavUpload(
+            token = token,
+            sliceId = sliceId,
+            uploadId = session.uploadId,
+        )
+    }
+
+    /**
+     * Advances a streaming (incremental) source-WAV upload: opens/gets the
+     * open-ended session, uploads [plan]'s bytes from the server's offset
+     * onward, and — when [ended] — finalizes so the server stores the WAV and
+     * enqueues GSS. Safe to call repeatedly (once per closed segment): each call
+     * resumes from the server offset and sends only what's new.
+     */
+    suspend fun uploadSourceWavStream(
+        sliceId: String,
+        plan: SourceUploadPlan,
+        ended: Boolean,
+        channels: Int,
+        sampleRateHz: Int,
+        codec: String = "pcm",
+        durationSecs: Double = 0.0,
+    ) = withContext(Dispatchers.IO) {
+        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        var session = createSourceWavStreamingSession(token, sliceId, channels, sampleRateHz, codec, durationSecs)
+        if (session.complete) return@withContext
+        var offset = session.offset.coerceIn(0L, plan.totalBytes)
+        while (offset < plan.totalBytes) {
+            val chunk = plan.readRange(offset, SOURCE_WAV_CHUNK_BYTES)
+            if (chunk.isEmpty()) break
+            val next = uploadSourceWavChunk(
+                token = token,
+                sliceId = sliceId,
+                uploadId = session.uploadId,
+                offset = offset,
+                buffer = chunk,
+                byteCount = chunk.size,
+            )
+            if (next.offset <= offset) {
+                throw ApiException("source WAV stream did not advance: ${next.offset}/${plan.totalBytes}")
+            }
+            offset = next.offset.coerceAtMost(plan.totalBytes)
+            session = next
+        }
+        if (ended) {
+            completeSourceWavUpload(token = token, sliceId = sliceId, uploadId = session.uploadId)
+        }
+    }
+
+    private fun createSourceWavStreamingSession(
+        token: String,
+        sliceId: String,
+        channels: Int,
+        sampleRateHz: Int,
+        codec: String,
+        durationSecs: Double,
+    ): SourceWavUploadSession {
+        // Omitting sizeBytes signals the server to open an open-ended session.
+        val body = JSONObject()
+            .put("channels", channels)
+            .put("sampleRateHz", sampleRateHz)
+            .put("codec", codec)
+        // Known only at stop; lets the server record a real source duration.
+        if (durationSecs > 0.0) body.put("durationSecs", durationSecs)
+        val request = Request.Builder()
+            .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/source-wav/uploads")
+            .header("Authorization", "Bearer $token")
+            .post(body.toString().toRequestBody(jsonMedia))
+            .build()
+        return parseSourceWavUploadSession(executeEnvelope(request))
+    }
+
+    private data class SourceWavUploadSession(
+        val uploadId: String,
+        val offset: Long,
+        val complete: Boolean,
+    )
+
+    private fun parseSourceWavUploadSession(data: JSONObject?): SourceWavUploadSession {
+        val uploadId = data?.optString("uploadId").orEmpty()
+        if (uploadId.isEmpty()) throw ApiException("source WAV upload returned no uploadId")
+        return SourceWavUploadSession(
+            uploadId = uploadId,
+            offset = data?.optLong("offset", 0L) ?: 0L,
+            complete = data?.optBoolean("complete", false) ?: false,
+        )
+    }
+
+    private fun createSourceWavUploadSession(
+        token: String,
+        sliceId: String,
+        durationSecs: Double,
+        sizeBytes: Long,
+        channels: Int,
+        sampleRateHz: Int,
+    ): SourceWavUploadSession {
+        val body = JSONObject()
+            .put("durationSecs", durationSecs)
+            .put("sizeBytes", sizeBytes)
+            .put("channels", channels)
+            .put("sampleRateHz", sampleRateHz)
+        val request = Request.Builder()
+            .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/source-wav/uploads")
+            .header("Authorization", "Bearer $token")
+            .post(body.toString().toRequestBody(jsonMedia))
+            .build()
+        return parseSourceWavUploadSession(executeEnvelope(request))
+    }
+
+    private fun uploadSourceWavChunk(
+        token: String,
+        sliceId: String,
+        uploadId: String,
+        offset: Long,
+        buffer: ByteArray,
+        byteCount: Int,
+    ): SourceWavUploadSession {
+        val request = Request.Builder()
+            .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/source-wav/uploads/$uploadId")
+            .header("Authorization", "Bearer $token")
+            .header("x-upload-offset", offset.toString())
+            .patch(buffer.toRequestBody(sourceChunkMedia, 0, byteCount))
+            .build()
+        return parseSourceWavUploadSession(executeEnvelope(request))
+    }
+
+    private fun completeSourceWavUpload(
+        token: String,
+        sliceId: String,
+        uploadId: String,
+    ) {
+        val request = Request.Builder()
+            .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/source-wav/uploads/$uploadId/complete")
+            .header("Authorization", "Bearer $token")
+            .post(JSONObject().toString().toRequestBody(jsonMedia))
+            .build()
+        executeEnvelope(request)
     }
 
     // ---- speaker enrollment ----
@@ -255,6 +454,18 @@ object VuedApi {
 
     private fun url(value: String): String =
         URLEncoder.encode(value, StandardCharsets.UTF_8.toString())
+
+    private fun executeEnvelope(request: Request): JSONObject? {
+        client.newCall(request).execute().use { response ->
+            val text = response.body?.string().orEmpty()
+            val envelope = if (text.isNotBlank()) JSONObject(text) else JSONObject()
+            val status = envelope.optInt("status", response.code)
+            if (status !in 200..299) {
+                throw ApiException(envelope.optString("message", "HTTP $status"))
+            }
+            return envelope.optJSONObject("data")
+        }
+    }
 
     /** Returns the envelope's `data` object, or null when data is null/absent. */
     private suspend fun request(
