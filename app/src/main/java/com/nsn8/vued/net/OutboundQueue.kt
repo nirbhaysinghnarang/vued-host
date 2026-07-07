@@ -26,7 +26,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - **Ordering:** a meeting's audio slice will not upload until that meeting's
  *    `MEETING_CREATE` item has succeeded — enforced on every drain, including retries.
  *    (The create is enqueued at meeting start, so it always precedes the stop-time
- *    audio item in the queue.)
+ *    audio item in the queue.) The drain services items in priority tiers —
+ *    `MEETING_CREATE → MEETING → MEETING_SOURCE_WAV → AMBIENT → AMBIENT_SOURCE_WAV`,
+ *    FIFO within a tier — and reloads the index between items, so meeting work
+ *    enqueued mid-drain preempts a queued ambient backlog instead of waiting behind
+ *    it. Ambient source sidecars additionally yield between 4 MB chunks to pending
+ *    higher-tier work and later resume from the server offset.
  *  - **Offline-safe + idempotent:** the index survives restarts (SharedPreferences
  *    JSON, like iOS UserDefaults); the server is idempotent on `meetingId` /`sliceId`
  *    (`ON CONFLICT`), so at-least-once retries never duplicate.
@@ -34,6 +39,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    so a retry skips straight to the bytes PUT.
  *  - **Opportunistic drain:** no scheduler — [drain] runs at lifecycle points (service
  *    start, each ambient flush, meeting start/stop), guarded against concurrent runs.
+ *    A drain requested while one is running sets a rerun flag so the in-flight drain
+ *    runs another pass instead of the request being dropped.
  *  - **No eviction:** items are kept until they succeed (matches iOS). Success removes
  *    the entry (+ file); orphan audio entries (missing file) are pruned.
  */
@@ -45,7 +52,15 @@ object OutboundQueue {
 
     enum class Kind { MEETING_CREATE, AMBIENT, MEETING, MEETING_SOURCE_WAV, AMBIENT_SOURCE_WAV }
 
-    private val SOURCE_KINDS = setOf(Kind.MEETING_SOURCE_WAV, Kind.AMBIENT_SOURCE_WAV)
+    /** Drain priority: lower value first; FIFO (insertion order) within a tier.
+     *  Explicit `when` — not [Kind.ordinal] — because kind names are persisted. */
+    private fun priority(kind: Kind): Int = when (kind) {
+        Kind.MEETING_CREATE -> 0
+        Kind.MEETING -> 1
+        Kind.MEETING_SOURCE_WAV -> 2 // includes streaming items
+        Kind.AMBIENT -> 3
+        Kind.AMBIENT_SOURCE_WAV -> 4
+    }
 
     // Ambient source sidecars are best-effort: cap their pending bytes so an
     // offline stretch can't fill the disk with ~150 MB windows. Meetings keep
@@ -54,6 +69,7 @@ object OutboundQueue {
 
     private val lock = Any()
     private val draining = AtomicBoolean(false)
+    private val drainRequested = AtomicBoolean(false)
 
     private fun dir(context: Context): File =
         File(context.filesDir, "outbound").apply { mkdirs() }
@@ -371,40 +387,90 @@ object OutboundQueue {
     // ---- drain (opportunistic, ordered, idempotent) ----
 
     /**
-     * Attempts every pending item once, in insertion order. A meeting's audio slice is
-     * skipped while its `MEETING_CREATE` is still pending, so the meeting always exists
-     * server-side before its audio is uploaded — on first try and on every retry.
+     * Attempts every pending item at most once per pass, highest-priority tier first
+     * ([priority]; insertion order within a tier), reloading the index between items so
+     * meeting work enqueued mid-drain is picked up ahead of a queued ambient backlog.
+     * A meeting's audio slice is skipped while its `MEETING_CREATE` is still pending,
+     * so the meeting always exists server-side before its audio is uploaded — on first
+     * try and on every retry. Reruns while further drains were requested; a yielded
+     * ambient sidecar is re-pickable within the pass and is not counted as a failure.
      */
     suspend fun drain(context: Context) {
-        if (!draining.compareAndSet(false, true)) return
-        val startedAt = System.currentTimeMillis()
-        var attempted = 0
-        try {
-            val snapshot = synchronized(lock) {
-                val items = load(context)
-                (0 until items.length()).map { items.getJSONObject(it) }
-            }
-            val ordered = snapshot
-                .filter { Kind.valueOf(it.getString("kind")) !in SOURCE_KINDS } +
-                snapshot.filter { Kind.valueOf(it.getString("kind")) in SOURCE_KINDS }
-            for (item in ordered) {
-                attempted += 1
-                when (Kind.valueOf(item.getString("kind"))) {
-                    Kind.MEETING_CREATE -> drainMeetingCreate(context, item)
-                    Kind.AMBIENT, Kind.MEETING -> drainAudio(context, item)
-                    Kind.MEETING_SOURCE_WAV -> drainMeetingSourceWav(context, item)
-                    Kind.AMBIENT_SOURCE_WAV -> drainAmbientSourceWav(context, item)
+        drainRequested.set(true) // set AFTER the caller's enqueue, so a request is never lost
+        var pass = 0
+        while (true) {
+            if (!draining.compareAndSet(false, true)) return // running drain will see the flag
+            try {
+                while (drainRequested.compareAndSet(true, false)) {
+                    if (pass > 0) DiagnosticsLogger.info("queue_drain_rerun", mapOf("pass" to pass))
+                    drainPass(context)
+                    pass += 1
                 }
+            } finally {
+                draining.set(false)
             }
-            DiagnosticsLogger.info("queue_drain_completed", mapOf(
-                "attempted" to attempted,
-                "pending" to size(context),
-                "elapsedMs" to (System.currentTimeMillis() - startedAt),
-            ))
-        } finally {
-            draining.set(false)
+            // A request may have landed between the last flag check and releasing
+            // `draining` (that caller's CAS failed, so nobody owns it) — re-claim.
+            if (!drainRequested.get()) return
         }
     }
+
+    private suspend fun drainPass(context: Context) {
+        val startedAt = System.currentTimeMillis()
+        // Every iteration either grows `attempted` permanently (including failures — a
+        // failing item is tried at most once per pass) or is a yield, which requires an
+        // unattempted higher-tier item that the very next pick consumes. So the pass
+        // terminates for any finite enqueue rate, and nothing can starve or hot-loop.
+        val attempted = mutableSetOf<String>()
+        var attempts = 0
+        var yields = 0
+        while (true) {
+            val item = nextPending(context, attempted) ?: break
+            val id = item.getString("id")
+            attempted += id
+            attempts += 1
+            val yielded = when (Kind.valueOf(item.getString("kind"))) {
+                Kind.MEETING_CREATE -> { drainMeetingCreate(context, item); false }
+                Kind.AMBIENT, Kind.MEETING -> { drainAudio(context, item); false }
+                Kind.MEETING_SOURCE_WAV -> { drainMeetingSourceWav(context, item); false }
+                Kind.AMBIENT_SOURCE_WAV -> drainAmbientSourceWav(context, item) {
+                    hasHigherPriorityPending(context, priority(Kind.AMBIENT_SOURCE_WAV), attempted)
+                }
+            }
+            if (yielded) {
+                attempted -= id
+                yields += 1
+            }
+        }
+        DiagnosticsLogger.info("queue_drain_completed", mapOf(
+            "attempted" to attempts,
+            "yields" to yields,
+            "pending" to size(context),
+            "elapsedMs" to (System.currentTimeMillis() - startedAt),
+        ))
+    }
+
+    /** First (insertion-order) unattempted item of the highest-priority tier,
+     *  reloaded under lock so items enqueued or removed mid-drain are seen. */
+    private fun nextPending(context: Context, attempted: Set<String>): JSONObject? =
+        synchronized(lock) {
+            val items = load(context)
+            (0 until items.length())
+                .map { items.getJSONObject(it) }
+                .filter { it.getString("id") !in attempted }
+                .minByOrNull { priority(Kind.valueOf(it.getString("kind"))) }
+        }
+
+    /** True when an unattempted item of a strictly higher tier than [tier] is pending. */
+    private fun hasHigherPriorityPending(context: Context, tier: Int, attempted: Set<String>): Boolean =
+        synchronized(lock) {
+            val items = load(context)
+            (0 until items.length()).any { idx ->
+                val o = items.getJSONObject(idx)
+                o.getString("id") !in attempted &&
+                    priority(Kind.valueOf(o.getString("kind"))) < tier
+            }
+        }
 
     suspend fun drainMeetingCreate(context: Context, meetingId: String): Boolean {
         val item = synchronized(lock) {
@@ -478,7 +544,7 @@ object OutboundQueue {
             runCatching { deleteUploadedSourceSegments(context, item) }
             file.delete()
             remove(context, id)
-            Log.i(TAG, "uploaded queued slice $id")
+            Log.i(TAG, "uploaded queued slice $id (${kind.name})")
         } catch (e: Exception) {
             Log.w(TAG, "slice $id still pending: ${e.message}")
             DiagnosticsLogger.warn("queue_audio_pending", mapOf(
@@ -529,6 +595,9 @@ object OutboundQueue {
             }
 
             val sourceSizeBytes = file.length()
+            // TODO: if long meeting sidecars ever delay ambient mono too much, pass a
+            // shouldYield (higher-tier threshold) here and handle Yielded like the
+            // ambient variant does.
             VuedApi.uploadSliceSourceWav(
                 sliceId = sliceId,
                 source = file,
@@ -554,8 +623,16 @@ object OutboundQueue {
      * Ambient variant of [drainMeetingSourceWav]: no meeting to wait for, and
      * the slice row is ensured via the ambient creator (idempotent server-side —
      * the mono AMBIENT item usually created it already).
+     *
+     * Returns true when the upload yielded to higher-priority work ([shouldYield],
+     * polled between chunks) — not a failure: the item stays pending and re-pickable,
+     * and the next attempt resumes from the server offset. All other exits return false.
      */
-    private suspend fun drainAmbientSourceWav(context: Context, item: JSONObject) {
+    private suspend fun drainAmbientSourceWav(
+        context: Context,
+        item: JSONObject,
+        shouldYield: () -> Boolean,
+    ): Boolean {
         val itemId = item.getString("id")
         val sliceId = item.getString("sliceId")
         val file = File(dir(context), "$sliceId.source.wav")
@@ -564,7 +641,7 @@ object OutboundQueue {
             DiagnosticsLogger.warn("queue_ambient_source_wav_orphan_removed", mapOf(
                 "sliceId" to sliceId,
             ))
-            return
+            return false
         }
         try {
             val durationSecs = item.getDouble("durationSecs")
@@ -584,7 +661,7 @@ object OutboundQueue {
             }
 
             val sourceSizeBytes = file.length()
-            VuedApi.uploadSliceSourceWav(
+            val result = VuedApi.uploadSliceSourceWav(
                 sliceId = sliceId,
                 source = file,
                 durationSecs = durationSecs,
@@ -592,7 +669,17 @@ object OutboundQueue {
                 channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS),
                 sampleRateHz = item.optInt("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ),
                 codec = item.optString("codec", "pcm"),
+                shouldYield = shouldYield,
             )
+            if (result is VuedApi.SourceWavUploadResult.Yielded) {
+                Log.i(TAG, "ambient source wav $sliceId yielded at ${result.offset}/${result.totalBytes}")
+                DiagnosticsLogger.info("queue_ambient_source_wav_yielded", mapOf(
+                    "sliceId" to sliceId,
+                    "offset" to result.offset,
+                    "totalBytes" to result.totalBytes,
+                ))
+                return true
+            }
             file.delete()
             remove(context, itemId)
             Log.i(TAG, "uploaded queued ambient source wav $sliceId")
@@ -602,6 +689,7 @@ object OutboundQueue {
                 "sliceId" to sliceId,
             ), e)
         }
+        return false
     }
 
     private suspend fun drainStreamingSourceWav(context: Context, item: JSONObject) {

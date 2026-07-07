@@ -158,7 +158,21 @@ object VuedApi {
         }
     }
 
-    /** Ships the 16-channel source WAV sidecar. This does not trigger normal transcription. */
+    /** Outcome of a resumable source-WAV upload attempt. */
+    sealed interface SourceWavUploadResult {
+        data object Completed : SourceWavUploadResult
+
+        /** Upload paused between chunks for higher-priority work; the server
+         *  session keeps [offset], so the next attempt resumes from there. */
+        data class Yielded(val offset: Long, val totalBytes: Long) : SourceWavUploadResult
+    }
+
+    /**
+     * Ships the 16-channel source WAV sidecar. This does not trigger normal transcription.
+     * [shouldYield] is polled between 4 MB chunks; when it returns true the upload stops
+     * with [SourceWavUploadResult.Yielded] — no chunk is interrupted mid-flight and
+     * `/complete` is never called, so the server session stays resumable.
+     */
     suspend fun uploadSliceSourceWav(
         sliceId: String,
         source: File,
@@ -167,7 +181,8 @@ object VuedApi {
         channels: Int,
         sampleRateHz: Int,
         codec: String = "pcm",
-    ) = withContext(Dispatchers.IO) {
+        shouldYield: () -> Boolean = { false },
+    ): SourceWavUploadResult = withContext(Dispatchers.IO) {
         if (!source.exists()) throw ApiException("source WAV missing")
         val actualSizeBytes = source.length()
         if (actualSizeBytes != sizeBytes) {
@@ -183,12 +198,15 @@ object VuedApi {
             sampleRateHz = sampleRateHz,
             codec = codec,
         )
-        if (session.complete) return@withContext
+        if (session.complete) return@withContext SourceWavUploadResult.Completed
 
         var offset = session.offset.coerceIn(0L, sizeBytes)
         RandomAccessFile(source, "r").use { raf ->
             val buffer = ByteArray(SOURCE_WAV_CHUNK_BYTES)
             while (offset < sizeBytes) {
+                if (shouldYield()) {
+                    return@withContext SourceWavUploadResult.Yielded(offset, sizeBytes)
+                }
                 val toRead = min(buffer.size.toLong(), sizeBytes - offset).toInt()
                 raf.seek(offset)
                 raf.readFully(buffer, 0, toRead)
@@ -213,6 +231,7 @@ object VuedApi {
             sliceId = sliceId,
             uploadId = session.uploadId,
         )
+        SourceWavUploadResult.Completed
     }
 
     /**
