@@ -189,10 +189,27 @@ object AmbientFlusher {
             return
         }
         source.flush()
-        val wavOut = File(context.cacheDir, "ambient_${windowEnd}_16ch_16k.wav")
-        val export = WavSegmentExporter.exportWindow(source.listSegments(), windowStart, windowEnd, wavOut)
+        // WavPack halves-or-better the ~150 MB raw window; same container the
+        // streaming meeting path ships, so server/Modal need nothing new.
+        val compress = VuedConfig.SOURCE_WAV_CODEC == "wavpack"
+        val codec = if (compress) "wavpack" else "pcm"
+        val out = File(
+            context.cacheDir,
+            if (compress) "ambient_${windowEnd}_16ch_16k.wv" else "ambient_${windowEnd}_16ch_16k.wav",
+        )
+        val export = if (compress) {
+            WavSegmentExporter.exportWindowWv(
+                source.listSegments(),
+                windowStart,
+                windowEnd,
+                out,
+                blobCacheDir = File(context.cacheDir, "ambient_wv_blobs"),
+            )
+        } else {
+            WavSegmentExporter.exportWindow(source.listSegments(), windowStart, windowEnd, out)
+        }
         if (export == null) {
-            wavOut.delete()
+            out.delete()
             Log.i(TAG, "ambient source sidecar export empty windowMs=${windowEnd - windowStart}")
             DiagnosticsLogger.info("ambient_source_wav_export_empty", mapOf(
                 "sliceId" to sliceId,
@@ -204,7 +221,8 @@ object AmbientFlusher {
             "sliceId" to sliceId,
             "segments" to export.segmentCount,
             "durationMs" to export.durationMs,
-            "bytes" to wavOut.length(),
+            "bytes" to out.length(),
+            "codec" to codec,
         ))
         OutboundQueue.enqueueAmbientSourceWav(
             context,
@@ -214,7 +232,8 @@ object AmbientFlusher {
             endedAtSec = windowEnd / 1000.0,
             durationSecs = durationSecs,
             monoSizeBytes = monoSizeBytes,
-            source = wavOut,
+            source = out,
+            codec = codec,
         )
     }
 }

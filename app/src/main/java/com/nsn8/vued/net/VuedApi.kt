@@ -145,6 +145,7 @@ object VuedApi {
         sizeBytes: Long,
         channels: Int,
         sampleRateHz: Int,
+        codec: String = "pcm",
     ) = withContext(Dispatchers.IO) {
         if (!source.exists()) throw ApiException("source WAV missing")
         val actualSizeBytes = source.length()
@@ -159,6 +160,7 @@ object VuedApi {
             sizeBytes = sizeBytes,
             channels = channels,
             sampleRateHz = sampleRateHz,
+            codec = codec,
         )
         if (session.complete) return@withContext
 
@@ -280,12 +282,14 @@ object VuedApi {
         sizeBytes: Long,
         channels: Int,
         sampleRateHz: Int,
+        codec: String = "pcm",
     ): SourceWavUploadSession {
         val body = JSONObject()
             .put("durationSecs", durationSecs)
             .put("sizeBytes", sizeBytes)
             .put("channels", channels)
             .put("sampleRateHz", sampleRateHz)
+            .put("codec", codec)
         val request = Request.Builder()
             .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/source-wav/uploads")
             .header("Authorization", "Bearer $token")

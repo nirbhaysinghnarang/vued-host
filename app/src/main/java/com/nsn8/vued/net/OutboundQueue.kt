@@ -183,6 +183,7 @@ object OutboundQueue {
         durationSecs: Double,
         monoSizeBytes: Long,
         source: File,
+        codec: String = "pcm",
     ): File? =
         synchronized(lock) {
             val items = load(context)
@@ -222,14 +223,16 @@ object OutboundQueue {
                         .put("sourceSizeBytes", dest.length())
                         .put("sourceChannels", SOURCE_WAV_CHANNELS)
                         .put("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ)
+                        .put("codec", codec)
                         .put("metadataDone", false)
                         .putOpt("roomId", RoomConfig.roomId(context)),
                 ),
             )
-            Log.i(TAG, "enqueued AMBIENT_SOURCE_WAV slice $sliceId (${dest.length()} bytes)")
+            Log.i(TAG, "enqueued AMBIENT_SOURCE_WAV slice $sliceId (${dest.length()} bytes, $codec)")
             DiagnosticsLogger.info("queue_ambient_source_wav_enqueued", mapOf(
                 "sliceId" to sliceId,
                 "bytes" to dest.length(),
+                "codec" to codec,
                 "pending" to load(context).length(),
             ))
             dest
@@ -533,6 +536,7 @@ object OutboundQueue {
                 sizeBytes = sourceSizeBytes,
                 channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS),
                 sampleRateHz = item.optInt("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ),
+                codec = item.optString("codec", "pcm"),
             )
             file.delete()
             remove(context, itemId)
@@ -587,6 +591,7 @@ object OutboundQueue {
                 sizeBytes = sourceSizeBytes,
                 channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS),
                 sampleRateHz = item.optInt("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ),
+                codec = item.optString("codec", "pcm"),
             )
             file.delete()
             remove(context, itemId)

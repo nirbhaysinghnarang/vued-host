@@ -70,6 +70,67 @@ object WavSegmentExporter {
         )
     }
 
+    /**
+     * Exports the window as the WavPack source container
+     * ([SourceWavContainerPlan.MAGIC] then length-prefixed per-segment blobs) —
+     * the same byte layout the streaming meeting uploader produces, so the
+     * server and Modal treat both identically. Blob files are per-window
+     * scratch (ambient windows never repeat), so they are deleted after the
+     * container is written.
+     */
+    fun exportWindowWv(
+        segments: List<MultiChannelWavRollingBuffer.Segment>,
+        startMs: Long,
+        endMs: Long,
+        out: File,
+        blobCacheDir: File,
+    ): Result? {
+        val selected = overlappingSegments(segments, startMs, endMs)
+        if (selected.isEmpty()) return null
+        val blobs = ArrayList<File>(selected.size)
+        var totalFrames = 0L
+        var sampleRate = MultiChannelWavRollingBuffer.SAMPLE_RATE_16K
+        try {
+            for (segment in selected) {
+                val info = Pcm16WavSegmentWriter.readInfo(segment.file) ?: continue
+                sampleRate = info.sampleRate
+                val startFrame = frameStart(startMs, segment.startMs, info.sampleRate, info.frameCount)
+                val endFrame = frameEnd(endMs, segment.startMs, info.sampleRate, info.frameCount)
+                if (endFrame <= startFrame) continue
+                val blob = SourceWavSegmentEncoder.encodeSegment(segment, startMs, endMs, blobCacheDir)
+                    ?: continue
+                blobs.add(blob)
+                totalFrames += endFrame - startFrame
+            }
+            if (blobs.isEmpty() || totalFrames <= 0) {
+                runCatching { out.delete() }
+                return null
+            }
+            out.outputStream().buffered().use { sink ->
+                sink.write(SourceWavContainerPlan.MAGIC)
+                for (blob in blobs) {
+                    val len = blob.length()
+                    sink.write(
+                        byteArrayOf(
+                            (len and 0xff).toByte(),
+                            ((len ushr 8) and 0xff).toByte(),
+                            ((len ushr 16) and 0xff).toByte(),
+                            ((len ushr 24) and 0xff).toByte(),
+                        ),
+                    )
+                    blob.inputStream().use { it.copyTo(sink) }
+                }
+            }
+        } finally {
+            blobs.forEach { runCatching { it.delete() } }
+        }
+        return Result(
+            file = out,
+            durationMs = totalFrames * 1000L / sampleRate,
+            segmentCount = blobs.size,
+        )
+    }
+
     private fun copyFrames(
         file: File,
         info: Pcm16WavSegmentWriter.Info,
