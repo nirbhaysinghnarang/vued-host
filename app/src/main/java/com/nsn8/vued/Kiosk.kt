@@ -1,9 +1,14 @@
 package com.nsn8.vued
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.provider.Settings
 
 private fun deviceAdminComponent(context: Context): ComponentName =
     ComponentName(context, DeviceAdminReceiver::class.java)
@@ -11,6 +16,11 @@ private fun deviceAdminComponent(context: Context): ComponentName =
 fun isDeviceOwner(context: Context): Boolean {
     val dpm = context.getSystemService(DevicePolicyManager::class.java)
     return dpm.isDeviceOwnerApp(context.packageName)
+}
+
+fun isKioskLocked(context: Context): Boolean {
+    val activityManager = context.getSystemService(ActivityManager::class.java)
+    return activityManager.lockTaskModeState == ActivityManager.LOCK_TASK_MODE_LOCKED
 }
 
 /**
@@ -27,13 +37,40 @@ fun startKiosk(activity: Activity): String {
             "adb shell dpm set-device-owner ${activity.packageName}/.DeviceAdminReceiver"
     }
     return try {
-        dpm.setLockTaskPackages(admin, arrayOf(activity.packageName))
-        dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+        applyKioskPolicy(activity, dpm, admin)
         activity.startLockTask()
         "Kiosk lock task started — device pinned to Vued."
     } catch (error: Throwable) {
         "kioskError=${error.message ?: error.javaClass.simpleName}"
     }
+}
+
+private fun applyKioskPolicy(
+    context: Context,
+    dpm: DevicePolicyManager,
+    admin: ComponentName,
+) {
+    dpm.setLockTaskPackages(admin, arrayOf(context.packageName))
+    dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+    dpm.addPersistentPreferredActivity(
+        admin,
+        IntentFilter(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+            addCategory(Intent.CATEGORY_DEFAULT)
+        },
+        ComponentName(context, MainActivity::class.java),
+    )
+    dpm.setStatusBarDisabled(admin, true)
+    dpm.setKeyguardDisabled(admin, true)
+    dpm.setGlobalSetting(
+        admin,
+        Settings.Global.STAY_ON_WHILE_PLUGGED_IN,
+        (
+            BatteryManager.BATTERY_PLUGGED_AC or
+                BatteryManager.BATTERY_PLUGGED_USB or
+                BatteryManager.BATTERY_PLUGGED_WIRELESS
+            ).toString(),
+    )
 }
 
 fun stopKiosk(activity: Activity): String =

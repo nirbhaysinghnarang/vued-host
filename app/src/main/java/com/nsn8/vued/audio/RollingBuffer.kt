@@ -37,6 +37,9 @@ class RollingBuffer(
         private set
     var lastSegmentPath: String? = null
         private set
+    @Volatile
+    var lastAppendMs: Long = 0L
+        private set
 
     init {
         directory.mkdirs()
@@ -62,7 +65,13 @@ class RollingBuffer(
             }
             writer?.write(pcmScratch, count)
             samplesInSegment += count
+            lastAppendMs = System.currentTimeMillis()
         }
+    }
+
+    fun hasRecentAudio(maxAgeMs: Long, nowMs: Long = System.currentTimeMillis()): Boolean {
+        val last = lastAppendMs
+        return last > 0L && nowMs - last <= maxAgeMs
     }
 
     /**

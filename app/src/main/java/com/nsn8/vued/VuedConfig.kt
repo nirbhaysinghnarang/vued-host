@@ -36,4 +36,6 @@ object VuedConfig {
     // this dBFS threshold (silent room). Float.NEGATIVE_INFINITY disables the
     // gate so every window uploads.
     const val AMBIENT_SOURCE_WAV_MIN_PEAK_DB = -50f
+
+    const val ALLOW_BUILT_IN_MIC_FALLBACK = false
 }

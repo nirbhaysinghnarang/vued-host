@@ -11,6 +11,7 @@ import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.audio.WavSegmentExporter
 import com.nsn8.vued.net.OutboundQueue
+import com.nsn8.vued.service.RecorderState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -74,7 +75,9 @@ object MeetingController {
     var active: ActiveMeeting? = null
         private set
 
-    val isCapturing: Boolean get() = rolling != null
+    val isCapturing: Boolean
+        get() = rolling?.hasRecentAudio(RecorderState.CAPTURE_STALE_MS) == true &&
+            RecorderState.state.value.hasFreshAudio()
 
     fun attach(
         buffer: RollingBuffer,
@@ -98,6 +101,10 @@ object MeetingController {
      */
     suspend fun start(context: Context, title: String): String {
         val buffer = rolling ?: error("Start recording first — the ambient buffer isn't running.")
+        val nowMs = System.currentTimeMillis()
+        check(RecorderState.state.value.hasFreshAudio(nowMs) && buffer.hasRecentAudio(RecorderState.CAPTURE_STALE_MS, nowMs)) {
+            "Start recording first — the microphone is not ready."
+        }
         check(active == null) { "A meeting is already in progress." }
         buffer.flush()
         flushSourceForMeetingStart()

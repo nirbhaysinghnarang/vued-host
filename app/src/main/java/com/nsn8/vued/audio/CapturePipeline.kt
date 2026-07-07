@@ -104,6 +104,7 @@ class CapturePipeline(
     val sourceSegmentCount: Int get() = closedSourceSegmentCount + (sourceRolling?.segmentCount ?: 0)
     val lastSourceSegmentPath: String?
         get() = sourceRolling?.lastSegmentPath ?: closedLastSourceSegmentPath
+    val lastAudioMs: Long get() = rolling.lastAppendMs
 
     fun close() {
         closeSourceRolling()

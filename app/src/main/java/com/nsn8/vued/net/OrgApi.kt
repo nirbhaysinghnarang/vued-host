@@ -38,10 +38,11 @@ object OrgApi {
         val arr = getArray("/api/v1/orgs/$orgId/rooms")
         return (0 until arr.length()).map { i ->
             val r = arr.getJSONObject(i)
+            val microphoneId = r.optString("microphone_id")
             Room(
                 id = r.optString("id"),
-                microphoneId = r.optString("microphone_id"),
-                displayName = r.optString("display_name"),
+                microphoneId = microphoneId,
+                displayName = r.optRoomName(microphoneId),
             )
         }
     }
@@ -102,5 +103,13 @@ object OrgApi {
             }
             envelope.optJSONArray("data") ?: JSONArray()
         }
+    }
+
+    private fun JSONObject.optRoomName(microphoneId: String): String {
+        listOf("room_name", "roomName", "name", "display_name", "displayName").forEach { key ->
+            val value = optString(key).trim()
+            if (value.isNotEmpty() && value != microphoneId) return value
+        }
+        return optString("display_name").trim().ifEmpty { microphoneId }
     }
 }

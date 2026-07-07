@@ -17,9 +17,20 @@ object RecorderState {
         val sourceWavRecording: Boolean = false,
         val sourceWavSegmentCount: Int = 0,
         val lastSourceWavSegment: String? = null,
+        val lastAudioMs: Long = 0L,
         val peakDb: Float = Float.NEGATIVE_INFINITY,
         val error: String? = null,
-    )
+        val captureReady: Boolean = false,
+        val micDisconnected: Boolean = false,
+    ) {
+        fun hasFreshAudio(nowMs: Long = System.currentTimeMillis()): Boolean =
+            captureReady &&
+                !micDisconnected &&
+                lastAudioMs > 0L &&
+                nowMs - lastAudioMs <= CAPTURE_STALE_MS
+    }
+
+    const val CAPTURE_STALE_MS = 5_000L
 
     private val _state = MutableStateFlow(Status())
     val state: StateFlow<Status> = _state

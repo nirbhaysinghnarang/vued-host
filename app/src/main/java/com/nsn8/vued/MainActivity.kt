@@ -9,8 +9,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -22,26 +28,30 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -60,16 +70,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -100,11 +112,15 @@ private val HOST_UI_MODE = HostUiMode.PROD
 
 private enum class HostUiMode { DEV, PROD }
 
+private data class WifiStatus(
+    val connected: Boolean,
+    val ssid: String?,
+)
+
 private val VuedBackground = Color(0xFFFFFFFF)
 private val VuedSurface = Color(0xFFF8F9FB)
 private val VuedSurfaceRaised = Color(0xFFFFFFFF)
 private val VuedHairline = Color(0xFFD6DDE6)
-private val VuedHairlineStrong = Color(0xFFAEB9C8)
 private val VuedTextPrimary = Color(0xFF0B0D12)
 private val VuedTextSecondary = Color(0xFF2F3744)
 private val VuedTextTertiary = Color(0xFF5B6573)
@@ -118,7 +134,6 @@ class MainActivity : ComponentActivity() {
         // Keep the screen on during in-room operation so capture/upload remains
         // responsive while the recorder is foregrounded.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        VuedAuth.init(applicationContext)
         enableEdgeToEdge()
         setContent {
             VuedTheme(desktopTheme = HOST_UI_MODE == HostUiMode.PROD) {
@@ -126,6 +141,13 @@ class MainActivity : ComponentActivity() {
                     AuthGate()
                 }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isDeviceOwner(this)) {
+            Log.i(TAG, startKiosk(this))
         }
     }
 }
@@ -209,8 +231,11 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .padding(32.dp),
-        contentAlignment = Alignment.Center,
+            .statusBarsPadding()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 32.dp, vertical = 24.dp),
+        contentAlignment = Alignment.TopCenter,
     ) {
         Surface(
             modifier = Modifier.fillMaxWidth(0.62f),
@@ -235,7 +260,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     text = if (creating) {
                         "This tablet needs a passphrase before ambient processing can run."
                     } else {
-                        "Unlock this tablet so it can process ambient candidates locally."
+                        "Unlock this tablet to process ambient candidates locally."
                     },
                     color = VuedTextTertiary,
                     fontSize = 15.sp,
@@ -247,7 +272,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     PassphraseTextField(
                         value = passphrase,
                         onValueChange = { passphrase = it },
-                        label = "Passphrase",
+                        label = "Enter your passphrase to be able to decrypt your meetings",
                         modifier = Modifier.fillMaxWidth(),
                     )
                     if (creating) {
@@ -368,8 +393,10 @@ private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
+            .statusBarsPadding()
+            .verticalScroll(rememberScrollState())
             .padding(32.dp),
-        contentAlignment = Alignment.Center,
+        contentAlignment = Alignment.TopCenter,
     ) {
         Surface(
             modifier = Modifier.fillMaxWidth(0.62f),
@@ -441,6 +468,9 @@ private fun ProdRecorderMainScreen() {
     val context = LocalContext.current
     val status by RecorderState.state.collectAsState()
     val scope = rememberCoroutineScope()
+    var roomName by remember { mutableStateOf(RoomConfig.roomName(context).orEmpty()) }
+    val assignedRoomId = remember { RoomConfig.roomId(context) }
+    val assignedOrgId = remember { RoomConfig.orgId(context) }
 
     var hasAudio by remember {
         mutableStateOf(
@@ -461,11 +491,60 @@ private fun ProdRecorderMainScreen() {
     var segmentBusy by remember { mutableStateOf(false) }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showEnroll by remember { mutableStateOf(false) }
+    var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
+
+    DisposableEffect(Unit) {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                wifiStatus = currentWifiStatus(context)
+            }
+
+            override fun onLost(network: Network) {
+                wifiStatus = currentWifiStatus(context)
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                wifiStatus = currentWifiStatus(context)
+            }
+        }
+        connectivity.registerDefaultNetworkCallback(callback)
+        onDispose { connectivity.unregisterNetworkCallback(callback) }
+    }
 
     LaunchedEffect(meetingActive, segmentStartedAt) {
         while (meetingActive) {
             nowMs = System.currentTimeMillis()
             kotlinx.coroutines.delay(250)
+        }
+    }
+
+    val captureReady = status.running && status.hasFreshAudio()
+
+    LaunchedEffect(captureReady, status.running, status.micDisconnected) {
+        if (!captureReady) {
+            val active = MeetingController.active
+            meetingActive = active != null
+            segmentStartedAt = active?.startMs ?: 0L
+            nowMs = System.currentTimeMillis()
+        }
+    }
+
+    LaunchedEffect(assignedRoomId, assignedOrgId) {
+        if (assignedRoomId.isNullOrBlank()) return@LaunchedEffect
+        runCatching {
+            val orgId = assignedOrgId?.takeIf { it.isNotBlank() }
+                ?: OrgApi.getOrgs().firstOrNull()?.id
+                ?: return@runCatching
+            OrgApi.getRooms(orgId).firstOrNull { it.id == assignedRoomId }?.let { room ->
+                if (room.displayName.isNotBlank() && room.displayName != roomName) {
+                    RoomConfig.set(context, room.id, room.displayName, orgId, room.microphoneId)
+                    roomName = room.displayName
+                }
+            }
         }
     }
 
@@ -484,46 +563,85 @@ private fun ProdRecorderMainScreen() {
         RecordingService.start(context)
     }
 
-    val ringColor = if (status.running) VuedSuccess else VuedIdleRing
-    val ringSoftColor = if (status.running) VuedSuccessSoft else VuedSurface
     val elapsedSecs = if (meetingActive) {
         ((nowMs - segmentStartedAt) / 1000).coerceAtLeast(0)
     } else {
         0
     }
+    val showMicDisconnected = !VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && status.micDisconnected
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
             .statusBarsPadding()
-            .padding(horizontal = 16.dp, vertical = 0.dp),
+            .padding(horizontal = 36.dp, vertical = 20.dp),
     ) {
+        if (roomName.isNotBlank()) {
+            Text(
+                text = roomName,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 2.dp),
+                color = VuedTextTertiary.copy(alpha = 0.38f),
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Light,
+                letterSpacing = 0.sp,
+            )
+        }
+
         SourceWavIndicator(
             status = status,
             meetingActive = meetingActive,
             modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(top = 4.dp)
+                .align(Alignment.BottomStart)
+                .padding(bottom = 4.dp)
                 .widthIn(max = 280.dp),
         )
 
-        AddSpeakerButton(
-            modifier = Modifier.align(Alignment.TopEnd),
-            onClick = { showEnroll = true },
+        AudioMuteButton(
+            unmuted = captureReady,
+            enabled = !status.running || status.captureReady,
+            modifier = Modifier.align(Alignment.TopStart),
+            onClick = {
+                if (status.running) RecordingService.stop(context) else startCapture()
+            },
         )
+
+        Row(
+            modifier = Modifier.align(Alignment.TopEnd),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+                WifiSettingsButton(
+                    status = wifiStatus,
+                    onClick = {
+                        openWifiSettings(context)
+                        wifiStatus = currentWifiStatus(context)
+                    },
+                )
+            }
+            AddSpeakerButton(onClick = { showEnroll = true })
+        }
 
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
-            val ringSize = minOf(maxWidth * 0.96f, maxHeight - 250.dp)
-            Column(
-                modifier = Modifier.offset(y = (-92).dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
+            val buttonSize = minOf(maxHeight * 0.68f, maxWidth * 0.46f)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 28.dp, vertical = 36.dp),
             ) {
-                Button(
-                    enabled = !segmentBusy && (status.running || meetingActive),
+                MeetingCircleButton(
+                    meetingActive = meetingActive,
+                    enabled = !segmentBusy && (captureReady || meetingActive),
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .offset(y = (-28).dp)
+                        .size(buttonSize),
                     onClick = {
                         if (meetingActive) {
                             runCatching { MeetingController.stopAsync(context) }
@@ -548,71 +666,22 @@ private fun ProdRecorderMainScreen() {
                             }
                         }
                     },
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (meetingActive) VuedTextPrimary else VuedSuccess,
-                        contentColor = Color.White,
-                        disabledContainerColor = VuedSurface,
-                        disabledContentColor = VuedTextTertiary,
-                    ),
-                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp),
-                    modifier = Modifier
-                        .height(128.dp)
-                        .width(470.dp),
-                ) {
-                    Text(
-                        text = if (meetingActive) "End Meeting" else "Start Meeting",
-                        fontSize = 42.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        letterSpacing = 0.sp,
-                    )
-                }
-
-                Text(
-                    text = if (meetingActive) formatSegmentTime(elapsedSecs) else "     ",
-                    modifier = Modifier.padding(top = 12.dp, bottom = 10.dp),
-                    color = VuedTextTertiary.copy(alpha = 0.72f),
-                    fontSize = 52.sp,
-                    fontWeight = FontWeight.Thin,
-                    letterSpacing = 0.sp,
                 )
 
-                Box(
-                    modifier = Modifier.size(ringSize),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    RecordingRing(
-                        ringColor = ringColor,
-                        softColor = ringSoftColor,
-                        running = status.running,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                    Button(
-                        onClick = {
-                            if (status.running) RecordingService.stop(context) else startCapture()
-                        },
-                        shape = CircleShape,
-                        modifier = Modifier.size(188.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = VuedTextPrimary,
-                        ),
-                        elevation = ButtonDefaults.buttonElevation(
-                            defaultElevation = 0.dp,
-                            pressedElevation = 0.dp,
-                            focusedElevation = 0.dp,
-                            hoveredElevation = 0.dp,
-                        ),
-                        contentPadding = PaddingValues(0.dp),
-                    ) {
-                        Text(
-                            text = if (status.running) "Mute" else "Unmute",
-                            fontSize = 38.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            letterSpacing = 0.sp,
-                        )
-                    }
-                }
+                Text(
+                    text = when {
+                        showMicDisconnected -> "Mic disconnected"
+                        meetingActive -> formatSegmentTime(elapsedSecs)
+                        else -> "     "
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 2.dp),
+                    color = if (showMicDisconnected) Color(0xFFB42318) else VuedTextTertiary.copy(alpha = 0.62f),
+                    fontSize = if (showMicDisconnected) 34.sp else 52.sp,
+                    fontWeight = if (showMicDisconnected) FontWeight.Medium else FontWeight.Thin,
+                    letterSpacing = 0.sp,
+                )
             }
         }
     }
@@ -623,27 +692,46 @@ private fun ProdRecorderMainScreen() {
 }
 
 @Composable
-private fun RecordingRing(
-    ringColor: Color,
-    softColor: Color,
-    running: Boolean,
+private fun MeetingCircleButton(
+    meetingActive: Boolean,
+    enabled: Boolean,
     modifier: Modifier = Modifier,
+    onClick: () -> Unit,
 ) {
-    Canvas(modifier = modifier) {
-        val diameter = size.minDimension
-        val stroke = diameter * 0.046f
-        val ringRadius = diameter * 0.43f
+    val borderColor = when {
+        !enabled -> VuedIdleRing
+        meetingActive -> VuedTextPrimary
+        else -> VuedSuccess
+    }
+    val textColor = when {
+        !enabled -> VuedTextTertiary
+        meetingActive -> Color.White
+        else -> VuedSuccess
+    }
+    val fillColor = if (meetingActive) VuedTextPrimary else Color.Transparent
 
-        drawCircle(
-            color = if (running) softColor.copy(alpha = 0.96f) else softColor.copy(alpha = 0.82f),
-            radius = ringRadius,
-            center = center,
-        )
-        drawCircle(
-            color = ringColor,
-            radius = ringRadius,
-            center = center,
-            style = Stroke(width = stroke, cap = StrokeCap.Round),
+    Box(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(fillColor, CircleShape)
+            .border(BorderStroke(10.dp, borderColor), CircleShape)
+            .then(
+                if (enabled) {
+                    Modifier.clickable(onClick = onClick)
+                } else {
+                    Modifier
+                }
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = if (meetingActive) "End\nMeeting" else "Start\nMeeting",
+            color = textColor,
+            fontSize = 68.sp,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = 72.sp,
+            letterSpacing = 0.sp,
+            textAlign = TextAlign.Center,
         )
     }
 }
@@ -709,6 +797,88 @@ private fun sourceWavStatusText(status: RecorderState.Status, meetingActive: Boo
 }
 
 @Composable
+private fun AudioMuteButton(
+    unmuted: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val iconColor = if (unmuted && enabled) Color.White else VuedTextTertiary
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        shape = CircleShape,
+        modifier = modifier
+            .size(112.dp)
+            .semantics { contentDescription = if (unmuted) "Mute" else "Unmute" },
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (unmuted) VuedSuccess else VuedIdleRing,
+            contentColor = iconColor,
+            disabledContainerColor = VuedIdleRing,
+            disabledContentColor = VuedTextTertiary,
+        ),
+        contentPadding = PaddingValues(0.dp),
+        elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
+    ) {
+        Box(
+            modifier = Modifier.size(60.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(Modifier.fillMaxSize()) {
+                val stroke = 4.dp.toPx()
+                val micCenterX = size.width * 0.5f
+                val micTop = size.height * 0.13f
+                val micSize = Size(size.width * 0.34f, size.height * 0.48f)
+
+                drawRoundRect(
+                    color = iconColor,
+                    topLeft = Offset(micCenterX - micSize.width / 2f, micTop),
+                    size = micSize,
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(
+                        micSize.width / 2f,
+                        micSize.width / 2f,
+                    ),
+                    style = Stroke(stroke, cap = StrokeCap.Round),
+                )
+                drawArc(
+                    color = iconColor,
+                    startAngle = 18f,
+                    sweepAngle = 144f,
+                    useCenter = false,
+                    topLeft = Offset(size.width * 0.24f, size.height * 0.35f),
+                    size = Size(size.width * 0.52f, size.height * 0.34f),
+                    style = Stroke(stroke, cap = StrokeCap.Round),
+                )
+                drawLine(
+                    color = iconColor,
+                    start = Offset(micCenterX, size.height * 0.69f),
+                    end = Offset(micCenterX, size.height * 0.84f),
+                    strokeWidth = stroke,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = iconColor,
+                    start = Offset(size.width * 0.36f, size.height * 0.84f),
+                    end = Offset(size.width * 0.64f, size.height * 0.84f),
+                    strokeWidth = stroke,
+                    cap = StrokeCap.Round,
+                )
+
+                if (!unmuted) {
+                    drawLine(
+                        color = iconColor,
+                        start = Offset(size.width * 0.22f, size.height * 0.18f),
+                        end = Offset(size.width * 0.82f, size.height * 0.82f),
+                        strokeWidth = stroke * 1.15f,
+                        cap = StrokeCap.Round,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun AddSpeakerButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
     Button(
         onClick = onClick,
@@ -760,6 +930,56 @@ private fun AddSpeakerButton(modifier: Modifier = Modifier, onClick: () -> Unit)
                     cap = StrokeCap.Round,
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun WifiSettingsButton(
+    status: WifiStatus,
+    onClick: () -> Unit,
+) {
+    val color = if (status.connected) VuedSuccess else Color(0xFFB42318)
+    val label = when {
+        status.ssid != null -> status.ssid
+        status.connected -> "Wi-Fi"
+        else -> "No Wi-Fi"
+    }
+    OutlinedButton(
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, VuedHairline),
+        modifier = Modifier
+            .semantics {
+                contentDescription = if (status.connected) {
+                    "Wi-Fi connected: $label"
+                } else {
+                    "Wi-Fi disconnected"
+                }
+            },
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = VuedSurfaceRaised.copy(alpha = 0.92f),
+            contentColor = color,
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_wifi_24),
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(20.dp),
+            )
+            Text(
+                text = label,
+                color = VuedTextTertiary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.sp,
+            )
         }
     }
 }
@@ -895,6 +1115,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
 
         StatusLine("Mic permission", if (hasAudio) "granted" else "NOT granted")
         StatusLine("Service", if (status.running) "RECORDING" else "stopped")
+        StatusLine("Capture ready", if (status.hasFreshAudio()) "yes" else "no")
         StatusLine("Segments written", status.segmentCount.toString())
         status.lastSegment?.let { StatusLine("Last segment", it) }
         StatusLine("16ch WAV", sourceWavStatusText(status, meetingActive))
@@ -926,29 +1147,33 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
             }
         }
 
+        val devCaptureReady = status.running && status.hasFreshAudio()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = {
-                scope.launch {
-                    try {
-                        if (meetingActive) {
-                            meetingMsg = "exporting + uploading…"
-                            val result = MeetingController.stop(context)
-                            meetingActive = false
-                            meetingMsg = "Uploaded ${result.meetingId.take(8)}… " +
-                                "(${"%.1f".format(result.durationSecs)}s) — transcribing" +
-                                if (result.sourceWavPath != null) "; 16ch WAV queued" else ""
-                        } else {
-                            val id = MeetingController.start(context, "Meeting")
-                            meetingActive = true
-                            meetingMsg = "Recording meeting ${id.take(8)}…"
+            Button(
+                enabled = meetingActive || devCaptureReady,
+                onClick = {
+                    scope.launch {
+                        try {
+                            if (meetingActive) {
+                                meetingMsg = "exporting + uploading…"
+                                val result = MeetingController.stop(context)
+                                meetingActive = false
+                                meetingMsg = "Uploaded ${result.meetingId.take(8)}… " +
+                                    "(${"%.1f".format(result.durationSecs)}s) — transcribing" +
+                                    if (result.sourceWavPath != null) "; 16ch WAV queued" else ""
+                            } else {
+                                val id = MeetingController.start(context, "Meeting")
+                                meetingActive = true
+                                meetingMsg = "Recording meeting ${id.take(8)}…"
+                            }
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "dev meeting action failed: ${e.message}", e)
+                            meetingActive = MeetingController.active != null
+                            meetingMsg = "meeting error: ${e.message}"
                         }
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "dev meeting action failed: ${e.message}", e)
-                        meetingActive = MeetingController.active != null
-                        meetingMsg = "meeting error: ${e.message}"
                     }
-                }
-            }) {
+                },
+            ) {
                 Text(if (meetingActive) "Stop Meeting" else "Start Meeting")
             }
             OutlinedButton(onClick = {
@@ -988,6 +1213,12 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                 (context as? Activity)?.let { kioskMessage = stopKiosk(it) }
             }) {
                 Text("Unlock")
+            }
+            OutlinedButton(onClick = {
+                openWifiSettings(context)
+                kioskMessage = "Opened Wi-Fi settings"
+            }) {
+                Text("Wi-Fi Settings")
             }
         }
         kioskMessage?.let { StatusLine("Kiosk", it) }
@@ -1066,4 +1297,51 @@ private fun requestUma8Permission(context: Context) {
         PendingIntent.FLAG_MUTABLE,
     )
     usbManager.requestPermission(device, intent)
+}
+
+private fun openWifiSettings(context: Context) {
+    (context as? Activity)?.let { activity ->
+        if (isKioskLocked(activity)) stopKiosk(activity)
+    }
+    val wifiIntent = Intent(Settings.ACTION_WIFI_SETTINGS)
+    val fallbackIntent = Intent(Settings.ACTION_SETTINGS)
+    runCatching {
+        context.startActivity(wifiIntent)
+    }.recoverCatching {
+        context.startActivity(fallbackIntent)
+    }.onFailure { error ->
+        Log.w(TAG, "Failed to open Wi-Fi settings: ${error.message}", error)
+    }
+}
+
+private fun currentWifiStatus(context: Context): WifiStatus {
+    val connectivity = context.getSystemService(ConnectivityManager::class.java)
+    val network = connectivity.activeNetwork ?: return WifiStatus(false, null)
+    val capabilities = connectivity.getNetworkCapabilities(network) ?: return WifiStatus(false, null)
+    if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+        return WifiStatus(false, null)
+    }
+
+    val ssidFromCapabilities = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        (capabilities.transportInfo as? WifiInfo)?.ssid.cleanSsid()
+    } else {
+        null
+    }
+    val ssidFromManager = runCatching {
+        context.getSystemService(WifiManager::class.java).connectionInfo?.ssid.cleanSsid()
+    }.getOrNull()
+
+    return WifiStatus(true, ssidFromCapabilities ?: ssidFromManager)
+}
+
+private fun String?.cleanSsid(): String? {
+    val value = this
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() && it != "<unknown ssid>" }
+        ?: return null
+    return if (value.length >= 2 && value.first() == '"' && value.last() == '"') {
+        value.substring(1, value.lastIndex)
+    } else {
+        value
+    }
 }

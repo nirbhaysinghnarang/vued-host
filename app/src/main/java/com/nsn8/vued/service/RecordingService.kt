@@ -15,6 +15,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import com.nsn8.vued.DiagnosticsLogger
+import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.audio.CapturePipeline
@@ -32,15 +33,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.io.File
 import kotlin.math.log10
 
 /**
- * Always-on foreground service that streams the configured UMA mic array, falling
- * back to Android microphone capture when no array is connected. The service runs
- * the [CapturePipeline] and continuously writes 16 kHz mono M4A segments to disk.
- * This is the Phase-1 ambient-capture foundation; mode/meeting logic and upload
- * land in later phases.
+ * Always-on foreground service that streams the configured UMA mic array. If
+ * [VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK] is enabled, Android microphone capture
+ * backs up unavailable arrays; otherwise UMA availability is required.
  */
 class RecordingService : Service() {
 
@@ -49,6 +49,7 @@ class RecordingService : Service() {
     private var captureThread: Thread? = null
     private val ambientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var ambientJob: Job? = null
+    private var captureWatchdogJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastUsbPermissionRequestKey: String? = null
     private var lastUsbPermissionRequestMs: Long = 0
@@ -79,6 +80,7 @@ class RecordingService : Service() {
         // while the physical capture source changes underneath it.
         val override = MicArrayConfig.selection(this).toProfile()
         val capture = Uma8Capture(this, override)
+        val allowBuiltInMicFallback = VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK
         val profile = readyUmaProfile(capture) ?: override ?: PROFILE_UMA8
         val pipeline = CapturePipeline(segmentsDir, profile.outChannels, sourceSegmentsDir)
         MeetingController.attach(pipeline.rollingBuffer) { pipeline.sourceRollingBuffer }
@@ -103,6 +105,30 @@ class RecordingService : Service() {
         }
         var lastPublish = 0L
         var nextUmaAttemptMs = 0L
+        var shouldStopSelf = false
+        var lastStaleReportMs = 0L
+        captureWatchdogJob = ambientScope.launch {
+            while (isActive) {
+                delay(CAPTURE_WATCHDOG_INTERVAL_MS)
+                val status = RecorderState.state.value
+                val lastAudioMs = pipeline.lastAudioMs
+                val ageMs = if (lastAudioMs > 0L) System.currentTimeMillis() - lastAudioMs else Long.MAX_VALUE
+                if (running && status.captureReady && ageMs > RecorderState.CAPTURE_STALE_MS) {
+                    RecorderState.update {
+                        it.copy(
+                            captureReady = false,
+                            micDisconnected = true,
+                            error = "Mic disconnected",
+                        )
+                    }
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastStaleReportMs >= CAPTURE_STALE_LOG_INTERVAL_MS) {
+                        lastStaleReportMs = now
+                        DiagnosticsLogger.warn("capture_stale", mapOf("ageMs" to ageMs))
+                    }
+                }
+            }
+        }
 
         try {
             while (running) {
@@ -120,10 +146,10 @@ class RecordingService : Service() {
                             "profile" to umaProfile.label,
                             "channels" to umaProfile.outChannels,
                         ))
-                        RecorderState.update { it.copy(error = null) }
                         capture.streamPcm(
                             onPcm = { buffer, length ->
                                 pipeline.process(buffer, length)
+                                publishCaptureReadyIfNeeded("uma", pipeline.lastAudioMs)
                                 lastPublish = publishStateIfDue(pipeline, lastPublish)
                             },
                             shouldContinue = { running },
@@ -131,20 +157,42 @@ class RecordingService : Service() {
                         nextUmaAttemptMs = 0L
                     } catch (error: Throwable) {
                         if (!running) throw error
+                        if (!allowBuiltInMicFallback) {
+                            handleUmaUnavailableWithoutFallback(pipeline, error)
+                            shouldStopSelf = true
+                            running = false
+                            break
+                        }
                         Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
                         DiagnosticsLogger.warn("uma_capture_fallback", mapOf("message" to (error.message ?: "")), error)
-                        RecorderState.update { it.copy(error = "UMA unavailable; using Android mic") }
+                        RecorderState.update {
+                            it.copy(
+                                captureReady = false,
+                                error = "UMA unavailable; using Android mic",
+                            )
+                        }
                         nextUmaAttemptMs = SystemClock.elapsedRealtime() + UMA_RETRY_AFTER_FAILURE_MS
                     }
                 } else {
+                    requestUmaPermissionIfNeeded(capture)
+                    if (!allowBuiltInMicFallback) {
+                        handleUmaUnavailableWithoutFallback(pipeline, null)
+                        shouldStopSelf = true
+                        running = false
+                        break
+                    }
                     Log.i(TAG, "capture profile=Android mic sampleRate=${AndroidMicCapture.SAMPLE_RATE_HZ}")
                     DiagnosticsLogger.info("capture_profile_selected", mapOf(
                         "profile" to "android_mic",
                         "sampleRate" to AndroidMicCapture.SAMPLE_RATE_HZ,
                     ))
+                    RecorderState.update { it.copy(captureReady = false, micDisconnected = false) }
                     lastPublish = streamAndroidMic(
                         pipeline = pipeline,
                         initialLastPublish = lastPublish,
+                        onReady = {
+                            publishCaptureReadyIfNeeded("android_mic", pipeline.lastAudioMs)
+                        },
                         shouldContinue = {
                             requestUmaPermissionIfNeeded(capture)
                             running && !shouldAttemptUmaCapture(capture, nextUmaAttemptMs)
@@ -155,23 +203,31 @@ class RecordingService : Service() {
         } catch (error: Throwable) {
             Log.e(TAG, "Capture loop ended: ${error.message}", error)
             DiagnosticsLogger.error("capture_loop_failed", throwable = error)
-            RecorderState.update { it.copy(error = error.message ?: error.javaClass.simpleName) }
+            RecorderState.update {
+                it.copy(
+                    captureReady = false,
+                    error = error.message ?: error.javaClass.simpleName,
+                )
+            }
         } finally {
             ambientJob?.cancel()
+            captureWatchdogJob?.cancel()
             AmbientFlusher.detach()
             MeetingController.detach()
             pipeline.close()
             RecorderState.update {
                 it.copy(
                     running = false,
+                    captureReady = false,
                     lastSegment = pipeline.lastSegmentPath,
+                    lastAudioMs = pipeline.lastAudioMs,
                     segmentCount = pipeline.segmentCount,
                     sourceWavRecording = false,
                     sourceWavSegmentCount = pipeline.sourceSegmentCount,
                     lastSourceWavSegment = pipeline.lastSourceSegmentPath,
                 )
             }
-            if (running) {
+            if (running || shouldStopSelf) {
                 // Stream died on its own (e.g. UMA-8 unplugged); tear the service down.
                 running = false
                 stopSelf()
@@ -183,6 +239,40 @@ class RecordingService : Service() {
         val device = capture.findDevice() ?: return null
         if (!capture.hasPermission(device)) return null
         return capture.resolveProfile()
+    }
+
+    private fun handleUmaUnavailableWithoutFallback(pipeline: CapturePipeline, error: Throwable?) {
+        val message = "Mic disconnected"
+        Log.w(TAG, if (error == null) message else "$message: ${error.message}", error)
+        DiagnosticsLogger.warn(
+            "uma_capture_required_unavailable",
+            mapOf("message" to (error?.message ?: "UMA mic unavailable")),
+            error,
+        )
+        RecorderState.update {
+            it.copy(
+                captureReady = false,
+                error = message,
+                micDisconnected = true,
+            )
+        }
+        runCatching {
+            runBlocking {
+                if (MeetingController.active != null) {
+                    MeetingController.stop(applicationContext)
+                } else {
+                    AmbientFlusher.flushOnce(this@RecordingService)
+                }
+            }
+        }.onFailure { flushError ->
+            Log.w(TAG, "Failed to flush after UMA disconnect: ${flushError.message}", flushError)
+            DiagnosticsLogger.warn(
+                "uma_disconnect_flush_failed",
+                mapOf("message" to (flushError.message ?: "")),
+                flushError,
+            )
+        }
+        pipeline.close()
     }
 
     private fun requestUmaPermissionIfNeeded(capture: Uma8Capture) {
@@ -219,17 +309,33 @@ class RecordingService : Service() {
     private fun streamAndroidMic(
         pipeline: CapturePipeline,
         initialLastPublish: Long,
+        onReady: () -> Unit,
         shouldContinue: () -> Boolean,
     ): Long {
         var lastPublish = initialLastPublish
         AndroidMicCapture().streamPcm(
             onPcm = { samples, length ->
                 pipeline.process16kMono(samples, length)
+                onReady()
                 lastPublish = publishStateIfDue(pipeline, lastPublish)
             },
             shouldContinue = shouldContinue,
         )
         return lastPublish
+    }
+
+    private fun publishCaptureReadyIfNeeded(source: String, lastAudioMs: Long) {
+        if (RecorderState.state.value.hasFreshAudio()) return
+        DiagnosticsLogger.info("capture_ready", mapOf("source" to source))
+        RecorderState.update {
+            it.copy(
+                running = true,
+                captureReady = true,
+                micDisconnected = false,
+                lastAudioMs = lastAudioMs,
+                error = null,
+            )
+        }
     }
 
     private fun publishStateIfDue(pipeline: CapturePipeline, lastPublish: Long): Long {
@@ -244,6 +350,7 @@ class RecordingService : Service() {
                 sourceWavRecording = pipeline.sourceWavRecording,
                 sourceWavSegmentCount = pipeline.sourceSegmentCount,
                 lastSourceWavSegment = pipeline.lastSourceSegmentPath,
+                lastAudioMs = pipeline.lastAudioMs,
                 peakDb = db,
             )
         }
@@ -255,7 +362,7 @@ class RecordingService : Service() {
         captureThread?.join(2_000)
         captureThread = null
         releaseWakeLock()
-        RecorderState.update { it.copy(running = false, sourceWavRecording = false) }
+        RecorderState.update { it.copy(running = false, sourceWavRecording = false, captureReady = false) }
         super.onDestroy()
     }
 
@@ -309,6 +416,8 @@ class RecordingService : Service() {
         private const val CHANNEL_ID = "vued_recording"
         private const val NOTIF_ID = 1001
         private const val PUBLISH_INTERVAL_MS = 300L
+        private const val CAPTURE_WATCHDOG_INTERVAL_MS = 1_000L
+        private const val CAPTURE_STALE_LOG_INTERVAL_MS = 30_000L
         private const val UMA_RETRY_AFTER_FAILURE_MS = 5_000L
         private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
         private const val TAG = "VuedRecordingService"
