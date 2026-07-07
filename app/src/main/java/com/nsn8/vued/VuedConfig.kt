@@ -26,4 +26,14 @@ object VuedConfig {
     // (native libwavpack) before upload; "pcm" streams raw PCM. Kill switch:
     // set "pcm" to revert to the uncompressed path.
     const val SOURCE_WAV_CODEC = "wavpack"
+
+    // Export + upload a 16-channel source WAV sidecar for every ambient flush
+    // window (feeds the ambient source-GSS pipeline). Kill switch: set false
+    // to keep source WAVs meeting-only.
+    const val AMBIENT_SOURCE_WAV_UPLOAD = true
+
+    // Skip the ambient source sidecar when the window's peak level stays below
+    // this dBFS threshold (silent room). Float.NEGATIVE_INFINITY disables the
+    // gate so every window uploads.
+    const val AMBIENT_SOURCE_WAV_MIN_PEAK_DB = -50f
 }

@@ -40,6 +40,21 @@ class CapturePipeline(
     var peak: Float = 0f
         private set
 
+    /** Max block peak since the last [takeAmbientWindowPeak] call. */
+    @Volatile
+    private var windowPeakMax: Float = 0f
+
+    /**
+     * Peak amplitude (0..1) accumulated over the current ambient window;
+     * reading resets the accumulator. The per-block [peak] is instantaneous,
+     * so the ambient flusher needs this to judge a whole 5-minute window.
+     */
+    fun takeAmbientWindowPeak(): Float {
+        val value = windowPeakMax
+        windowPeakMax = 0f
+        return value
+    }
+
     fun configureInputChannels(channels: Int) {
         if (channels == inputChannels) return
         inputChannels = channels
@@ -68,6 +83,7 @@ class CapturePipeline(
             if (a > p) p = a
         }
         peak = p
+        if (p > windowPeakMax) windowPeakMax = p
 
         // Speaker-enrollment tap: when armed, the recorder receives the same
         // 16 kHz frames the rolling buffer gets. Output is reused, so the sink

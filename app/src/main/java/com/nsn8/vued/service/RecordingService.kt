@@ -82,7 +82,11 @@ class RecordingService : Service() {
         val profile = readyUmaProfile(capture) ?: override ?: PROFILE_UMA8
         val pipeline = CapturePipeline(segmentsDir, profile.outChannels, sourceSegmentsDir)
         MeetingController.attach(pipeline.rollingBuffer) { pipeline.sourceRollingBuffer }
-        AmbientFlusher.attach(pipeline.rollingBuffer)
+        AmbientFlusher.attach(
+            pipeline.rollingBuffer,
+            sourceBuffer = { pipeline.sourceRollingBuffer },
+            windowPeak = { pipeline.takeAmbientWindowPeak() },
+        )
         // Drain any backlog left by a previous run (offline/crash) as soon as we're up.
         ambientScope.launch {
             MeetingController.retryPendingExports(applicationContext)

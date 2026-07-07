@@ -43,7 +43,14 @@ object OutboundQueue {
     private const val PREFS = "vued_outbound"
     private const val KEY = "queue"
 
-    enum class Kind { MEETING_CREATE, AMBIENT, MEETING, MEETING_SOURCE_WAV }
+    enum class Kind { MEETING_CREATE, AMBIENT, MEETING, MEETING_SOURCE_WAV, AMBIENT_SOURCE_WAV }
+
+    private val SOURCE_KINDS = setOf(Kind.MEETING_SOURCE_WAV, Kind.AMBIENT_SOURCE_WAV)
+
+    // Ambient source sidecars are best-effort: cap their pending bytes so an
+    // offline stretch can't fill the disk with ~150 MB windows. Meetings keep
+    // the no-eviction guarantee.
+    private const val AMBIENT_SOURCE_WAV_MAX_PENDING_BYTES = 2_000_000_000L
 
     private val lock = Any()
     private val draining = AtomicBoolean(false)
@@ -161,6 +168,67 @@ object OutboundQueue {
             DiagnosticsLogger.info("queue_source_wav_enqueued", mapOf(
                 "sliceId" to sliceId,
                 "meetingId" to meetingId,
+                "bytes" to dest.length(),
+                "pending" to load(context).length(),
+            ))
+            dest
+        }
+
+    fun enqueueAmbientSourceWav(
+        context: Context,
+        sliceId: String,
+        sessionId: String,
+        startedAtSec: Double,
+        endedAtSec: Double,
+        durationSecs: Double,
+        monoSizeBytes: Long,
+        source: File,
+    ): File? =
+        synchronized(lock) {
+            val items = load(context)
+            var pendingSourceBytes = 0L
+            for (index in 0 until items.length()) {
+                val item = items.getJSONObject(index)
+                if (item.optString("kind") == Kind.AMBIENT_SOURCE_WAV.name) {
+                    pendingSourceBytes += item.optLong("sourceSizeBytes", 0L)
+                }
+            }
+            if (pendingSourceBytes + source.length() > AMBIENT_SOURCE_WAV_MAX_PENDING_BYTES) {
+                source.delete()
+                Log.w(TAG, "ambient source wav dropped: backlog ${pendingSourceBytes / 1_000_000}MB over cap")
+                DiagnosticsLogger.warn("ambient_source_wav_backlog_dropped", mapOf(
+                    "sliceId" to sliceId,
+                    "pendingBytes" to pendingSourceBytes,
+                ))
+                return@synchronized null
+            }
+            val dest = File(dir(context), "$sliceId.source.wav")
+            if (!source.renameTo(dest)) {
+                source.copyTo(dest, overwrite = true)
+                source.delete()
+            }
+            save(
+                context,
+                items.put(
+                    JSONObject()
+                        .put("id", sourceItemId(sliceId))
+                        .put("kind", Kind.AMBIENT_SOURCE_WAV.name)
+                        .put("sliceId", sliceId)
+                        .put("sessionId", sessionId)
+                        .put("startedAtSec", startedAtSec)
+                        .put("endedAtSec", endedAtSec)
+                        .put("durationSecs", durationSecs)
+                        .put("monoSizeBytes", monoSizeBytes)
+                        .put("sourceSizeBytes", dest.length())
+                        .put("sourceChannels", SOURCE_WAV_CHANNELS)
+                        .put("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ)
+                        .put("metadataDone", false)
+                        .putOpt("roomId", RoomConfig.roomId(context)),
+                ),
+            )
+            Log.i(TAG, "enqueued AMBIENT_SOURCE_WAV slice $sliceId (${dest.length()} bytes)")
+            DiagnosticsLogger.info("queue_ambient_source_wav_enqueued", mapOf(
+                "sliceId" to sliceId,
                 "bytes" to dest.length(),
                 "pending" to load(context).length(),
             ))
@@ -314,14 +382,15 @@ object OutboundQueue {
                 (0 until items.length()).map { items.getJSONObject(it) }
             }
             val ordered = snapshot
-                .filter { Kind.valueOf(it.getString("kind")) != Kind.MEETING_SOURCE_WAV } +
-                snapshot.filter { Kind.valueOf(it.getString("kind")) == Kind.MEETING_SOURCE_WAV }
+                .filter { Kind.valueOf(it.getString("kind")) !in SOURCE_KINDS } +
+                snapshot.filter { Kind.valueOf(it.getString("kind")) in SOURCE_KINDS }
             for (item in ordered) {
                 attempted += 1
                 when (Kind.valueOf(item.getString("kind"))) {
                     Kind.MEETING_CREATE -> drainMeetingCreate(context, item)
                     Kind.AMBIENT, Kind.MEETING -> drainAudio(context, item)
                     Kind.MEETING_SOURCE_WAV -> drainMeetingSourceWav(context, item)
+                    Kind.AMBIENT_SOURCE_WAV -> drainAmbientSourceWav(context, item)
                 }
             }
             DiagnosticsLogger.info("queue_drain_completed", mapOf(
@@ -473,6 +542,59 @@ object OutboundQueue {
             DiagnosticsLogger.warn("queue_source_wav_pending", mapOf(
                 "sliceId" to sliceId,
                 "meetingId" to meetingId,
+            ), e)
+        }
+    }
+
+    /**
+     * Ambient variant of [drainMeetingSourceWav]: no meeting to wait for, and
+     * the slice row is ensured via the ambient creator (idempotent server-side —
+     * the mono AMBIENT item usually created it already).
+     */
+    private suspend fun drainAmbientSourceWav(context: Context, item: JSONObject) {
+        val itemId = item.getString("id")
+        val sliceId = item.getString("sliceId")
+        val file = File(dir(context), "$sliceId.source.wav")
+        if (!file.exists()) {
+            remove(context, itemId)
+            DiagnosticsLogger.warn("queue_ambient_source_wav_orphan_removed", mapOf(
+                "sliceId" to sliceId,
+            ))
+            return
+        }
+        try {
+            val durationSecs = item.getDouble("durationSecs")
+            val monoSizeBytes = item.getLong("monoSizeBytes")
+            if (!item.optBoolean("metadataDone", false)) {
+                val roomId = item.optString("roomId", "").ifEmpty { null }
+                VuedApi.createAmbientSlice(
+                    sliceId,
+                    item.getString("sessionId"),
+                    item.getDouble("startedAtSec"),
+                    item.getDouble("endedAtSec"),
+                    durationSecs,
+                    monoSizeBytes,
+                    roomId = roomId,
+                )
+                setMetadataDone(context, itemId)
+            }
+
+            val sourceSizeBytes = file.length()
+            VuedApi.uploadSliceSourceWav(
+                sliceId = sliceId,
+                source = file,
+                durationSecs = durationSecs,
+                sizeBytes = sourceSizeBytes,
+                channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS),
+                sampleRateHz = item.optInt("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ),
+            )
+            file.delete()
+            remove(context, itemId)
+            Log.i(TAG, "uploaded queued ambient source wav $sliceId")
+        } catch (e: Exception) {
+            Log.w(TAG, "ambient source wav $sliceId still pending: ${e.message}")
+            DiagnosticsLogger.warn("queue_ambient_source_wav_pending", mapOf(
+                "sliceId" to sliceId,
             ), e)
         }
     }
