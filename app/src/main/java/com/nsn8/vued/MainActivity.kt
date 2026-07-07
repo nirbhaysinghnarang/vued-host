@@ -14,6 +14,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -39,6 +40,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -104,6 +106,9 @@ import com.nsn8.vued.service.RecordingService
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
 import io.github.jan.supabase.auth.status.SessionStatus
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
@@ -115,6 +120,13 @@ private enum class HostUiMode { DEV, PROD }
 private data class WifiStatus(
     val connected: Boolean,
     val ssid: String?,
+)
+
+private data class BatteryStatus(
+    val levelPercent: Int?,
+    val charging: Boolean,
+    val plugged: Boolean,
+    val powerSource: String?,
 )
 
 private val VuedBackground = Color(0xFFFFFFFF)
@@ -492,6 +504,8 @@ private fun ProdRecorderMainScreen() {
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showEnroll by remember { mutableStateOf(false) }
     var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
+    var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
+    var currentTime by remember { mutableStateOf(formatCurrentTime()) }
 
     DisposableEffect(Unit) {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)
@@ -515,10 +529,33 @@ private fun ProdRecorderMainScreen() {
         onDispose { connectivity.unregisterNetworkCallback(callback) }
     }
 
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                batteryStatus = batteryStatusFromIntent(intent)
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
     LaunchedEffect(meetingActive, segmentStartedAt) {
         while (meetingActive) {
             nowMs = System.currentTimeMillis()
             kotlinx.coroutines.delay(250)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            currentTime = formatCurrentTime()
+            kotlinx.coroutines.delay(1_000)
         }
     }
 
@@ -622,6 +659,7 @@ private fun ProdRecorderMainScreen() {
                     },
                 )
             }
+            BatteryStatusBadge(status = batteryStatus)
             AddSpeakerButton(onClick = { showEnroll = true })
         }
 
@@ -684,6 +722,18 @@ private fun ProdRecorderMainScreen() {
                 )
             }
         }
+
+        Text(
+            text = currentTime,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(bottom = 2.dp),
+            color = VuedTextTertiary.copy(alpha = 0.62f),
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Light,
+            letterSpacing = 0.sp,
+        )
     }
 
     if (showEnroll) {
@@ -988,6 +1038,100 @@ private fun formatSegmentTime(totalSecs: Long): String {
     val minutes = totalSecs / 60
     val seconds = totalSecs % 60
     return "%02d:%02d".format(minutes, seconds)
+}
+
+private fun formatCurrentTime(): String =
+    LocalTime.now().format(DateTimeFormatter.ofPattern("h:mm a", Locale.getDefault()))
+
+@Composable
+private fun BatteryStatusBadge(
+    status: BatteryStatus,
+    modifier: Modifier = Modifier,
+) {
+    val level = status.levelPercent?.coerceIn(0, 100)
+    val color = when {
+        level != null && level <= 15 && !status.charging -> Color(0xFFB42318)
+        status.charging -> VuedSuccess
+        else -> VuedTextTertiary
+    }
+    val label = buildString {
+        append(level?.let { "$it%" } ?: "--%")
+        when {
+            status.charging -> append(" Charging")
+            status.plugged -> append(" Plugged")
+        }
+    }
+
+    Surface(
+        modifier = modifier.semantics { contentDescription = batteryContentDescription(status) },
+        shape = RoundedCornerShape(8.dp),
+        color = VuedSurfaceRaised.copy(alpha = 0.92f),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+        border = BorderStroke(1.dp, VuedHairline),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BatteryIcon(
+                levelPercent = level,
+                charging = status.charging,
+                color = color,
+                modifier = Modifier.size(width = 24.dp, height = 14.dp),
+            )
+            Text(
+                text = label,
+                color = VuedTextTertiary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BatteryIcon(
+    levelPercent: Int?,
+    charging: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier) {
+        val stroke = 1.4.dp.toPx()
+        val capWidth = 2.8.dp.toPx()
+        val bodyWidth = size.width - capWidth - stroke
+        val corner = 2.dp.toPx()
+        val levelFraction = (levelPercent ?: 0).coerceIn(0, 100) / 100f
+
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(stroke / 2f, stroke / 2f),
+            size = Size(bodyWidth, size.height - stroke),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(corner, corner),
+            style = Stroke(stroke),
+        )
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(bodyWidth + stroke, size.height * 0.32f),
+            size = Size(capWidth, size.height * 0.36f),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(stroke, stroke),
+        )
+        if (levelFraction > 0f) {
+            val fillInset = stroke * 2.1f
+            drawRoundRect(
+                color = color.copy(alpha = if (charging) 0.92f else 0.68f),
+                topLeft = Offset(fillInset, fillInset),
+                size = Size(
+                    width = (bodyWidth - fillInset * 2f) * levelFraction,
+                    height = size.height - fillInset * 2f,
+                ),
+                cornerRadius = androidx.compose.ui.geometry.CornerRadius(corner * 0.7f, corner * 0.7f),
+            )
+        }
+    }
 }
 
 @Composable
@@ -1343,5 +1487,57 @@ private fun String?.cleanSsid(): String? {
         value.substring(1, value.lastIndex)
     } else {
         value
+    }
+}
+
+private fun currentBatteryStatus(context: Context): BatteryStatus {
+    val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        ?: return BatteryStatus(
+            levelPercent = null,
+            charging = false,
+            plugged = false,
+            powerSource = null,
+        )
+    return batteryStatusFromIntent(intent)
+}
+
+private fun batteryStatusFromIntent(intent: Intent): BatteryStatus {
+    val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+    val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+    val percent = if (level >= 0 && scale > 0) {
+        ((level * 100f) / scale).toInt().coerceIn(0, 100)
+    } else {
+        null
+    }
+    val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN)
+    val pluggedValue = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+
+    return BatteryStatus(
+        levelPercent = percent,
+        charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL,
+        plugged = pluggedValue != 0,
+        powerSource = pluggedValue.powerSourceLabel(),
+    )
+}
+
+private fun Int.powerSourceLabel(): String? = when {
+    this and BatteryManager.BATTERY_PLUGGED_AC != 0 -> "AC"
+    this and BatteryManager.BATTERY_PLUGGED_USB != 0 -> "USB"
+    this and BatteryManager.BATTERY_PLUGGED_WIRELESS != 0 -> "wireless"
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        this and BatteryManager.BATTERY_PLUGGED_DOCK != 0 -> "dock"
+    else -> null
+}
+
+private fun batteryContentDescription(status: BatteryStatus): String = buildString {
+    append("Battery ")
+    append(status.levelPercent?.let { "$it percent" } ?: "level unknown")
+    when {
+        status.charging && status.powerSource != null -> append(", charging via ${status.powerSource}")
+        status.charging -> append(", charging")
+        status.plugged && status.powerSource != null -> append(", plugged in via ${status.powerSource}")
+        status.plugged -> append(", plugged in")
+        else -> append(", not charging")
     }
 }
