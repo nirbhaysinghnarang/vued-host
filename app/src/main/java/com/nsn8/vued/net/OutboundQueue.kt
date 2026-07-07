@@ -650,12 +650,32 @@ object OutboundQueue {
             // While recording, withhold the most recent segment — it may still be
             // growing or turn out to be the meeting's last (tail-trimmed) segment.
             val selected = if (ended) overlapping else overlapping.dropLast(1)
+            if (ended && selected.isEmpty()) {
+                // The meeting window contains no source audio at all (e.g. a
+                // false-start stop, or the rolling buffer never produced UMA-16
+                // segments). The server will only ever reject the empty payload,
+                // so retrying poisons the queue forever — abandon instead.
+                remove(context, itemId)
+                runCatching { wvBlobDir(context, sliceId).deleteRecursively() }
+                DiagnosticsLogger.warn("queue_source_wav_stream_abandoned_empty", mapOf(
+                    "sliceId" to sliceId, "meetingId" to meetingId,
+                ))
+                return
+            }
             val plan: SourceUploadPlan = if (codec == "wavpack") {
                 // Encode each safe, trimmed segment to a cached .wv blob, then lay
                 // them out as the length-prefixed container the server stores and
                 // Modal decodes.
                 val blobs = selected.mapNotNull {
                     SourceWavSegmentEncoder.encodeSegment(it, startMs, endMs, wvBlobDir(context, sliceId))
+                }
+                if (ended && blobs.isEmpty()) {
+                    remove(context, itemId)
+                    runCatching { wvBlobDir(context, sliceId).deleteRecursively() }
+                    DiagnosticsLogger.warn("queue_source_wav_stream_abandoned_empty", mapOf(
+                        "sliceId" to sliceId, "meetingId" to meetingId, "codec" to codec,
+                    ))
+                    return
                 }
                 SourceWavContainerPlan.build(blobs)
             } else {
@@ -697,6 +717,18 @@ object OutboundQueue {
                 ))
             }
         } catch (e: Exception) {
+            if (ended && e is VuedApi.ApiException && e.isPermanentRejection) {
+                // The server has definitively rejected the finalized payload
+                // (e.g. 400 "wav data chunk is empty"); no retry can change the
+                // bytes, so drop the item instead of blocking the queue forever.
+                remove(context, itemId)
+                runCatching { wvBlobDir(context, sliceId).deleteRecursively() }
+                Log.w(TAG, "streaming source wav $sliceId abandoned: ${e.message}")
+                DiagnosticsLogger.warn("queue_source_wav_stream_abandoned_rejected", mapOf(
+                    "sliceId" to sliceId, "meetingId" to meetingId, "status" to e.statusCode,
+                ), e)
+                return
+            }
             Log.w(TAG, "streaming source wav $sliceId still pending: ${e.message}")
             DiagnosticsLogger.warn("queue_source_wav_stream_pending", mapOf(
                 "sliceId" to sliceId, "meetingId" to meetingId, "ended" to ended,

@@ -33,10 +33,31 @@ object VuedApi {
         .readTimeout(5, TimeUnit.MINUTES)
         .writeTimeout(2, TimeUnit.MINUTES)
         .build()
+
+    // Source-wav session/chunk calls run inside the outbound-queue drain; a hung
+    // call holds the drain and freezes every other upload, so cap each call
+    // absolutely (callTimeout covers slow-drip responses that per-read timeouts
+    // never trip). A 4 MB LAN chunk finishes in seconds; 2 minutes is generous.
+    private val sourceWavChunkClient = client.newBuilder()
+        .callTimeout(2, TimeUnit.MINUTES)
+        .build()
+
+    // /complete blocks while the server pushes the assembled file to storage —
+    // ~1 min per GB observed — so its cap must accommodate long meetings while
+    // still guaranteeing the drain eventually unwedges.
+    private val sourceWavCompleteClient = client.newBuilder()
+        .readTimeout(8, TimeUnit.MINUTES)
+        .callTimeout(10, TimeUnit.MINUTES)
+        .build()
+
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
     private val sourceChunkMedia = "application/octet-stream".toMediaType()
 
-    class ApiException(message: String) : Exception(message)
+    class ApiException(message: String, val statusCode: Int = 0) : Exception(message) {
+        /** 4xx payload rejections that no retry can fix (auth 401 and conflict 409 excluded). */
+        val isPermanentRejection: Boolean
+            get() = statusCode == 400 || statusCode == 413 || statusCode == 422
+    }
 
     // ---- meeting recording (timeline-slice path) ----
 
@@ -256,7 +277,7 @@ object VuedApi {
             .header("Authorization", "Bearer $token")
             .post(body.toString().toRequestBody(jsonMedia))
             .build()
-        return parseSourceWavUploadSession(executeEnvelope(request))
+        return parseSourceWavUploadSession(executeEnvelope(request, sourceWavChunkClient))
     }
 
     private data class SourceWavUploadSession(
@@ -312,7 +333,7 @@ object VuedApi {
             .header("x-upload-offset", offset.toString())
             .patch(buffer.toRequestBody(sourceChunkMedia, 0, byteCount))
             .build()
-        return parseSourceWavUploadSession(executeEnvelope(request))
+        return parseSourceWavUploadSession(executeEnvelope(request, sourceWavChunkClient))
     }
 
     private fun completeSourceWavUpload(
@@ -325,7 +346,7 @@ object VuedApi {
             .header("Authorization", "Bearer $token")
             .post(JSONObject().toString().toRequestBody(jsonMedia))
             .build()
-        executeEnvelope(request)
+        executeEnvelope(request, sourceWavCompleteClient)
     }
 
     // ---- speaker enrollment ----
@@ -460,13 +481,13 @@ object VuedApi {
     private fun url(value: String): String =
         URLEncoder.encode(value, StandardCharsets.UTF_8.toString())
 
-    private fun executeEnvelope(request: Request): JSONObject? {
-        client.newCall(request).execute().use { response ->
+    private fun executeEnvelope(request: Request, httpClient: OkHttpClient = client): JSONObject? {
+        httpClient.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             val envelope = if (text.isNotBlank()) JSONObject(text) else JSONObject()
             val status = envelope.optInt("status", response.code)
             if (status !in 200..299) {
-                throw ApiException(envelope.optString("message", "HTTP $status"))
+                throw ApiException(envelope.optString("message", "HTTP $status"), statusCode = status)
             }
             return envelope.optJSONObject("data")
         }
