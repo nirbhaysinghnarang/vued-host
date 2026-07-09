@@ -17,5 +17,6 @@ object VuedConfig {
     // assign itself to one.
     const val ORG_API_BASE_URL = API_BASE_URL
 
-    const val ALLOW_BUILT_IN_MIC_FALLBACK = false
+    const val ALLOW_BUILT_IN_MIC_FALLBACK = true
 }
+    
