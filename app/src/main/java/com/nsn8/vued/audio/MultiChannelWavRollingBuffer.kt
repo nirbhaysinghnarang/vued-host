@@ -15,6 +15,8 @@ class MultiChannelWavRollingBuffer(
     private val segmentSeconds: Int = DEFAULT_SEGMENT_SECONDS,
     private val retentionSeconds: Long = 72 * 60 * 60,
     private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val freeSpaceFloorBytes: Long = DiskSpaceGuard.DEFAULT_FLOOR_BYTES,
+    private val freeBytesProvider: () -> Long = { DiskSpaceGuard.freeBytes(directory) },
     // Settable so the meeting controller can subscribe to segment closes (to
     // drive incremental upload) only while a meeting is active.
     @Volatile var onSegmentClosed: (file: File, count: Int) -> Unit = { _, _ -> },
@@ -110,6 +112,13 @@ class MultiChannelWavRollingBuffer(
                 runCatching { file.delete() }
             }
         }
+        DiskSpaceGuard.enforceFloor(
+            directory,
+            ".wav",
+            protect = currentFile,
+            floorBytes = freeSpaceFloorBytes,
+            freeBytes = freeBytesProvider,
+        )
     }
 
     companion object {
@@ -135,6 +144,35 @@ class MultiChannelWavRollingBuffer(
                 ?.mapNotNull { segmentFor(it, sampleRate, channels, segmentSeconds) }
                 ?.sortedBy { it.startMs }
                 ?: emptyList()
+
+        /**
+         * Deletes finalized segments fully inside [startMs, endMs] — the
+         * upload-completion reaper. Zero-frame files are skipped: an
+         * in-progress writer patches its WAV header only on finish(), so a
+         * live file parses as zero frames and would otherwise look "fully
+         * covered" via the fallback duration. Boundary-straddling segments
+         * survive to the age/floor prunes. Returns the number deleted.
+         */
+        fun deleteSegmentsCoveredBy(
+            directory: File,
+            startMs: Long,
+            endMs: Long,
+            sampleRate: Int = SAMPLE_RATE_16K,
+            channels: Int = CHANNELS_UMA16,
+            segmentSeconds: Int = DEFAULT_SEGMENT_SECONDS,
+        ): Int {
+            var deleted = 0
+            directory.listFiles { file -> file.name.endsWith(".wav") }?.forEach { file ->
+                val segment = segmentFor(file, sampleRate, channels, segmentSeconds) ?: return@forEach
+                if (segment.frameCount <= 0L) return@forEach
+                if (segment.startMs >= startMs && segment.endMs <= endMs &&
+                    runCatching { file.delete() }.getOrDefault(false)
+                ) {
+                    deleted += 1
+                }
+            }
+            return deleted
+        }
 
         fun segmentFor(
             file: File,

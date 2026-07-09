@@ -20,6 +20,8 @@ class RollingBuffer(
     private val sampleRate: Int = 16_000,
     private val segmentSeconds: Int = 30,
     private val retentionSeconds: Long = 72 * 60 * 60,
+    private val freeSpaceFloorBytes: Long = DiskSpaceGuard.DEFAULT_FLOOR_BYTES,
+    private val freeBytesProvider: () -> Long = { DiskSpaceGuard.freeBytes(directory) },
     private val onSegmentClosed: (file: File, count: Int) -> Unit = { _, _ -> },
 ) {
     /** A finalized, readable segment and its approximate wall-clock span. */
@@ -131,6 +133,13 @@ class RollingBuffer(
                 runCatching { f.delete() }
             }
         }
+        DiskSpaceGuard.enforceFloor(
+            directory,
+            ".m4a",
+            protect = currentFile,
+            floorBytes = freeSpaceFloorBytes,
+            freeBytes = freeBytesProvider,
+        )
     }
 
     companion object {

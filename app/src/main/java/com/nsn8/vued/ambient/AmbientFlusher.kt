@@ -139,11 +139,32 @@ object AmbientFlusher {
         lastUploadMs = windowEnd
         // 16-ch source sidecar for the same window/slice; never allowed to
         // break the canonical ambient flush.
-        runCatching {
+        val sidecarOutcome = runCatching {
             enqueueSourceSidecar(context, sliceId, windowStart, windowEnd, durationSecs, monoSizeBytes)
-        }.onFailure { error ->
+        }.getOrElse { error ->
             Log.w(TAG, "ambient source sidecar failed: ${error.message}")
             DiagnosticsLogger.warn("ambient_source_wav_failed", mapOf("sliceId" to sliceId), error)
+            null // failed: keep the window's raw segments for the 72h fallback
+        }
+        // The window is never revisited (cursor already advanced), so once its
+        // bytes are durably enqueued — or the skip decision is final — the raw
+        // uma16 segments it covers are dead weight (~1.8GB/hour if retained).
+        if (sidecarOutcome?.windowConsumed == true) {
+            sourceBufferProvider()?.directory?.let { sourceDir ->
+                runCatching {
+                    val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(
+                        sourceDir, windowStart, windowEnd,
+                    )
+                    if (deleted > 0) {
+                        DiagnosticsLogger.info("ambient_source_segments_deleted", mapOf(
+                            "sliceId" to sliceId,
+                            "deleted" to deleted,
+                            "outcome" to sidecarOutcome.name,
+                            "windowMs" to (windowEnd - windowStart),
+                        ))
+                    }
+                }
+            }
         }
         val drainStartMs = SystemClock.elapsedRealtime()
         OutboundQueue.drain(context) // upload this slice + any offline backlog
@@ -163,6 +184,22 @@ object AmbientFlusher {
     }
 
     /**
+     * How a window's 16-ch sidecar concluded. [windowConsumed] marks outcomes
+     * where the decision is final and the window's raw uma16 segments can be
+     * deleted: bytes durably enqueued, or an intentional skip that will never
+     * be revisited. Failures (exception, backlog drop) keep the segments for
+     * the 72h fallback.
+     */
+    private enum class SidecarOutcome(val windowConsumed: Boolean) {
+        ENQUEUED(true),
+        SKIPPED_DISABLED(true),
+        SKIPPED_SILENT(true),
+        EXPORT_EMPTY(true),
+        NO_SOURCE_BUFFER(false),
+        DROPPED_BACKLOG(false),
+    }
+
+    /**
      * Exports the window from the 16-ch source buffer and enqueues it as a
      * sidecar on the same slice as the mono item. Skipped when disabled, when
      * no UMA-16 buffer exists, or when the window never rose above the silence
@@ -175,10 +212,10 @@ object AmbientFlusher {
         windowEnd: Long,
         durationSecs: Double,
         monoSizeBytes: Long,
-    ) {
+    ): SidecarOutcome {
         val windowPeak = windowPeakProvider()
-        if (!VuedConfig.AMBIENT_SOURCE_WAV_UPLOAD) return
-        val source = sourceBufferProvider() ?: return
+        if (!VuedConfig.AMBIENT_SOURCE_WAV_UPLOAD) return SidecarOutcome.SKIPPED_DISABLED
+        val source = sourceBufferProvider() ?: return SidecarOutcome.NO_SOURCE_BUFFER
         val peakDb = if (windowPeak > 0f) 20f * log10(windowPeak) else Float.NEGATIVE_INFINITY
         if (peakDb < VuedConfig.AMBIENT_SOURCE_WAV_MIN_PEAK_DB) {
             Log.i(TAG, "ambient source sidecar skipped: silent window peakDb=$peakDb")
@@ -186,7 +223,7 @@ object AmbientFlusher {
                 "sliceId" to sliceId,
                 "peakDb" to peakDb,
             ))
-            return
+            return SidecarOutcome.SKIPPED_SILENT
         }
         source.flush()
         // WavPack halves-or-better the ~150 MB raw window; same container the
@@ -215,7 +252,7 @@ object AmbientFlusher {
                 "sliceId" to sliceId,
                 "windowMs" to (windowEnd - windowStart),
             ))
-            return
+            return SidecarOutcome.EXPORT_EMPTY
         }
         DiagnosticsLogger.info("ambient_source_wav_export_completed", mapOf(
             "sliceId" to sliceId,
@@ -224,7 +261,7 @@ object AmbientFlusher {
             "bytes" to out.length(),
             "codec" to codec,
         ))
-        OutboundQueue.enqueueAmbientSourceWav(
+        val enqueued = OutboundQueue.enqueueAmbientSourceWav(
             context,
             sliceId = sliceId,
             sessionId = sessionId,
@@ -235,5 +272,6 @@ object AmbientFlusher {
             source = out,
             codec = codec,
         )
+        return if (enqueued != null) SidecarOutcome.ENQUEUED else SidecarOutcome.DROPPED_BACKLOG
     }
 }

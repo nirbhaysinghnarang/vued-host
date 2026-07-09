@@ -609,6 +609,7 @@ object OutboundQueue {
             )
             file.delete()
             remove(context, itemId)
+            runCatching { deleteUploadedUma16Segments(context, item) }
             Log.i(TAG, "uploaded queued source wav $sliceId")
         } catch (e: Exception) {
             Log.w(TAG, "source wav $sliceId still pending: ${e.message}")
@@ -799,6 +800,21 @@ object OutboundQueue {
             if (ended) {
                 remove(context, itemId)
                 runCatching { wvBlobDir(context, sliceId).deleteRecursively() }
+                // The upload is durable server-side; the raw ring segments this
+                // window covered are no longer needed by anyone (ambient windows
+                // never overlap meeting ranges). Boundary straddlers survive to
+                // the age/floor prunes.
+                runCatching {
+                    val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(
+                        segmentsDir, startMs, requireNotNull(endMs),
+                    )
+                    if (deleted > 0) {
+                        DiagnosticsLogger.info("queue_source_wav_segments_deleted", mapOf(
+                            "sliceId" to sliceId, "meetingId" to meetingId, "deleted" to deleted,
+                            "startMs" to startMs, "endMs" to endMs,
+                        ))
+                    }
+                }
                 Log.i(TAG, "completed streaming source wav $sliceId (${plan.totalBytes} bytes, codec=$codec)")
                 DiagnosticsLogger.info("queue_source_wav_stream_completed", mapOf(
                     "sliceId" to sliceId, "meetingId" to meetingId, "bytes" to plan.totalBytes, "codec" to codec,
@@ -838,6 +854,22 @@ object OutboundQueue {
         val startMs = (item.getDouble("startedAtSec") * 1000).toLong()
         val endMs = (item.getDouble("endedAtSec") * 1000).toLong()
         RollingBuffer.deleteSegmentsCoveredBy(segmentsDir, startMs, endMs)
+    }
+
+    /** uma16 counterpart of [deleteUploadedSourceSegments] for the
+     *  non-streaming meeting source upload (self-contained outbound copy). */
+    private fun deleteUploadedUma16Segments(context: Context, item: JSONObject) {
+        val dir = context.getExternalFilesDir(null)?.let { File(it, "uma16_segments") } ?: return
+        val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(
+            dir,
+            (item.getDouble("startedAtSec") * 1000).toLong(),
+            (item.getDouble("endedAtSec") * 1000).toLong(),
+        )
+        if (deleted > 0) {
+            DiagnosticsLogger.info("queue_source_wav_segments_deleted", mapOf(
+                "sliceId" to item.optString("sliceId"), "deleted" to deleted,
+            ))
+        }
     }
 
     // ---- index mutations (whole-array rewrite under lock, like iOS UserDefaults) ----

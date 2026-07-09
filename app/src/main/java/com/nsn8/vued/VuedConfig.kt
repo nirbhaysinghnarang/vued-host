@@ -9,8 +9,10 @@ object VuedConfig {
     const val SUPABASE_URL = "https://eubvwnuocitdcctwqjox.supabase.co"
     const val SUPABASE_ANON_KEY = "sb_publishable_dhS0lnu9IDvFPDi7TIzZwQ_hTgKl_eH"
 
-    // Local development API running on this Mac over the LAN.
-    const val API_BASE_URL = "http://10.0.0.32:8765"
+    // Vued Office GSS stack on Render (render.office-gss.yaml blueprint).
+    // For local development against a Mac on the LAN, use e.g.
+    // "http://10.0.0.32:8765".
+    const val API_BASE_URL = "https://vued-office-gss-api.onrender.com"
 
     // Org-management API (orgs, rooms, members) — a separate service from the
     // recording backend above. Used to fetch the org's rooms so the tablet can
