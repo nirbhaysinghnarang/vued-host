@@ -39,5 +39,8 @@ object VuedConfig {
     // gate so every window uploads.
     const val AMBIENT_SOURCE_WAV_MIN_PEAK_DB = -50f
 
-    const val ALLOW_BUILT_IN_MIC_FALLBACK = false
+    // When the UMA array drops off USB, fall back to the built-in Android mic
+    // so the meeting's mono/live-transcript path keeps working. Fallback audio
+    // is mono — no 16-channel source WAV (and no GSS) for that stretch.
+    const val ALLOW_BUILT_IN_MIC_FALLBACK = true
 }

@@ -27,6 +27,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -48,6 +49,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -72,6 +75,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -109,6 +113,7 @@ import io.github.jan.supabase.auth.status.SessionStatus
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
@@ -377,13 +382,61 @@ private fun PassphraseTextField(
     )
 }
 
+private fun suggestedRoomMicrophoneId(roomName: String): String {
+    return roomName.trim()
+        .lowercase(Locale.US)
+        .replace(Regex("[^a-z0-9]+"), "-")
+        .trim('-')
+        .ifBlank { "tablet-room" }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val roomNameBringIntoView = remember { BringIntoViewRequester() }
+    val microphoneIdBringIntoView = remember { BringIntoViewRequester() }
     var rooms by remember { mutableStateOf<List<OrgApi.Room>>(emptyList()) }
     var orgId by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(true) }
+    var creating by remember { mutableStateOf(false) }
+    var createError by remember { mutableStateOf<String?>(null) }
+    var selectedRoomId by remember { mutableStateOf<String?>(null) }
+    var roomDraftName by remember { mutableStateOf("") }
+    var roomDraftMicrophoneId by remember { mutableStateOf("") }
+    val selectedRoom = rooms.firstOrNull { it.id == selectedRoomId }
+    val isCreatingDraft = roomDraftName.trim().isNotEmpty()
+    val canSubmit = !creating &&
+        orgId != null &&
+        if (isCreatingDraft) {
+            roomDraftMicrophoneId.trim().isNotEmpty()
+        } else {
+            selectedRoom != null
+        }
+
+    fun selectRoom(room: OrgApi.Room) {
+        RoomConfig.set(
+            context,
+            room.id,
+            room.displayName,
+            orgId.orEmpty(),
+            room.microphoneId,
+        )
+        onRoomPicked(room.displayName)
+    }
+
+    fun Modifier.keyboardFocused(requester: BringIntoViewRequester): Modifier {
+        return bringIntoViewRequester(requester).onFocusEvent { focusState ->
+            if (focusState.isFocused) {
+                scope.launch {
+                    delay(250)
+                    requester.bringIntoView()
+                }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         try {
@@ -406,6 +459,8 @@ private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
             .fillMaxSize()
             .background(VuedBackground)
             .statusBarsPadding()
+            .navigationBarsPadding()
+            .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(32.dp),
         contentAlignment = Alignment.TopCenter,
@@ -438,35 +493,138 @@ private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
                 when {
                     loading -> Text("Loading rooms...", color = VuedTextSecondary)
                     error != null -> Text(error.orEmpty(), color = MaterialTheme.colorScheme.error)
-                    rooms.isEmpty() -> Text("No rooms found. Create one in Vued first.", color = VuedTextSecondary)
-                    else -> rooms.forEach { room ->
-                        OutlinedButton(
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(8.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                contentColor = VuedTextPrimary,
-                            ),
-                            border = BorderStroke(1.dp, VuedHairline),
-                            onClick = {
-                                RoomConfig.set(
-                                    context,
-                                    room.id,
-                                    room.displayName,
-                                    orgId.orEmpty(),
-                                    room.microphoneId,
-                                )
-                                onRoomPicked(room.displayName)
-                            },
-                        ) {
+                    else -> {
+                        if (rooms.isEmpty()) {
                             Text(
-                                text = room.displayName,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 8.dp),
+                                text = "No rooms found. Create one below to assign this tablet.",
+                                color = VuedTextSecondary,
+                                fontSize = 15.sp,
+                                letterSpacing = 0.sp,
+                            )
+                        } else {
+                            rooms.forEach { room ->
+                                val selected = room.id == selectedRoomId
+                                OutlinedButton(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = VuedTextPrimary,
+                                    ),
+                                    border = BorderStroke(
+                                        width = if (selected) 2.dp else 1.dp,
+                                        color = if (selected) VuedSuccess else VuedHairline,
+                                    ),
+                                    onClick = {
+                                        selectedRoomId = room.id
+                                        roomDraftName = ""
+                                        roomDraftMicrophoneId = ""
+                                        createError = null
+                                    },
+                                ) {
+                                    Text(
+                                        text = room.displayName,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 8.dp),
+                                        color = if (selected) VuedSuccess else VuedTextPrimary,
+                                        fontSize = 17.sp,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                        letterSpacing = 0.sp,
+                                    )
+                                }
+                            }
+                        }
+
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                text = "Create new room",
                                 color = VuedTextPrimary,
+                                fontWeight = FontWeight.SemiBold,
                                 fontSize = 17.sp,
                                 letterSpacing = 0.sp,
                             )
+                            OutlinedTextField(
+                                value = roomDraftName,
+                                onValueChange = { next ->
+                                    val previousSuggestion = suggestedRoomMicrophoneId(roomDraftName)
+                                    selectedRoomId = null
+                                    createError = null
+                                    roomDraftName = next
+                                    if (roomDraftMicrophoneId.isBlank() || roomDraftMicrophoneId == previousSuggestion) {
+                                        roomDraftMicrophoneId = suggestedRoomMicrophoneId(next)
+                                    }
+                                },
+                                label = { Text("Room name") },
+                                enabled = !creating,
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .keyboardFocused(roomNameBringIntoView),
+                            )
+                            OutlinedTextField(
+                                value = roomDraftMicrophoneId,
+                                onValueChange = {
+                                    selectedRoomId = null
+                                    createError = null
+                                    roomDraftMicrophoneId = it.trim()
+                                },
+                                label = { Text("Microphone ID") },
+                                enabled = !creating,
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .keyboardFocused(microphoneIdBringIntoView),
+                            )
+                            createError?.let {
+                                Text(
+                                    text = it,
+                                    color = MaterialTheme.colorScheme.error,
+                                    fontSize = 14.sp,
+                                    letterSpacing = 0.sp,
+                                )
+                            }
+                            Button(
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = canSubmit,
+                                shape = RoundedCornerShape(8.dp),
+                                onClick = {
+                                    val currentOrgId = orgId ?: return@Button
+                                    if (isCreatingDraft) {
+                                        val displayName = roomDraftName.trim()
+                                        val microphoneId = roomDraftMicrophoneId.trim()
+                                        scope.launch {
+                                            creating = true
+                                            createError = null
+                                            try {
+                                                val created = OrgApi.createRoom(currentOrgId, displayName, microphoneId)
+                                                rooms = (rooms.filter { it.id != created.id } + created)
+                                                    .sortedBy { it.displayName.lowercase(Locale.US) }
+                                                roomDraftName = ""
+                                                roomDraftMicrophoneId = ""
+                                                selectedRoomId = created.id
+                                                selectRoom(created)
+                                            } catch (e: Exception) {
+                                                createError = e.message ?: "Could not create room."
+                                            } finally {
+                                                creating = false
+                                            }
+                                        }
+                                    } else {
+                                        selectedRoom?.let { selectRoom(it) }
+                                    }
+                                },
+                            ) {
+                                Text(
+                                    text = when {
+                                        creating -> "Creating..."
+                                        isCreatingDraft -> "Create new room"
+                                        else -> "Select"
+                                    },
+                                    modifier = Modifier.padding(vertical = 8.dp),
+                                    fontSize = 16.sp,
+                                    letterSpacing = 0.sp,
+                                )
+                            }
                         }
                     }
                 }

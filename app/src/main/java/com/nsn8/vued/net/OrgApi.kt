@@ -47,6 +47,24 @@ object OrgApi {
         }
     }
 
+    /** Create a room for [orgId]. The org API accepts camelCase fields. */
+    suspend fun createRoom(orgId: String, displayName: String, microphoneId: String): Room {
+        val r = postJson(
+            "/api/v1/orgs/$orgId/rooms",
+            JSONObject()
+                .put("displayName", displayName)
+                .put("microphoneId", microphoneId),
+        )
+        val returnedMicrophoneId = r.optString("microphone_id")
+            .ifBlank { r.optString("microphoneId") }
+            .ifBlank { microphoneId }
+        return Room(
+            id = r.optString("id"),
+            microphoneId = returnedMicrophoneId,
+            displayName = r.optRoomName(returnedMicrophoneId),
+        )
+    }
+
     /** Org members (snake_case from the org API) — for the "existing user" picker. */
     suspend fun getMembers(orgId: String): List<Member> {
         val arr = getArray("/api/v1/orgs/$orgId/members")
@@ -68,6 +86,24 @@ object OrgApi {
             "/api/v1/orgs/$orgId/speaker-profile-links/$speakerProfileId",
             JSONObject().put("userId", userId),
         )
+    }
+
+    private suspend fun postJson(path: String, body: JSONObject): JSONObject = withContext(Dispatchers.IO) {
+        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val request = Request.Builder()
+            .url(VuedConfig.ORG_API_BASE_URL + path)
+            .header("Authorization", "Bearer $token")
+            .post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        client.newCall(request).execute().use { response ->
+            val text = response.body?.string().orEmpty()
+            val envelope = if (text.isNotBlank()) JSONObject(text) else JSONObject()
+            val status = envelope.optInt("status", response.code)
+            if (status !in 200..299) {
+                throw VuedApi.ApiException(envelope.optString("message", "HTTP $status"))
+            }
+            envelope.optJSONObject("data") ?: JSONObject()
+        }
     }
 
     private suspend fun putJson(path: String, body: JSONObject) = withContext(Dispatchers.IO) {
