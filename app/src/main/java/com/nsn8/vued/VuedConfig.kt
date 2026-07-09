@@ -6,8 +6,8 @@ package com.nsn8.vued
  * service-role key must NEVER appear in the app.
  */
 object VuedConfig {
-    const val SUPABASE_URL = "https://eubvwnuocitdcctwqjox.supabase.co"
-    const val SUPABASE_ANON_KEY = "sb_publishable_dhS0lnu9IDvFPDi7TIzZwQ_hTgKl_eH"
+    const val SUPABASE_URL = "https://fmzwemrvhiyyotswkplb.supabase.co"
+    const val SUPABASE_ANON_KEY = "sb_publishable_wEIaal3mcF9ZcbLXT9NF3w_heVIvHlX"
 
     // Stateless STT / API backend for the fresh office-dev stack.
     const val API_BASE_URL = "https://vued-office-api-dev.onrender.com"
@@ -19,4 +19,3 @@ object VuedConfig {
 
     const val ALLOW_BUILT_IN_MIC_FALLBACK = true
 }
-    
