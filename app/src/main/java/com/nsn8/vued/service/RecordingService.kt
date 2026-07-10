@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import com.nsn8.vued.AmplitudeTracker
 import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.ambient.AmbientFlusher
@@ -116,6 +117,7 @@ class RecordingService : Service() {
                             error = "Mic disconnected",
                         )
                     }
+                    AmplitudeTracker.track("mic_disconnected", mapOf("reason" to "capture_stale", "ageMs" to ageMs))
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastStaleReportMs >= CAPTURE_STALE_LOG_INTERVAL_MS) {
                         lastStaleReportMs = now
@@ -241,6 +243,10 @@ class RecordingService : Service() {
             mapOf("message" to (error?.message ?: "UMA mic unavailable")),
             error,
         )
+        AmplitudeTracker.track(
+            "mic_disconnected",
+            mapOf("reason" to "uma_unavailable", "message" to (error?.message ?: "UMA mic unavailable")),
+        )
         RecorderState.update {
             it.copy(
                 captureReady = false,
@@ -319,6 +325,7 @@ class RecordingService : Service() {
     private fun publishCaptureReadyIfNeeded(source: String, lastAudioMs: Long) {
         if (RecorderState.state.value.hasFreshAudio()) return
         DiagnosticsLogger.info("capture_ready", mapOf("source" to source))
+        AmplitudeTracker.track("mic_connected", mapOf("source" to source))
         RecorderState.update {
             it.copy(
                 running = true,

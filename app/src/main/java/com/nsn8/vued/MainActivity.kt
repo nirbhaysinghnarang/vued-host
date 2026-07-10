@@ -48,6 +48,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
@@ -56,6 +57,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -92,6 +94,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -112,15 +115,21 @@ import com.nsn8.vued.service.RecorderState
 import com.nsn8.vued.service.RecordingService
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
+import com.nsn8.vued.update.SelfUpdateManager
 import io.github.jan.supabase.auth.status.SessionStatus
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
+private const val KIOSK_ESCAPE_TAPS_REQUIRED = 7
+private const val KIOSK_ESCAPE_TAP_WINDOW_MS = 8_000L
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -158,11 +167,15 @@ class MainActivity : ComponentActivity() {
     private var pendingKioskAfterUsbPermission = false
     private var lastUsbPermissionRequestKey: String? = null
     private var lastUsbPermissionRequestMs: Long = 0
+    private var kioskManuallyEscaped = false
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val attachedDevice = intent.usbDeviceExtra()
+                    if (attachedDevice.matchesUmaSafely()) {
+                        AmplitudeTracker.track("mic_connected", usbDeviceData(attachedDevice) + mapOf("source" to "usb_attached"))
+                    }
                     dismissMicDisconnectedIfUmaDetected(attachedDevice, trigger = "usb_attached")
                     logKioskUsbEvent(
                         "kiosk_usb_attach_received",
@@ -240,11 +253,19 @@ class MainActivity : ComponentActivity() {
         hideStatusBar()
         if (isDeviceOwner(this)) {
             logKioskUsbEvent("kiosk_resume_device_owner", data = mapOf("locked" to isKioskLocked(this)))
+            if (kioskManuallyEscaped) {
+                logKioskUsbEvent("kiosk_resume_lock_skipped_after_escape")
+                return
+            }
             if (!requestUmaPermissionForKioskRecovery(trigger = "activity_resume")) {
                 val result = startKiosk(this)
                 logKioskUsbEvent("kiosk_resume_lock_started", data = mapOf("result" to result))
             }
         }
+    }
+
+    fun markKioskManuallyEscaped() {
+        kioskManuallyEscaped = true
     }
 
     fun requestUmaPermissionForKioskRecovery(trigger: String = "manual"): Boolean {
@@ -519,7 +540,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     text = if (creating) {
                         "This tablet needs a passphrase before ambient processing can run."
                     } else {
-                        "Unlock this tablet to process ambient candidates locally."
+                        "Unlock this tablet."
                     },
                     color = VuedTextTertiary,
                     fontSize = 15.sp,
@@ -531,7 +552,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     PassphraseTextField(
                         value = passphrase,
                         onValueChange = { passphrase = it },
-                        label = "Enter your passphrase to be able to decrypt your meetings",
+                        label = "Enter your passphrase.",
                         modifier = Modifier.fillMaxWidth(),
                     )
                     if (creating) {
@@ -906,6 +927,14 @@ private fun ProdRecorderMainScreen() {
     var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
     var micArrayPresent by remember { mutableStateOf(isUmaMicPresent(context)) }
     var currentTime by remember { mutableStateOf(formatCurrentTime()) }
+    var updateDialogVisible by remember { mutableStateOf(false) }
+    var updateTitle by remember { mutableStateOf("Software update") }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var updateBusy by remember { mutableStateOf(false) }
+    var updateRunToken by remember { mutableStateOf(0) }
+    var updateJob by remember { mutableStateOf<Job?>(null) }
+    var kioskEscapeTapCount by remember { mutableStateOf(0) }
+    var lastKioskEscapeTapMs by remember { mutableStateOf(0L) }
 
     DisposableEffect(Unit) {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)
@@ -948,7 +977,11 @@ private fun ProdRecorderMainScreen() {
     DisposableEffect(Unit) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
+                val wasPresent = micArrayPresent
                 micArrayPresent = isUmaMicPresent(ctx)
+                if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED && wasPresent && !micArrayPresent) {
+                    AmplitudeTracker.track("mic_disconnected", mapOf("reason" to "usb_detached"))
+                }
             }
         }
         val filter = IntentFilter().apply {
@@ -1056,7 +1089,13 @@ private fun ProdRecorderMainScreen() {
             enabled = !status.running || status.captureReady,
             modifier = Modifier.align(Alignment.TopStart),
             onClick = {
-                if (status.running) RecordingService.stop(context) else startCapture()
+                if (status.running) {
+                    AmplitudeTracker.track("mute")
+                    RecordingService.stop(context)
+                } else {
+                    AmplitudeTracker.track("unmute")
+                    startCapture()
+                }
             },
         )
 
@@ -1151,10 +1190,120 @@ private fun ProdRecorderMainScreen() {
             fontWeight = FontWeight.Light,
             letterSpacing = 0.sp,
         )
+
+        SelfUpdateButton(
+            versionCode = BuildConfig.VERSION_CODE,
+            busy = updateBusy,
+            enabled = true,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .navigationBarsPadding()
+                .padding(bottom = 2.dp),
+            onClick = {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastKioskEscapeTapMs > KIOSK_ESCAPE_TAP_WINDOW_MS) {
+                    kioskEscapeTapCount = 0
+                }
+                lastKioskEscapeTapMs = now
+                kioskEscapeTapCount += 1
+
+                if (kioskEscapeTapCount == KIOSK_ESCAPE_TAPS_REQUIRED - 1) {
+                    updateJob?.cancel()
+                    updateJob = null
+                    AmplitudeTracker.track("self_update_cancelled_for_kiosk_escape", mapOf("tapCount" to kioskEscapeTapCount))
+                    updateRunToken += 1
+                    updateBusy = false
+                    updateDialogVisible = true
+                    updateTitle = "Unlock almost ready"
+                    updateMessage = "You're 1 step away from unlocking kiosk mode."
+                    DiagnosticsLogger.info(
+                        "kiosk_escape_hatch_warning",
+                        mapOf("tapCount" to kioskEscapeTapCount, "required" to KIOSK_ESCAPE_TAPS_REQUIRED),
+                    )
+                    return@SelfUpdateButton
+                }
+                if (kioskEscapeTapCount >= KIOSK_ESCAPE_TAPS_REQUIRED) {
+                    kioskEscapeTapCount = 0
+                    updateJob?.cancel()
+                    updateJob = null
+                    AmplitudeTracker.track("self_update_cancelled_for_kiosk_escape", mapOf("tapCount" to KIOSK_ESCAPE_TAPS_REQUIRED))
+                    updateRunToken += 1
+                    updateBusy = false
+                    (context as? MainActivity)?.markKioskManuallyEscaped()
+                    val result = (context as? Activity)?.let(::stopKiosk) ?: "unlockError=activityUnavailable"
+                    updateDialogVisible = true
+                    updateTitle = "Kiosk unlocked"
+                    updateMessage = "$result You can now leave the app from the tablet."
+                    DiagnosticsLogger.info("kiosk_escape_hatch_unlocked", mapOf("result" to result))
+                    return@SelfUpdateButton
+                }
+                if (updateBusy) {
+                    return@SelfUpdateButton
+                }
+
+                AmplitudeTracker.track("self_update_button_pressed")
+                updateDialogVisible = true
+                updateBusy = true
+                updateRunToken += 1
+                val runToken = updateRunToken
+                updateTitle = "Checking for updates"
+                updateMessage = "Looking for a newer version. Current version: ${BuildConfig.VERSION_CODE}."
+                updateJob = scope.launch {
+                    try {
+                        when (val result = SelfUpdateManager.installLatest(context) { message ->
+                            scope.launch(Dispatchers.Main) {
+                                if (runToken == updateRunToken) {
+                                    updateTitle = updateTitleForProgress(message)
+                                    updateMessage = message
+                                }
+                            }
+                        }) {
+                            is SelfUpdateManager.UpdateResult.Installing -> {
+                                if (runToken == updateRunToken) {
+                                    updateTitle = "Installing update"
+                                    updateMessage = "Android is installing ${result.versionName} (version ${result.versionCode}). The app will reopen automatically when installation finishes."
+                                }
+                            }
+                            is SelfUpdateManager.UpdateResult.UpToDate -> {
+                                if (runToken == updateRunToken) {
+                                    updateTitle = "You're up to date"
+                                    updateMessage = "Current version: ${result.versionCode}. No newer update is available."
+                                }
+                            }
+                        }
+                    } catch (error: Throwable) {
+                        if (error is CancellationException) {
+                            throw error
+                        }
+                        if (runToken == updateRunToken) {
+                            updateTitle = "Update unavailable"
+                            updateMessage = error.message ?: "Could not complete the update check."
+                        }
+                        DiagnosticsLogger.error("self_update_ui_failed", throwable = error, sentry = false)
+                    } finally {
+                        if (runToken == updateRunToken) {
+                            updateBusy = false
+                            updateJob = null
+                        }
+                    }
+                }
+            },
+        )
     }
 
     if (showEnroll) {
         ProdSpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
+    }
+    if (updateDialogVisible) {
+        SelfUpdateDialog(
+            title = updateTitle,
+            busy = updateBusy,
+            message = updateMessage ?: "",
+            versionCode = BuildConfig.VERSION_CODE,
+            onDismiss = {
+                if (!updateBusy) updateDialogVisible = false
+            },
+        )
     }
 }
 
@@ -1397,6 +1546,220 @@ private fun MicConnectionBadge(status: MicConnectionUi) {
 }
 
 @Composable
+private fun SelfUpdateButton(
+    versionCode: Int,
+    busy: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, VuedHairline),
+        modifier = modifier.semantics {
+            contentDescription = "Check for app updates. Current version: $versionCode"
+        },
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = VuedSurfaceRaised.copy(alpha = 0.92f),
+            contentColor = VuedTextTertiary,
+            disabledContainerColor = VuedSurfaceRaised.copy(alpha = 0.72f),
+            disabledContentColor = VuedTextTertiary.copy(alpha = 0.45f),
+        ),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (busy) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = VuedTextTertiary,
+                )
+            } else {
+                Icon(
+                    painter = painterResource(R.drawable.ic_update_24),
+                    contentDescription = null,
+                    tint = VuedTextTertiary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = if (busy) "Checking updates" else "Check for updates",
+                    color = VuedTextTertiary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.sp,
+                )
+                Text(
+                    text = "Current version: $versionCode",
+                    color = VuedTextTertiary.copy(alpha = 0.72f),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Normal,
+                    letterSpacing = 0.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelfUpdateDialog(
+    title: String,
+    busy: Boolean,
+    message: String,
+    versionCode: Int,
+    onDismiss: () -> Unit,
+) {
+    val statusColor = when {
+        title.contains("unavailable", ignoreCase = true) -> Color(0xFFB42318)
+        title.contains("up to date", ignoreCase = true) -> VuedSuccess
+        title.contains("install", ignoreCase = true) -> VuedSuccess
+        else -> VuedTextTertiary
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 430.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = VuedSurfaceRaised,
+            shadowElevation = 20.dp,
+            tonalElevation = 0.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(statusColor.copy(alpha = 0.10f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (busy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.5.dp,
+                                color = statusColor,
+                            )
+                        } else {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_update_24),
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(24.dp),
+                            )
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(
+                            text = title,
+                            color = VuedTextPrimary,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.sp,
+                        )
+                        Text(
+                            text = if (busy) "Update check in progress" else "Software update",
+                            color = VuedTextTertiary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            letterSpacing = 0.sp,
+                        )
+                    }
+                }
+
+                Text(
+                    text = message,
+                    color = VuedTextSecondary,
+                    fontSize = 15.sp,
+                    lineHeight = 21.sp,
+                    letterSpacing = 0.sp,
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(VuedSurface),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Current version",
+                        modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp),
+                        color = VuedTextTertiary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 0.sp,
+                    )
+                    Text(
+                        text = versionCode.toString(),
+                        modifier = Modifier.padding(end = 12.dp, top = 10.dp, bottom = 10.dp),
+                        color = VuedTextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 0.sp,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (busy) {
+                        Text(
+                            text = "Keep Vued open",
+                            color = VuedTextTertiary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            letterSpacing = 0.sp,
+                        )
+                    } else {
+                        Button(
+                            onClick = onDismiss,
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = VuedTextPrimary,
+                                contentColor = Color.White,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 9.dp),
+                        ) {
+                            Text(
+                                text = "Done",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun updateTitleForProgress(message: String): String = when {
+    message.startsWith("Downloading") -> "Downloading update"
+    message.startsWith("Preparing") -> "Installing update"
+    else -> "Checking for updates"
+}
+
+@Composable
 private fun WifiSettingsButton(
     status: WifiStatus,
     onClick: () -> Unit,
@@ -1488,10 +1851,7 @@ private fun BatteryStatusBadge(
     }
     val label = buildString {
         append(level?.let { "$it%" } ?: "--%")
-        when {
-            status.charging -> append(" Charging")
-            status.plugged -> append(" Plugged")
-        }
+
     }
 
     Surface(
@@ -1964,11 +2324,4 @@ private fun Int.powerSourceLabel(): String? = when {
 private fun batteryContentDescription(status: BatteryStatus): String = buildString {
     append("Battery ")
     append(status.levelPercent?.let { "$it percent" } ?: "level unknown")
-    when {
-        status.charging && status.powerSource != null -> append(", charging via ${status.powerSource}")
-        status.charging -> append(", charging")
-        status.plugged && status.powerSource != null -> append(", plugged in via ${status.powerSource}")
-        status.plugged -> append(", plugged in")
-        else -> append(", not charging")
-    }
 }

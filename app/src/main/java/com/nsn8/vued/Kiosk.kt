@@ -75,8 +75,21 @@ private fun applyKioskPolicy(
 
 fun stopKiosk(activity: Activity): String =
     try {
-        activity.stopLockTask()
-        "Kiosk lock task stopped."
+        val dpm = activity.getSystemService(DevicePolicyManager::class.java)
+        val admin = deviceAdminComponent(activity)
+        val lockTaskResult = runCatching {
+            activity.stopLockTask()
+            "Kiosk lock task stopped."
+        }.getOrElse { error ->
+            "unlockWarning=${error.message ?: error.javaClass.simpleName}"
+        }
+        if (dpm.isDeviceOwnerApp(activity.packageName)) {
+            dpm.setStatusBarDisabled(admin, false)
+            dpm.setKeyguardDisabled(admin, false)
+            dpm.clearPackagePersistentPreferredActivities(admin, activity.packageName)
+            dpm.setLockTaskPackages(admin, emptyArray<String>())
+        }
+        lockTaskResult
     } catch (error: Throwable) {
         "unlockError=${error.message ?: error.javaClass.simpleName}"
     }

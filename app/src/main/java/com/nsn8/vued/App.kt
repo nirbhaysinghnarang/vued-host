@@ -23,6 +23,7 @@ class App : Application() {
         super.onCreate()
         DiagnosticsLogger.init(this)
         VuedAuth.init(this)
+        AmplitudeTracker.init(this)
         initSentry()
         bindSentryUserToAuth()
         val previousHandler = Thread.getDefaultUncaughtExceptionHandler()

@@ -2,6 +2,7 @@ package com.nsn8.vued.net
 
 import android.content.Context
 import android.util.Log
+import com.nsn8.vued.AmplitudeTracker
 import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.audio.RollingBuffer
 import org.json.JSONArray
@@ -158,6 +159,17 @@ object OutboundQueue {
                 "bytes" to dest.length(),
                 "pending" to load(context).length(),
             ))
+            AmplitudeTracker.track(
+                "audio_push_enqueued",
+                mapOf(
+                    "kind" to kind.name,
+                    "sliceId" to sliceId,
+                    "meetingId" to meetingId,
+                    "bytes" to dest.length(),
+                    "durationSecs" to durationSecs,
+                    "pending" to load(context).length(),
+                ),
+            )
         }
     }
 
@@ -243,6 +255,17 @@ object OutboundQueue {
         try {
             val durationSecs = item.getDouble("durationSecs")
             val sizeBytes = item.getLong("sizeBytes")
+            AmplitudeTracker.track(
+                "audio_push_started",
+                mapOf(
+                    "sliceId" to id,
+                    "kind" to kind.name,
+                    "meetingId" to item.optString("meetingId", ""),
+                    "bytes" to sizeBytes,
+                    "durationSecs" to durationSecs,
+                    "metadataDone" to item.optBoolean("metadataDone", false),
+                ),
+            )
             if (!item.optBoolean("metadataDone", false)) {
                 val roomId = item.optString("roomId", "").ifEmpty { null }
                 when (kind) {
@@ -265,8 +288,28 @@ object OutboundQueue {
             file.delete()
             remove(context, id)
             Log.i(TAG, "uploaded queued slice $id")
+            AmplitudeTracker.track(
+                "audio_push_succeeded",
+                mapOf(
+                    "sliceId" to id,
+                    "kind" to kind.name,
+                    "meetingId" to item.optString("meetingId", ""),
+                    "bytes" to sizeBytes,
+                    "durationSecs" to durationSecs,
+                    "pending" to size(context),
+                ),
+            )
         } catch (e: Exception) {
             Log.w(TAG, "slice $id still pending: ${e.message}")
+            AmplitudeTracker.track(
+                "audio_push_pending",
+                mapOf(
+                    "sliceId" to id,
+                    "kind" to kind.name,
+                    "meetingId" to item.optString("meetingId", ""),
+                    "message" to (e.message ?: e.javaClass.simpleName),
+                ),
+            )
             DiagnosticsLogger.warn("queue_audio_pending", mapOf(
                 "sliceId" to id,
                 "kind" to kind.name,
