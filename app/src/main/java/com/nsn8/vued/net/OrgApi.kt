@@ -89,7 +89,7 @@ object OrgApi {
     }
 
     private suspend fun postJson(path: String, body: JSONObject): JSONObject = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw VuedApi.ApiException("not signed in")
         val request = Request.Builder()
             .url(VuedConfig.ORG_API_BASE_URL + path)
             .header("Authorization", "Bearer $token")
@@ -107,7 +107,7 @@ object OrgApi {
     }
 
     private suspend fun putJson(path: String, body: JSONObject) = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw VuedApi.ApiException("not signed in")
         val request = Request.Builder()
             .url(VuedConfig.ORG_API_BASE_URL + path)
             .header("Authorization", "Bearer $token")
@@ -124,7 +124,7 @@ object OrgApi {
     }
 
     private suspend fun getArray(path: String): JSONArray = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw VuedApi.ApiException("not signed in")
         val request = Request.Builder()
             .url(VuedConfig.ORG_API_BASE_URL + path)
             .header("Authorization", "Bearer $token")

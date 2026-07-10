@@ -108,7 +108,7 @@ object VuedApi {
         durationSecs: Double,
         sizeBytes: Long,
     ) = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw ApiException("not signed in")
         val request = Request.Builder()
             .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/audio")
             .header("Authorization", "Bearer $token")
@@ -174,7 +174,7 @@ object VuedApi {
         durationSecs: Double? = null,
         isOrgUser: Boolean = false,
     ): SpeakerProfile = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw ApiException("not signed in")
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("display_name", displayName)
             .addFormDataPart("is_org_user", isOrgUser.toString())
@@ -264,7 +264,7 @@ object VuedApi {
         method: String,
         body: JSONObject? = null,
     ): JSONObject? = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw ApiException("not signed in")
         val builder = Request.Builder()
             .url(VuedConfig.API_BASE_URL + path)
             .header("Authorization", "Bearer $token")
