@@ -24,9 +24,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.nsn8.vued.auth.VuedAuth
 import kotlinx.coroutines.launch
@@ -52,13 +52,14 @@ fun LoginScreen(
             .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
             text = "Vued",
             style = MaterialTheme.typography.headlineMedium,
-            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center,
         )
         OutlinedTextField(
             value = email,
@@ -78,7 +79,13 @@ fun LoginScreen(
             modifier = Modifier.fillMaxWidth(),
         )
         error?.let {
-            Text(it, color = Color(0xFF9B1C1C), style = MaterialTheme.typography.bodySmall)
+            Text(
+                text = it,
+                color = Color(0xFF9B1C1C),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+            )
         }
         Button(
             onClick = {

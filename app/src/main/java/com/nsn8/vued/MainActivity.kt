@@ -128,8 +128,6 @@ import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
-private const val KIOSK_ESCAPE_TAPS_REQUIRED = 7
-private const val KIOSK_ESCAPE_TAP_WINDOW_MS = 8_000L
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -425,6 +423,7 @@ private fun AuthGate() {
     val loginConnectionButtons: @Composable () -> Unit = {
         WifiSettingsButton(
             status = loginWifiStatus,
+            labelOverride = "Set up Wi-Fi",
             onClick = {
                 openWifiSettings(context)
                 loginWifiStatus = currentWifiStatus(context)
@@ -933,8 +932,6 @@ private fun ProdRecorderMainScreen() {
     var updateBusy by remember { mutableStateOf(false) }
     var updateRunToken by remember { mutableStateOf(0) }
     var updateJob by remember { mutableStateOf<Job?>(null) }
-    var kioskEscapeTapCount by remember { mutableStateOf(0) }
-    var lastKioskEscapeTapMs by remember { mutableStateOf(0L) }
 
     DisposableEffect(Unit) {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)
@@ -1200,43 +1197,6 @@ private fun ProdRecorderMainScreen() {
                 .navigationBarsPadding()
                 .padding(bottom = 2.dp),
             onClick = {
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastKioskEscapeTapMs > KIOSK_ESCAPE_TAP_WINDOW_MS) {
-                    kioskEscapeTapCount = 0
-                }
-                lastKioskEscapeTapMs = now
-                kioskEscapeTapCount += 1
-
-                if (kioskEscapeTapCount == KIOSK_ESCAPE_TAPS_REQUIRED - 1) {
-                    updateJob?.cancel()
-                    updateJob = null
-                    AmplitudeTracker.track("self_update_cancelled_for_kiosk_escape", mapOf("tapCount" to kioskEscapeTapCount))
-                    updateRunToken += 1
-                    updateBusy = false
-                    updateDialogVisible = true
-                    updateTitle = "Unlock almost ready"
-                    updateMessage = "You're 1 step away from unlocking kiosk mode."
-                    DiagnosticsLogger.info(
-                        "kiosk_escape_hatch_warning",
-                        mapOf("tapCount" to kioskEscapeTapCount, "required" to KIOSK_ESCAPE_TAPS_REQUIRED),
-                    )
-                    return@SelfUpdateButton
-                }
-                if (kioskEscapeTapCount >= KIOSK_ESCAPE_TAPS_REQUIRED) {
-                    kioskEscapeTapCount = 0
-                    updateJob?.cancel()
-                    updateJob = null
-                    AmplitudeTracker.track("self_update_cancelled_for_kiosk_escape", mapOf("tapCount" to KIOSK_ESCAPE_TAPS_REQUIRED))
-                    updateRunToken += 1
-                    updateBusy = false
-                    (context as? MainActivity)?.markKioskManuallyEscaped()
-                    val result = (context as? Activity)?.let(::stopKiosk) ?: "unlockError=activityUnavailable"
-                    updateDialogVisible = true
-                    updateTitle = "Kiosk unlocked"
-                    updateMessage = "$result You can now leave the app from the tablet."
-                    DiagnosticsLogger.info("kiosk_escape_hatch_unlocked", mapOf("result" to result))
-                    return@SelfUpdateButton
-                }
                 if (updateBusy) {
                     return@SelfUpdateButton
                 }
@@ -1762,14 +1722,16 @@ private fun updateTitleForProgress(message: String): String = when {
 @Composable
 private fun WifiSettingsButton(
     status: WifiStatus,
+    labelOverride: String? = null,
     onClick: () -> Unit,
 ) {
     val color = if (status.connected) VuedSuccess else Color(0xFFB42318)
-    val label = when {
+    val statusLabel = when {
         status.ssid != null -> status.ssid
         status.connected -> "Wi-Fi"
         else -> "No Wi-Fi"
     }
+    val label = labelOverride ?: statusLabel
     OutlinedButton(
         onClick = onClick,
         shape = RoundedCornerShape(8.dp),
@@ -1777,9 +1739,9 @@ private fun WifiSettingsButton(
         modifier = Modifier
             .semantics {
                 contentDescription = if (status.connected) {
-                    "Wi-Fi connected: $label"
+                    "Wi-Fi connected: $statusLabel"
                 } else {
-                    "Wi-Fi disconnected"
+                    "$label, Wi-Fi disconnected"
                 }
             },
         colors = ButtonDefaults.outlinedButtonColors(
