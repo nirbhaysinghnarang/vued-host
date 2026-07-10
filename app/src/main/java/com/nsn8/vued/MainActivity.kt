@@ -1030,6 +1030,9 @@ private fun ProdRecorderMainScreen() {
             )
             BatteryStatusBadge(status = batteryStatus)
             AddSpeakerButton(onClick = { showEnroll = true })
+            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+                DebugExceptionButton()
+            }
         }
 
         BoxWithConstraints(
@@ -1107,6 +1110,29 @@ private fun ProdRecorderMainScreen() {
 
     if (showEnroll) {
         ProdSpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
+    }
+}
+
+@Composable
+private fun DebugExceptionButton() {
+    OutlinedButton(
+        onClick = {
+            throw IllegalStateException("Debug Sentry test exception from Vued host")
+        },
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, Color(0xFFF2B8B5)),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = Color(0xFFFFFBFA),
+            contentColor = Color(0xFFB42318),
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Text(
+            text = "Crash",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.sp,
+        )
     }
 }
 
