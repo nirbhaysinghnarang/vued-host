@@ -2,4 +2,6 @@
 <resources>
     <!-- miniDSP UMA-8 mic array (vendor 0x2752 = 10066) -->
     <usb-device vendor-id="10066" />
+    <!-- XMOS Xcore200 / MCHStreamer Lite used by UMA-16 v2 (vendor 0x20B1 = 8369) -->
+    <usb-device vendor-id="8369" />
 </resources>

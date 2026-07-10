@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -17,6 +18,7 @@ import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
@@ -45,7 +47,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -91,6 +92,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.auth.VuedAuth
@@ -116,6 +120,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
+private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -144,12 +149,50 @@ private val VuedSuccess = Color(0xFF16764F)
 private val VuedIdleRing = Color(0xFFE5EAF0)
 
 class MainActivity : ComponentActivity() {
+    private var pendingKioskAfterUsbPermission = false
+    private var lastUsbPermissionRequestKey: String? = null
+    private var lastUsbPermissionRequestMs: Long = 0
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    val attachedDevice = intent.usbDeviceExtra()
+                    logKioskUsbEvent(
+                        "kiosk_usb_attach_received",
+                        attachedDevice,
+                        mapOf("matchesUma" to attachedDevice.matchesUmaSafely()),
+                    )
+                    requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
+                }
+                ACTION_USB_PERMISSION -> {
+                    val device = intent.usbDeviceExtra()
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    logKioskUsbEvent(
+                        "kiosk_usb_permission_result",
+                        device,
+                        mapOf(
+                            "granted" to granted,
+                            "willRelock" to isDeviceOwner(this@MainActivity),
+                        ),
+                    )
+                    lastUsbPermissionRequestKey = null
+                    pendingKioskAfterUsbPermission = false
+                    if (isDeviceOwner(this@MainActivity)) {
+                        val result = startKiosk(this@MainActivity)
+                        logKioskUsbEvent("kiosk_usb_relock_after_permission", device, mapOf("result" to result))
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Keep the screen on during in-room operation so capture/upload remains
         // responsive while the recorder is foregrounded.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
+        hideStatusBar()
         setContent {
             VuedTheme(desktopTheme = HOST_UI_MODE == HostUiMode.PROD) {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -157,20 +200,183 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleUsbAttachIntent(intent, trigger = "activity_create_intent")
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUsbAttachIntent(intent, trigger = "activity_new_intent")
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(ACTION_USB_PERMISSION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(usbPermissionReceiver, filter)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unregisterReceiver(usbPermissionReceiver)
     }
 
     override fun onResume() {
         super.onResume()
+        hideStatusBar()
         if (isDeviceOwner(this)) {
-            Log.i(TAG, startKiosk(this))
+            logKioskUsbEvent("kiosk_resume_device_owner", data = mapOf("locked" to isKioskLocked(this)))
+            if (!requestUmaPermissionForKioskRecovery(trigger = "activity_resume")) {
+                val result = startKiosk(this)
+                logKioskUsbEvent("kiosk_resume_lock_started", data = mapOf("result" to result))
+            }
+        }
+    }
+
+    fun requestUmaPermissionForKioskRecovery(trigger: String = "manual"): Boolean {
+        val requested = requestUmaPermission(this, unlockKioskForDialog = true)
+        logKioskUsbEvent(
+            "kiosk_usb_permission_recovery_checked",
+            Uma8Capture(this).findDevice(),
+            mapOf(
+                "trigger" to trigger,
+                "requested" to requested,
+                "locked" to isKioskLocked(this),
+            ),
+        )
+        if (requested) {
+            pendingKioskAfterUsbPermission = true
+        }
+        return requested
+    }
+
+    private fun requestUmaPermission(context: Context, unlockKioskForDialog: Boolean): Boolean {
+        val usbManager = context.getSystemService(UsbManager::class.java)
+        val device = Uma8Capture(context).findDevice()
+        if (device == null) {
+            logKioskUsbEvent(
+                "kiosk_usb_permission_request_skipped",
+                data = mapOf("reason" to "no_uma_device", "unlockKioskForDialog" to unlockKioskForDialog),
+            )
+            return false
+        }
+        if (usbManager.hasPermission(device)) {
+            logKioskUsbEvent(
+                "kiosk_usb_permission_request_skipped",
+                device,
+                mapOf("reason" to "already_authorized", "unlockKioskForDialog" to unlockKioskForDialog),
+            )
+            return false
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val deviceKey = "${device.vendorId}:${device.productId}:${device.deviceName}"
+        if (
+            pendingKioskAfterUsbPermission &&
+            deviceKey == lastUsbPermissionRequestKey &&
+            now - lastUsbPermissionRequestMs < USB_PERMISSION_REQUEST_INTERVAL_MS
+        ) {
+            logKioskUsbEvent(
+                "kiosk_usb_permission_request_debounced",
+                device,
+                mapOf("elapsedMs" to (now - lastUsbPermissionRequestMs)),
+            )
+            return true
+        }
+        lastUsbPermissionRequestKey = deviceKey
+        lastUsbPermissionRequestMs = now
+
+        if (unlockKioskForDialog && context is Activity && isKioskLocked(context)) {
+            val result = stopKiosk(context)
+            logKioskUsbEvent("kiosk_usb_unlock_for_permission_dialog", device, mapOf("result" to result))
+        } else {
+            logKioskUsbEvent(
+                "kiosk_usb_unlock_not_needed_for_permission_dialog",
+                device,
+                mapOf(
+                    "unlockKioskForDialog" to unlockKioskForDialog,
+                    "locked" to (context as? Activity)?.let(::isKioskLocked),
+                ),
+            )
+        }
+
+        val intent = PendingIntent.getBroadcast(
+            context,
+            0,
+            Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
+            PendingIntent.FLAG_MUTABLE,
+        )
+        usbManager.requestPermission(device, intent)
+        logKioskUsbEvent("kiosk_usb_permission_requested", device)
+        return true
+    }
+
+    private fun handleUsbAttachIntent(intent: Intent?, trigger: String) {
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        val device = intent.usbDeviceExtra()
+        logKioskUsbEvent("kiosk_usb_attach_activity_intent", device, mapOf("trigger" to trigger))
+        requestUmaPermissionForKioskRecovery(trigger = trigger)
+    }
+
+    private fun logKioskUsbEvent(
+        event: String,
+        device: UsbDevice? = null,
+        data: Map<String, Any?> = emptyMap(),
+    ) {
+        val eventData = usbDeviceData(device) + data
+        Log.i(TAG, "$event $eventData")
+        DiagnosticsLogger.info(event, eventData)
+    }
+
+    private fun hideStatusBar() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.statusBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 }
 
+private fun Intent.usbDeviceExtra(): UsbDevice? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice
+    }
+
+private fun usbDeviceData(device: UsbDevice?): Map<String, Any?> =
+    if (device == null) {
+        mapOf("devicePresent" to false)
+    } else {
+        mapOf(
+            "devicePresent" to true,
+            "vendorId" to device.vendorId,
+            "productId" to device.productId,
+            "deviceName" to device.deviceName,
+            "productName" to runCatching { device.productName }.getOrNull(),
+            "manufacturerName" to runCatching { device.manufacturerName }.getOrNull(),
+            "matchesUma" to device.matchesUmaSafely(),
+        )
+    }
+
+private fun UsbDevice?.matchesUmaSafely(): Boolean =
+    this?.let { runCatching { Uma8Capture.isMicArrayDevice(it) }.getOrDefault(false) } ?: false
+
 @Composable
 private fun AuthGate() {
+    val context = LocalContext.current
     val status by VuedAuth.sessionStatus.collectAsState()
     val scope = rememberCoroutineScope()
+    var loginWifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
     when (status) {
         is SessionStatus.Authenticated -> {
             when (HOST_UI_MODE) {
@@ -183,9 +389,30 @@ private fun AuthGate() {
                 }
             }
         }
-        is SessionStatus.RefreshFailure -> LoginScreen(initialError = "Session expired, sign in again")
+        is SessionStatus.RefreshFailure -> LoginScreen(
+            initialError = "Session expired, sign in again",
+            wifiSettingsButton = {
+                WifiSettingsButton(
+                    status = loginWifiStatus,
+                    onClick = {
+                        openWifiSettings(context)
+                        loginWifiStatus = currentWifiStatus(context)
+                    },
+                )
+            },
+        )
         SessionStatus.Initializing -> LoadingScreen()
-        is SessionStatus.NotAuthenticated -> LoginScreen()
+        is SessionStatus.NotAuthenticated -> LoginScreen(
+            wifiSettingsButton = {
+                WifiSettingsButton(
+                    status = loginWifiStatus,
+                    onClick = {
+                        openWifiSettings(context)
+                        loginWifiStatus = currentWifiStatus(context)
+                    },
+                )
+            },
+        )
     }
 }
 
@@ -246,7 +473,6 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .statusBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 32.dp, vertical = 24.dp),
@@ -456,7 +682,6 @@ private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .statusBarsPadding()
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
@@ -767,7 +992,6 @@ private fun ProdRecorderMainScreen() {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .statusBarsPadding()
             .padding(horizontal = 36.dp, vertical = 20.dp),
     ) {
         if (roomName.isNotBlank()) {
@@ -797,15 +1021,13 @@ private fun ProdRecorderMainScreen() {
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
-                WifiSettingsButton(
-                    status = wifiStatus,
-                    onClick = {
-                        openWifiSettings(context)
-                        wifiStatus = currentWifiStatus(context)
-                    },
-                )
-            }
+            WifiSettingsButton(
+                status = wifiStatus,
+                onClick = {
+                    openWifiSettings(context)
+                    wifiStatus = currentWifiStatus(context)
+                },
+            )
             BatteryStatusBadge(status = batteryStatus)
             AddSpeakerButton(onClick = { showEnroll = true })
         }
@@ -1265,7 +1487,6 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .statusBarsPadding()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -1513,9 +1734,14 @@ private fun MicArraySelection.uiLabel(): String = when (this) {
 }
 
 private fun requestUma8Permission(context: Context) {
+    if (context is MainActivity && context.requestUmaPermissionForKioskRecovery()) return
+
     val usbManager = context.getSystemService(UsbManager::class.java)
     val device = Uma8Capture(context).findDevice() ?: return
     if (usbManager.hasPermission(device)) return
+    if (context is Activity && isKioskLocked(context)) {
+        stopKiosk(context)
+    }
     val intent = PendingIntent.getBroadcast(
         context,
         0,

@@ -6,7 +6,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -36,7 +36,10 @@ import kotlinx.coroutines.launch
  * swaps this screen for the recorder — no explicit navigation needed.
  */
 @Composable
-fun LoginScreen(initialError: String? = null) {
+fun LoginScreen(
+    initialError: String? = null,
+    wifiSettingsButton: (@Composable () -> Unit)? = null,
+) {
     val scope = rememberCoroutineScope()
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
@@ -46,7 +49,6 @@ fun LoginScreen(initialError: String? = null) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .statusBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 20.dp),
@@ -100,6 +102,14 @@ fun LoginScreen(initialError: String? = null) {
                 Text("Signing in…")
             } else {
                 Text("Sign in")
+            }
+        }
+        wifiSettingsButton?.let { button ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Start,
+            ) {
+                button()
             }
         }
     }
