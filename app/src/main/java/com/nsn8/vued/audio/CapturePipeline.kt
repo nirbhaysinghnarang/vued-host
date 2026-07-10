@@ -1,5 +1,7 @@
 package com.nsn8.vued.audio
 
+import com.nsn8.vued.capture.PROFILE_UMA16
+import com.nsn8.vued.capture.PROFILE_UMA8
 import com.nsn8.vued.capture.Uma8Capture
 import java.io.File
 import kotlin.math.abs
@@ -32,7 +34,8 @@ class CapturePipeline(
     /** The live rolling buffer, so the meeting flow can flush + export windows. */
     val rollingBuffer: RollingBuffer get() = rolling
 
-    /** Optional UMA-16 source WAV buffer. Null for UMA-8 and Android mic capture. */
+    /** Optional mic-array source WAV buffer. Null for Android mic capture and
+     *  unsupported channel counts. */
     val sourceRollingBuffer: MultiChannelWavRollingBuffer? get() = sourceRolling
 
     /** Peak amplitude (0..1) of the most recently processed 16 kHz block. */
@@ -112,9 +115,15 @@ class CapturePipeline(
     }
 
     private fun configureSourceRolling(channels: Int) {
-        val shouldRecordSource = channels == MultiChannelWavRollingBuffer.CHANNELS_UMA16 &&
+        val shouldRecordSource = channels in SUPPORTED_SOURCE_CHANNELS &&
             sourceSegmentsDir != null
         if (shouldRecordSource) {
+            // A UMA-16 <-> UMA-8 hot-swap changes the channel count; the old
+            // buffer's segments stay on disk for their own upload item.
+            val existing = sourceRolling
+            if (existing != null && existing.channels != channels) {
+                closeSourceRolling()
+            }
             if (sourceRolling == null) {
                 sourceRolling = createSourceRolling(channels)
             }
@@ -125,8 +134,8 @@ class CapturePipeline(
 
     private fun createSourceRolling(channels: Int): MultiChannelWavRollingBuffer? {
         val directory = sourceSegmentsDir ?: return null
-        if (channels != MultiChannelWavRollingBuffer.CHANNELS_UMA16) return null
-        return MultiChannelWavRollingBuffer(directory)
+        if (channels !in SUPPORTED_SOURCE_CHANNELS) return null
+        return MultiChannelWavRollingBuffer(directory, channels = channels)
     }
 
     private fun closeSourceRolling() {
@@ -140,5 +149,9 @@ class CapturePipeline(
 
     companion object {
         private const val SOURCE_WRITE_ACTIVE_WINDOW_MS = 2_000L
+
+        /** Mic-array channel counts eligible for source-WAV (GSS) recording.
+         *  Keep in sync with ALLOWED_SOURCE_CHANNELS on the server and Modal. */
+        val SUPPORTED_SOURCE_CHANNELS = setOf(PROFILE_UMA8.outChannels, PROFILE_UMA16.outChannels)
     }
 }

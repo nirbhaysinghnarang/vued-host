@@ -23,7 +23,7 @@ class SourceWavStreamPlanTest {
     @Test
     fun planMatchesWholeFileExportApartFromPatchedSizes() {
         val dir = threeSegments()
-        val segments = MultiChannelWavRollingBuffer.listSegmentsIn(dir)
+        val segments = MultiChannelWavRollingBuffer.listSegmentsIn(dir, channels = 16)
         val startMs = 1_500L
         val endMs = 2_500L
 
@@ -51,7 +51,7 @@ class SourceWavStreamPlanTest {
     @Test
     fun liveStreamPrefixMatchesEndedFilePrefix() {
         val dir = threeSegments()
-        val segments = MultiChannelWavRollingBuffer.listSegmentsIn(dir)
+        val segments = MultiChannelWavRollingBuffer.listSegmentsIn(dir, channels = 16)
         val startMs = 1_000L
         val endMs = 3_500L  // ends partway through the 3rd segment
 
@@ -75,7 +75,7 @@ class SourceWavStreamPlanTest {
     fun readRangeSpansHeaderAndSegmentBoundaries() {
         val dir = threeSegments()
         val segments = WavSegmentExporter.overlappingSegments(
-            MultiChannelWavRollingBuffer.listSegmentsIn(dir), 1_000L, 3_500L,
+            MultiChannelWavRollingBuffer.listSegmentsIn(dir, channels = 16), 1_000L, 3_500L,
         )
         val plan = SourceWavStreamPlan.build(segments, 1_000L, 3_500L)
         val whole = plan.readRange(0, plan.totalBytes.toInt())
@@ -92,21 +92,34 @@ class SourceWavStreamPlanTest {
         assertArrayEquals(whole, reassembled)
     }
 
-    /** Three finalized 1-second, 16ch/16kHz segments starting at 1000/2000/3000 ms. */
-    private fun threeSegments(): File {
+    @Test
+    fun uma8SegmentsProduceSevenChannelHeader() {
+        val dir = threeSegments(channels = 7)
+        val segments = MultiChannelWavRollingBuffer.listSegmentsIn(dir, channels = 7)
+        assertEquals(3, segments.size)
+        val plan = SourceWavStreamPlan.build(segments, 1_000L, 3_500L)
+        val header = plan.readRange(0, headerBytes)
+        // fmt chunk channel count lives at byte offset 22 (LE u16).
+        val channels = (header[22].toInt() and 0xff) or ((header[23].toInt() and 0xff) shl 8)
+        assertEquals(7, channels)
+    }
+
+    /** Three finalized 1-second 16kHz segments starting at 1000/2000/3000 ms. */
+    private fun threeSegments(channels: Int = 16): File {
         val dir = tempDir()
         var nowMs = 1_000L
         val buffer = MultiChannelWavRollingBuffer(
             directory = dir,
+            channels = channels,
             segmentSeconds = 1,
             clockMs = { nowMs },
         )
         val frame = 16_000
-        buffer.appendInterleavedPcm16(ShortArray(frame * 16) { 1 }, frames = frame)
+        buffer.appendInterleavedPcm16(ShortArray(frame * channels) { 1 }, frames = frame)
         nowMs = 2_000L
-        buffer.appendInterleavedPcm16(ShortArray(frame * 16) { 2 }, frames = frame)
+        buffer.appendInterleavedPcm16(ShortArray(frame * channels) { 2 }, frames = frame)
         nowMs = 3_000L
-        buffer.appendInterleavedPcm16(ShortArray(frame * 16) { 3 }, frames = frame)
+        buffer.appendInterleavedPcm16(ShortArray(frame * channels) { 3 }, frames = frame)
         buffer.flush()
         return dir
     }

@@ -286,6 +286,7 @@ class OutboundQueueStressTest {
                 endedAtSec = startedAtSec + 300.0,
                 durationSecs = 300.0,
                 monoSizeBytes = 1L,
+                channels = 16,
                 source = wav,
             )
             requireNotNull(enqueued) { "Ambient source wav was dropped by the backlog cap" }

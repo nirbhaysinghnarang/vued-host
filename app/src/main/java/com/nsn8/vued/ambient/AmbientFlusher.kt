@@ -137,7 +137,7 @@ object AmbientFlusher {
         OutboundQueue.enqueueAmbient(context, sliceId, sessionId, windowStart / 1000.0, windowEnd / 1000.0, durationSecs, out)
         lastFlushMs = windowEnd
         lastUploadMs = windowEnd
-        // 16-ch source sidecar for the same window/slice; never allowed to
+        // Mic-array source sidecar for the same window/slice; never allowed to
         // break the canonical ambient flush.
         val sidecarOutcome = runCatching {
             enqueueSourceSidecar(context, sliceId, windowStart, windowEnd, durationSecs, monoSizeBytes)
@@ -150,10 +150,10 @@ object AmbientFlusher {
         // bytes are durably enqueued — or the skip decision is final — the raw
         // uma16 segments it covers are dead weight (~1.8GB/hour if retained).
         if (sidecarOutcome?.windowConsumed == true) {
-            sourceBufferProvider()?.directory?.let { sourceDir ->
+            sourceBufferProvider()?.let { sourceBuffer ->
                 runCatching {
                     val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(
-                        sourceDir, windowStart, windowEnd,
+                        sourceBuffer.directory, windowStart, windowEnd, channels = sourceBuffer.channels,
                     )
                     if (deleted > 0) {
                         DiagnosticsLogger.info("ambient_source_segments_deleted", mapOf(
@@ -200,9 +200,9 @@ object AmbientFlusher {
     }
 
     /**
-     * Exports the window from the 16-ch source buffer and enqueues it as a
+     * Exports the window from the mic-array source buffer and enqueues it as a
      * sidecar on the same slice as the mono item. Skipped when disabled, when
-     * no UMA-16 buffer exists, or when the window never rose above the silence
+     * no mic-array buffer exists, or when the window never rose above the silence
      * gate (the peak accumulator is read unconditionally so it resets per window).
      */
     private fun enqueueSourceSidecar(
@@ -232,7 +232,11 @@ object AmbientFlusher {
         val codec = if (compress) "wavpack" else "pcm"
         val out = File(
             context.cacheDir,
-            if (compress) "ambient_${windowEnd}_16ch_16k.wv" else "ambient_${windowEnd}_16ch_16k.wav",
+            if (compress) {
+                "ambient_${windowEnd}_${source.channels}ch_16k.wv"
+            } else {
+                "ambient_${windowEnd}_${source.channels}ch_16k.wav"
+            },
         )
         val export = if (compress) {
             WavSegmentExporter.exportWindowWv(
@@ -269,6 +273,7 @@ object AmbientFlusher {
             endedAtSec = windowEnd / 1000.0,
             durationSecs = durationSecs,
             monoSizeBytes = monoSizeBytes,
+            channels = source.channels,
             source = out,
             codec = codec,
         )

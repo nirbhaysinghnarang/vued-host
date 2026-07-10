@@ -3,14 +3,14 @@ package com.nsn8.vued.audio
 import java.io.File
 
 /**
- * Disk-backed rolling WAV buffer for UMA-16 source audio.
+ * Disk-backed rolling WAV buffer for mic-array (UMA-8/UMA-16) source audio.
  *
  * Accepts 48 kHz interleaved int32 PCM from the UMA native reader and stores
  * 16 kHz interleaved PCM16 WAV segments.
  */
 class MultiChannelWavRollingBuffer(
     val directory: File,
-    private val channels: Int = CHANNELS_UMA16,
+    val channels: Int,
     private val sampleRate: Int = SAMPLE_RATE_16K,
     private val segmentSeconds: Int = DEFAULT_SEGMENT_SECONDS,
     private val retentionSeconds: Long = 72 * 60 * 60,
@@ -122,6 +122,7 @@ class MultiChannelWavRollingBuffer(
     }
 
     companion object {
+        const val CHANNELS_UMA8 = 7
         const val CHANNELS_UMA16 = 16
         const val SAMPLE_RATE_16K = 16_000
         const val DEFAULT_SEGMENT_SECONDS = 30
@@ -137,7 +138,7 @@ class MultiChannelWavRollingBuffer(
         fun listSegmentsIn(
             directory: File,
             sampleRate: Int = SAMPLE_RATE_16K,
-            channels: Int = CHANNELS_UMA16,
+            channels: Int,
             segmentSeconds: Int = DEFAULT_SEGMENT_SECONDS,
         ): List<Segment> =
             directory.listFiles { file -> file.name.endsWith(".wav") }
@@ -158,7 +159,7 @@ class MultiChannelWavRollingBuffer(
             startMs: Long,
             endMs: Long,
             sampleRate: Int = SAMPLE_RATE_16K,
-            channels: Int = CHANNELS_UMA16,
+            channels: Int,
             segmentSeconds: Int = DEFAULT_SEGMENT_SECONDS,
         ): Int {
             var deleted = 0
@@ -177,7 +178,7 @@ class MultiChannelWavRollingBuffer(
         fun segmentFor(
             file: File,
             sampleRate: Int = SAMPLE_RATE_16K,
-            channels: Int = CHANNELS_UMA16,
+            channels: Int,
             segmentSeconds: Int = DEFAULT_SEGMENT_SECONDS,
         ): Segment? {
             val startMs = (file.nameWithoutExtension.toLongOrNull() ?: return null) * 1000

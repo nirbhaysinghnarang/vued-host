@@ -19,6 +19,7 @@ class RollingBufferRetentionTest {
 
     private fun buffer(dir: File, clock: () -> Long) = MultiChannelWavRollingBuffer(
         directory = dir,
+        channels = 16,
         segmentSeconds = 1,
         clockMs = clock,
     )
@@ -35,7 +36,7 @@ class RollingBufferRetentionTest {
         buffer.appendInterleavedPcm16(oneSecond, frames = 16_000) // [3000, 4000)
         buffer.flush()
 
-        val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 2_000L, 3_000L)
+        val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 2_000L, 3_000L, channels = 16)
 
         assertEquals(1, deleted)
         assertTrue(File(dir, "1.wav").exists()) // straddles the start bound
@@ -53,9 +54,9 @@ class RollingBufferRetentionTest {
         buffer.appendInterleavedPcm16(ShortArray(24_000 * 16) { 7 }, frames = 24_000)
         buffer.flush()
 
-        assertEquals(0, MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 1_000L, 2_000L))
+        assertEquals(0, MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 1_000L, 2_000L, channels = 16))
         assertTrue(File(dir, "1.wav").exists())
-        assertEquals(1, MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 1_000L, 2_500L))
+        assertEquals(1, MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 1_000L, 2_500L, channels = 16))
         assertFalse(File(dir, "1.wav").exists())
     }
 
@@ -69,14 +70,14 @@ class RollingBufferRetentionTest {
         buffer.appendInterleavedPcm16(ShortArray(8_000 * 16) { 3 }, frames = 8_000)
 
         val deletedWhileOpen =
-            MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 0L, 10_000L)
+            MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 0L, 10_000L, channels = 16)
 
         assertEquals(0, deletedWhileOpen)
         assertTrue(File(dir, "1.wav").exists())
 
         buffer.flush() // header patched; the same window now covers it
 
-        assertEquals(1, MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 0L, 10_000L))
+        assertEquals(1, MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 0L, 10_000L, channels = 16))
         assertFalse(File(dir, "1.wav").exists())
     }
 
@@ -88,7 +89,7 @@ class RollingBufferRetentionTest {
         writer.writeInterleaved(ShortArray(16_000) { 9 }, frames = 16_000)
         writer.finish()
 
-        val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 0L, 60_000L)
+        val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(dir, 0L, 60_000L, channels = 16)
 
         assertEquals(0, deleted)
         assertTrue(monoFile.exists())
@@ -101,6 +102,7 @@ class RollingBufferRetentionTest {
         fun wavCount() = dir.listFiles { f -> f.name.endsWith(".wav") }?.size ?: 0
         val buffer = MultiChannelWavRollingBuffer(
             directory = dir,
+            channels = 16,
             segmentSeconds = 1,
             clockMs = { nowMs },
             freeSpaceFloorBytes = 1L,

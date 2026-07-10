@@ -152,6 +152,7 @@ object OutboundQueue {
         endedAtSec: Double,
         durationSecs: Double,
         monoSizeBytes: Long,
+        channels: Int,
         source: File,
     ): File =
         synchronized(lock) {
@@ -174,7 +175,7 @@ object OutboundQueue {
                         .put("durationSecs", durationSecs)
                         .put("monoSizeBytes", monoSizeBytes)
                         .put("sourceSizeBytes", dest.length())
-                        .put("sourceChannels", SOURCE_WAV_CHANNELS)
+                        .put("sourceChannels", channels)
                         .put("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ)
                         .put("metadataDone", false)
                         .putOpt("roomId", RoomConfig.roomId(context)),
@@ -198,6 +199,7 @@ object OutboundQueue {
         endedAtSec: Double,
         durationSecs: Double,
         monoSizeBytes: Long,
+        channels: Int,
         source: File,
         codec: String = "pcm",
     ): File? =
@@ -237,7 +239,7 @@ object OutboundQueue {
                         .put("durationSecs", durationSecs)
                         .put("monoSizeBytes", monoSizeBytes)
                         .put("sourceSizeBytes", dest.length())
-                        .put("sourceChannels", SOURCE_WAV_CHANNELS)
+                        .put("sourceChannels", channels)
                         .put("sourceSampleRateHz", SOURCE_WAV_SAMPLE_RATE_HZ)
                         .put("codec", codec)
                         .put("metadataDone", false)
@@ -268,7 +270,7 @@ object OutboundQueue {
         meetingId: String,
         startedAtSec: Double,
         segmentsDir: String,
-        channels: Int = SOURCE_WAV_CHANNELS,
+        channels: Int,
         sampleRateHz: Int = SOURCE_WAV_SAMPLE_RATE_HZ,
         codec: String = "pcm",
     ) = synchronized(lock) {
@@ -741,7 +743,7 @@ object OutboundQueue {
             val selected = if (ended) overlapping else overlapping.dropLast(1)
             if (ended && selected.isEmpty()) {
                 // The meeting window contains no source audio at all (e.g. a
-                // false-start stop, or the rolling buffer never produced UMA-16
+                // false-start stop, or the rolling buffer never produced mic-array
                 // segments). The server will only ever reject the empty payload,
                 // so retrying poisons the queue forever — abandon instead.
                 remove(context, itemId)
@@ -806,7 +808,7 @@ object OutboundQueue {
                 // the age/floor prunes.
                 runCatching {
                     val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(
-                        segmentsDir, startMs, requireNotNull(endMs),
+                        segmentsDir, startMs, requireNotNull(endMs), channels = channels,
                     )
                     if (deleted > 0) {
                         DiagnosticsLogger.info("queue_source_wav_segments_deleted", mapOf(
@@ -856,14 +858,15 @@ object OutboundQueue {
         RollingBuffer.deleteSegmentsCoveredBy(segmentsDir, startMs, endMs)
     }
 
-    /** uma16 counterpart of [deleteUploadedSourceSegments] for the
+    /** Mic-array counterpart of [deleteUploadedSourceSegments] for the
      *  non-streaming meeting source upload (self-contained outbound copy). */
     private fun deleteUploadedUma16Segments(context: Context, item: JSONObject) {
-        val dir = context.getExternalFilesDir(null)?.let { File(it, "uma16_segments") } ?: return
+        val dir = context.getExternalFilesDir(null)?.let { File(it, SOURCE_SEGMENTS_DIR_NAME) } ?: return
         val deleted = MultiChannelWavRollingBuffer.deleteSegmentsCoveredBy(
             dir,
             (item.getDouble("startedAtSec") * 1000).toLong(),
             (item.getDouble("endedAtSec") * 1000).toLong(),
+            channels = item.optInt("sourceChannels", SOURCE_WAV_CHANNELS),
         )
         if (deleted > 0) {
             DiagnosticsLogger.info("queue_source_wav_segments_deleted", mapOf(
@@ -903,6 +906,13 @@ object OutboundQueue {
     private fun wvBlobDir(context: Context, sliceId: String): File =
         File(context.filesDir, "wv_blobs/$sliceId")
 
+    /** On-device mic-array segment dir. Historical name — kept for UMA-8 too,
+     *  since persisted queue items reference it by absolute path. */
+    const val SOURCE_SEGMENTS_DIR_NAME = "uma16_segments"
+
+    /** Fallback channel count for queue items persisted by pre-UMA-8 builds,
+     *  which only ever recorded 16-channel source WAVs. Not a default for new
+     *  items — enqueue callers must pass the buffer's real channel count. */
     private const val SOURCE_WAV_CHANNELS = 16
     private const val SOURCE_WAV_SAMPLE_RATE_HZ = 16_000
     // Longer than any plausible single meeting, so a still-recording meeting is

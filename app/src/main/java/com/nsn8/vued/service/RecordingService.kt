@@ -22,7 +22,6 @@ import com.nsn8.vued.audio.CapturePipeline
 import com.nsn8.vued.capture.AndroidMicCapture
 import com.nsn8.vued.capture.MicArrayProfile
 import com.nsn8.vued.capture.MicArrayConfig
-import com.nsn8.vued.capture.PROFILE_UMA8
 import com.nsn8.vued.capture.Uma8Capture
 import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.OutboundQueue
@@ -75,14 +74,18 @@ class RecordingService : Service() {
 
     private fun captureLoop() {
         val segmentsDir = File(getExternalFilesDir(null), "segments")
-        val sourceSegmentsDir = File(getExternalFilesDir(null), "uma16_segments")
+        val sourceSegmentsDir = File(getExternalFilesDir(null), OutboundQueue.SOURCE_SEGMENTS_DIR_NAME)
         // Manual selection overrides auto-detect. Keep a single rolling buffer alive
         // while the physical capture source changes underneath it.
         val override = MicArrayConfig.selection(this).toProfile()
         val capture = Uma8Capture(this, override)
         val allowBuiltInMicFallback = VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK
-        val profile = readyUmaProfile(capture) ?: override ?: PROFILE_UMA8
-        val pipeline = CapturePipeline(segmentsDir, profile.outChannels, sourceSegmentsDir)
+        // Size the pipeline from the array that is actually present; 0 means no
+        // array yet, so no source buffer is pre-created on the Android-mic
+        // fallback path. configureInputChannels() below supplies the real
+        // channel count once a UMA device streams.
+        val initialChannels = readyUmaProfile(capture)?.outChannels ?: 0
+        val pipeline = CapturePipeline(segmentsDir, initialChannels, sourceSegmentsDir)
         MeetingController.attach(pipeline.rollingBuffer) { pipeline.sourceRollingBuffer }
         AmbientFlusher.attach(
             pipeline.rollingBuffer,

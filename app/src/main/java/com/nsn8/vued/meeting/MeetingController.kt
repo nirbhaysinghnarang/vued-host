@@ -277,7 +277,7 @@ object MeetingController {
             finalizeStreamingSourceWav(context, meeting)
             null
         } else {
-            exportSourceMeeting(context, meeting)?.let { sourcePath ->
+            exportSourceMeeting(context, meeting)?.let { export ->
                 OutboundQueue.enqueueMeetingSourceWav(
                     context = context,
                     sliceId = sliceId,
@@ -287,7 +287,8 @@ object MeetingController {
                     endedAtSec = meeting.endMs / 1000.0,
                     durationSecs = durationSecs,
                     monoSizeBytes = sizeBytes,
-                    source = File(sourcePath),
+                    channels = export.channels,
+                    source = File(export.path),
                 ).absolutePath
             }
         }
@@ -316,6 +317,7 @@ object MeetingController {
             meetingId = meetingId,
             startedAtSec = startMs / 1000.0,
             segmentsDir = buffer.directory.absolutePath,
+            channels = buffer.channels,
             codec = VuedConfig.SOURCE_WAV_CODEC,
         )
         buffer.onSegmentClosed = { _, _ -> onSourceSegmentClosed() }
@@ -356,7 +358,9 @@ object MeetingController {
         return true
     }
 
-    private fun exportSourceMeeting(context: Context, meeting: ClosedMeeting): String? {
+    private data class SourceExport(val path: String, val channels: Int)
+
+    private fun exportSourceMeeting(context: Context, meeting: ClosedMeeting): SourceExport? {
         val source = sourceRollingProvider() ?: return null
         return runCatching {
             val flushStartMs = SystemClock.elapsedRealtime()
@@ -372,7 +376,7 @@ object MeetingController {
                 context.getExternalFilesDir(null) ?: context.filesDir,
                 "uma16_meetings",
             ).apply { mkdirs() }
-            val out = File(directory, "meeting_${meeting.meetingId}_16ch_16k.wav")
+            val out = File(directory, "meeting_${meeting.meetingId}_${source.channels}ch_16k.wav")
             val exportStartMs = SystemClock.elapsedRealtime()
             val export = WavSegmentExporter.exportWindow(segments, meeting.startMs, meeting.endMs, out)
                 ?: return@runCatching null
@@ -390,7 +394,7 @@ object MeetingController {
                 "path" to out.absolutePath,
                 "elapsedMs" to (SystemClock.elapsedRealtime() - exportStartMs),
             ))
-            out.absolutePath
+            SourceExport(out.absolutePath, source.channels)
         }.onFailure { error ->
             Log.w(TAG, "source wav export failed meeting=${meeting.meetingId}: ${error.message}", error)
             DiagnosticsLogger.warn(

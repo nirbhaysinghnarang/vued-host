@@ -67,6 +67,7 @@ class MultiChannelWavRecordingTest {
         var nowMs = 1_000L
         val buffer = MultiChannelWavRollingBuffer(
             directory = dir,
+            channels = 16,
             segmentSeconds = 1,
             clockMs = { nowMs },
         )
@@ -87,11 +88,40 @@ class MultiChannelWavRecordingTest {
     }
 
     @Test
+    fun rollingBufferRecordsUma8SevenChannelSegments() {
+        val channels = MultiChannelWavRollingBuffer.CHANNELS_UMA8
+        val dir = tempDir()
+        var nowMs = 1_000L
+        val buffer = MultiChannelWavRollingBuffer(
+            directory = dir,
+            channels = channels,
+            segmentSeconds = 1,
+            clockMs = { nowMs },
+        )
+        val oneSecond = ShortArray(16_000 * channels) { 100 }
+
+        buffer.appendInterleavedPcm16(oneSecond, frames = 16_000)
+        nowMs = 2_000L
+        buffer.appendInterleavedPcm16(oneSecond, frames = 16_000)
+        buffer.flush()
+
+        val segments = buffer.listSegments()
+        assertEquals(2, segments.size)
+        assertEquals(16_000L, segments[0].frameCount)
+        val info = checkNotNull(Pcm16WavSegmentWriter.readInfo(File(dir, "1.wav")))
+        assertEquals(channels, info.channels)
+        // segmentFor filters by channel count: the same dir lists nothing at 16.
+        assertTrue(MultiChannelWavRollingBuffer.listSegmentsIn(dir, channels = 16).isEmpty())
+        assertEquals(2, MultiChannelWavRollingBuffer.listSegmentsIn(dir, channels = channels).size)
+    }
+
+    @Test
     fun wavExporterStitchesAndTrimsMeetingWindow() {
         val dir = tempDir()
         var nowMs = 1_000L
         val buffer = MultiChannelWavRollingBuffer(
             directory = dir,
+            channels = 16,
             segmentSeconds = 1,
             clockMs = { nowMs },
         )
