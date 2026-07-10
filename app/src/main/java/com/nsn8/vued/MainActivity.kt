@@ -138,6 +138,12 @@ private data class BatteryStatus(
     val powerSource: String?,
 )
 
+private data class MicConnectionUi(
+    val label: String,
+    val color: Color,
+    val contentDescription: String,
+)
+
 private val VuedBackground = Color(0xFFFFFFFF)
 private val VuedSurface = Color(0xFFF8F9FB)
 private val VuedSurfaceRaised = Color(0xFFFFFFFF)
@@ -157,6 +163,7 @@ class MainActivity : ComponentActivity() {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val attachedDevice = intent.usbDeviceExtra()
+                    dismissMicDisconnectedIfUmaDetected(attachedDevice, trigger = "usb_attached")
                     logKioskUsbEvent(
                         "kiosk_usb_attach_received",
                         attachedDevice,
@@ -267,6 +274,7 @@ class MainActivity : ComponentActivity() {
             )
             return false
         }
+        dismissMicDisconnectedIfUmaDetected(device, trigger = "usb_device_list")
         if (usbManager.hasPermission(device)) {
             logKioskUsbEvent(
                 "kiosk_usb_permission_request_skipped",
@@ -321,6 +329,7 @@ class MainActivity : ComponentActivity() {
     private fun handleUsbAttachIntent(intent: Intent?, trigger: String) {
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
         val device = intent.usbDeviceExtra()
+        dismissMicDisconnectedIfUmaDetected(device, trigger = trigger)
         logKioskUsbEvent("kiosk_usb_attach_activity_intent", device, mapOf("trigger" to trigger))
         requestUmaPermissionForKioskRecovery(trigger = trigger)
     }
@@ -333,6 +342,20 @@ class MainActivity : ComponentActivity() {
         val eventData = usbDeviceData(device) + data
         Log.i(TAG, "$event $eventData")
         DiagnosticsLogger.info(event, eventData)
+    }
+
+    private fun dismissMicDisconnectedIfUmaDetected(device: UsbDevice?, trigger: String) {
+        if (!device.matchesUmaSafely()) return
+        if (!RecorderState.state.value.micDisconnected) return
+
+        RecorderState.update {
+            it.copy(
+                captureReady = false,
+                micDisconnected = false,
+                error = null,
+            )
+        }
+        logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", device, mapOf("trigger" to trigger))
     }
 
     private fun hideStatusBar() {
@@ -374,10 +397,21 @@ private fun UsbDevice?.matchesUmaSafely(): Boolean =
 @Composable
 private fun AuthGate() {
     val context = LocalContext.current
-    val status by VuedAuth.sessionStatus.collectAsState()
+    val authStatus by VuedAuth.sessionStatus.collectAsState()
     val scope = rememberCoroutineScope()
     var loginWifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
-    when (status) {
+
+    val loginConnectionButtons: @Composable () -> Unit = {
+        WifiSettingsButton(
+            status = loginWifiStatus,
+            onClick = {
+                openWifiSettings(context)
+                loginWifiStatus = currentWifiStatus(context)
+            },
+        )
+    }
+
+    when (authStatus) {
         is SessionStatus.Authenticated -> {
             when (HOST_UI_MODE) {
                 HostUiMode.PROD -> ProdRecorderScreen()
@@ -391,27 +425,11 @@ private fun AuthGate() {
         }
         is SessionStatus.RefreshFailure -> LoginScreen(
             initialError = "Session expired, sign in again",
-            wifiSettingsButton = {
-                WifiSettingsButton(
-                    status = loginWifiStatus,
-                    onClick = {
-                        openWifiSettings(context)
-                        loginWifiStatus = currentWifiStatus(context)
-                    },
-                )
-            },
+            wifiSettingsButton = loginConnectionButtons,
         )
         SessionStatus.Initializing -> LoadingScreen()
         is SessionStatus.NotAuthenticated -> LoginScreen(
-            wifiSettingsButton = {
-                WifiSettingsButton(
-                    status = loginWifiStatus,
-                    onClick = {
-                        openWifiSettings(context)
-                        loginWifiStatus = currentWifiStatus(context)
-                    },
-                )
-            },
+            wifiSettingsButton = loginConnectionButtons,
         )
     }
 }
@@ -886,6 +904,7 @@ private fun ProdRecorderMainScreen() {
     var showEnroll by remember { mutableStateOf(false) }
     var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
     var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
+    var micArrayPresent by remember { mutableStateOf(isUmaMicPresent(context)) }
     var currentTime by remember { mutableStateOf(formatCurrentTime()) }
 
     DisposableEffect(Unit) {
@@ -926,6 +945,26 @@ private fun ProdRecorderMainScreen() {
         onDispose { context.unregisterReceiver(receiver) }
     }
 
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                micArrayPresent = isUmaMicPresent(ctx)
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(ACTION_USB_PERMISSION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
     LaunchedEffect(meetingActive, segmentStartedAt) {
         while (meetingActive) {
             nowMs = System.currentTimeMillis()
@@ -941,8 +980,13 @@ private fun ProdRecorderMainScreen() {
     }
 
     val captureReady = status.running && status.hasFreshAudio()
+    val micConnectionStatus = micConnectionUi(
+        micArrayPresent = micArrayPresent,
+        status = status,
+    )
 
     LaunchedEffect(captureReady, status.running, status.micDisconnected) {
+        micArrayPresent = isUmaMicPresent(context)
         if (!captureReady) {
             val active = MeetingController.active
             meetingActive = active != null
@@ -1028,6 +1072,7 @@ private fun ProdRecorderMainScreen() {
                     wifiStatus = currentWifiStatus(context)
                 },
             )
+            MicConnectionBadge(status = micConnectionStatus)
             BatteryStatusBadge(status = batteryStatus)
             AddSpeakerButton(onClick = { showEnroll = true })
             if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
@@ -1320,6 +1365,38 @@ private fun AddSpeakerButton(modifier: Modifier = Modifier, onClick: () -> Unit)
 }
 
 @Composable
+private fun MicConnectionBadge(status: MicConnectionUi) {
+    Surface(
+        modifier = Modifier.semantics { contentDescription = status.contentDescription },
+        shape = RoundedCornerShape(8.dp),
+        color = VuedSurfaceRaised.copy(alpha = 0.92f),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+        border = BorderStroke(1.dp, VuedHairline),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_mic_24),
+                contentDescription = null,
+                tint = status.color,
+                modifier = Modifier.size(20.dp),
+            )
+            Text(
+                text = status.label,
+                color = VuedTextTertiary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.sp,
+            )
+        }
+    }
+}
+
+@Composable
 private fun WifiSettingsButton(
     status: WifiStatus,
     onClick: () -> Unit,
@@ -1368,6 +1445,26 @@ private fun WifiSettingsButton(
         }
     }
 }
+
+private fun isUmaMicPresent(context: Context): Boolean =
+    Uma8Capture(context).findDevice() != null
+
+private fun micConnectionUi(
+    micArrayPresent: Boolean,
+    status: RecorderState.Status,
+): MicConnectionUi =
+    when {
+        micArrayPresent && !status.micDisconnected -> MicConnectionUi(
+            label = "Connected",
+            color = VuedSuccess,
+            contentDescription = "Mic connected",
+        )
+        else -> MicConnectionUi(
+            label = "Disconnected",
+            color = Color(0xFFB42318),
+            contentDescription = "Mic disconnected",
+        )
+    }
 
 private fun formatSegmentTime(totalSecs: Long): String {
     val minutes = totalSecs / 60
