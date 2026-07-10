@@ -23,7 +23,7 @@ from urllib.request import urlopen
 from urllib.parse import quote
 
 
-SUPABASE_URL = "https://eubvwnuocitdcctwqjox.supabase.co"
+SUPABASE_URL = "https://fmzwemrvhiyyotswkplb.supabase.co"
 BUCKET = "downloads"
 PREFIX = "android-host"
 CHANNEL = "latest"
