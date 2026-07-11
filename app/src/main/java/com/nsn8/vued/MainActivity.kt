@@ -128,6 +128,7 @@ import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
+private const val RECONNECT_MEETING_GRACE_MS = 10_000L
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -163,6 +164,8 @@ private val VuedIdleRing = Color(0xFFE5EAF0)
 
 class MainActivity : ComponentActivity() {
     private var pendingKioskAfterUsbPermission = false
+    private var pendingRecorderStartAfterUsbPermission = false
+    private var pendingRecorderStartRequiresResumeState = false
     private var lastUsbPermissionRequestKey: String? = null
     private var lastUsbPermissionRequestMs: Long = 0
     private var kioskManuallyEscaped = false
@@ -180,11 +183,15 @@ class MainActivity : ComponentActivity() {
                         attachedDevice,
                         mapOf("matchesUma" to attachedDevice.matchesUmaSafely()),
                     )
-                    requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
+                    if (!resumeRecorderAfterUmaReconnect("usb_attached", attachedDevice)) {
+                        requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
+                    }
                 }
                 ACTION_USB_PERMISSION -> {
                     val device = intent.usbDeviceExtra()
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    val shouldStartRecorder = pendingRecorderStartAfterUsbPermission
+                    val requiresResumeState = pendingRecorderStartRequiresResumeState
                     logKioskUsbEvent(
                         "kiosk_usb_permission_result",
                         device,
@@ -195,6 +202,17 @@ class MainActivity : ComponentActivity() {
                     )
                     lastUsbPermissionRequestKey = null
                     pendingKioskAfterUsbPermission = false
+                    pendingRecorderStartAfterUsbPermission = false
+                    pendingRecorderStartRequiresResumeState = false
+                    if (granted && shouldStartRecorder) {
+                        if (requiresResumeState) {
+                            resumeRecorderAfterUmaReconnect("usb_permission_granted", device)
+                        } else {
+                            RecordingService.start(this@MainActivity)
+                        }
+                    } else if (granted) {
+                        resumeRecorderAfterUmaReconnect("usb_permission_granted", device)
+                    }
                     if (isDeviceOwner(this@MainActivity)) {
                         val result = startKiosk(this@MainActivity)
                         logKioskUsbEvent("kiosk_usb_relock_after_permission", device, mapOf("result" to result))
@@ -283,6 +301,52 @@ class MainActivity : ComponentActivity() {
         return requested
     }
 
+    fun requestUmaPermissionForRecorderStart(
+        trigger: String = "manual",
+        requireResumeState: Boolean = false,
+    ): Boolean {
+        val requested = requestUmaPermission(this, unlockKioskForDialog = true)
+        logKioskUsbEvent(
+            "recorder_usb_permission_checked",
+            Uma8Capture(this).findDevice(),
+            mapOf(
+                "trigger" to trigger,
+                "requested" to requested,
+                "requireResumeState" to requireResumeState,
+            ),
+        )
+        if (requested) {
+            pendingRecorderStartAfterUsbPermission = true
+            pendingRecorderStartRequiresResumeState = requireResumeState
+        }
+        return requested
+    }
+
+    private fun resumeRecorderAfterUmaReconnect(trigger: String, device: UsbDevice?): Boolean {
+        if (!device.matchesUmaSafely()) return false
+        val status = RecorderState.state.value
+        val disconnectedAtMs = status.disconnectedAtMs
+        if (status.running || disconnectedAtMs <= 0L || !status.resumeOnReconnect) return false
+        val elapsedMs = System.currentTimeMillis() - disconnectedAtMs
+
+        val capture = Uma8Capture(this)
+        val connected = capture.findDevice() ?: return false
+        if (!capture.hasPermission(connected)) {
+            return requestUmaPermissionForRecorderStart(
+                trigger = trigger,
+                requireResumeState = true,
+            )
+        }
+
+        logKioskUsbEvent(
+            "recorder_usb_reconnect_autoresume",
+            connected,
+            mapOf("trigger" to trigger, "elapsedMs" to elapsedMs),
+        )
+        RecordingService.start(this)
+        return true
+    }
+
     private fun requestUmaPermission(context: Context, unlockKioskForDialog: Boolean): Boolean {
         val usbManager = context.getSystemService(UsbManager::class.java)
         val device = Uma8Capture(context).findDevice()
@@ -365,7 +429,12 @@ class MainActivity : ComponentActivity() {
 
     private fun dismissMicDisconnectedIfUmaDetected(device: UsbDevice?, trigger: String) {
         if (!device.matchesUmaSafely()) return
-        if (!RecorderState.state.value.micDisconnected) return
+        val status = RecorderState.state.value
+        if (!status.micDisconnected) return
+        if (status.resumeOnReconnect && !status.running && !status.hasFreshAudio()) {
+            logKioskUsbEvent("kiosk_usb_detected_waiting_for_resume", device, mapOf("trigger" to trigger))
+            return
+        }
 
         RecorderState.update {
             it.copy(
@@ -909,13 +978,21 @@ private fun ProdRecorderMainScreen() {
                 PackageManager.PERMISSION_GRANTED
         )
     }
+    var pendingStartAfterRuntimePermission by remember { mutableStateOf(false) }
+    var runtimePermissionRequestInFlight by remember { mutableStateOf(false) }
 
-    val audioLauncher = rememberLauncherForActivityResult(
+    val capturePermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> hasAudio = granted }
-    val notifLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { granted ->
+        hasAudio = granted
+        runtimePermissionRequestInFlight = false
+    }
+    val setupPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        grants[Manifest.permission.RECORD_AUDIO]?.let { granted -> hasAudio = granted }
+        requestUma8Permission(context)
+    }
 
     var meetingActive by remember { mutableStateOf(MeetingController.active != null) }
     var segmentStartedAt by remember { mutableStateOf(MeetingController.active?.startMs ?: 0L) }
@@ -1040,19 +1117,115 @@ private fun ProdRecorderMainScreen() {
         }
     }
 
-    fun startCapture() {
+    fun setupPermissionsToRequest(): Array<String> {
+        val permissions = mutableListOf<String>()
         if (!hasAudio) {
-            audioLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            return
+            permissions += Manifest.permission.RECORD_AUDIO
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            permissions += Manifest.permission.POST_NOTIFICATIONS
         }
-        requestUma8Permission(context)
+        return permissions.toTypedArray()
+    }
+
+    fun requestSetupPermissions(): Boolean {
+        val permissions = setupPermissionsToRequest()
+        if (permissions.isEmpty()) {
+            requestUma8Permission(context)
+            return false
+        }
+        setupPermissionLauncher.launch(permissions)
+        return true
+    }
+
+    fun requestCapturePermission(): Boolean {
+        if (hasAudio) return false
+        runtimePermissionRequestInFlight = true
+        capturePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        return true
+    }
+
+    fun startCapture() {
+        if (requestCapturePermission()) {
+            pendingStartAfterRuntimePermission = true
+            return
+        }
+
+        val umaDevice = Uma8Capture(context).findDevice()
+        if (!VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && umaDevice == null) {
+            RecorderState.update {
+                it.copy(
+                    running = false,
+                    captureReady = false,
+                    micDisconnected = true,
+                    disconnectedAtMs = System.currentTimeMillis(),
+                    resumeOnReconnect = false,
+                    error = "Mic disconnected",
+                )
+            }
+            return
+        }
+
+        if (requestUma8PermissionForStart(context)) return
         RecordingService.start(context)
+    }
+
+    LaunchedEffect(Unit) {
+        requestSetupPermissions()
+    }
+
+    LaunchedEffect(
+        pendingStartAfterRuntimePermission,
+        runtimePermissionRequestInFlight,
+        hasAudio,
+    ) {
+        if (pendingStartAfterRuntimePermission && !runtimePermissionRequestInFlight && hasAudio) {
+            pendingStartAfterRuntimePermission = false
+            startCapture()
+        }
+    }
+
+    LaunchedEffect(status.micDisconnected, status.disconnectedAtMs) {
+        val disconnectMs = status.disconnectedAtMs
+        if (!status.micDisconnected || disconnectMs <= 0L) return@LaunchedEffect
+
+        delay(RECONNECT_MEETING_GRACE_MS)
+
+        val latest = RecorderState.state.value
+        val stillSameDisconnect = latest.micDisconnected &&
+            latest.disconnectedAtMs == disconnectMs &&
+            !latest.running &&
+            !latest.hasFreshAudio()
+        if (!stillSameDisconnect) return@LaunchedEffect
+
+        runCatching {
+            if (MeetingController.active != null) {
+                MeetingController.stopAsync(context, endMs = disconnectMs)
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to finalize meeting after mic disconnect grace: ${error.message}", error)
+            DiagnosticsLogger.warn(
+                "meeting_disconnect_grace_finalize_failed",
+                mapOf("disconnectMs" to disconnectMs),
+                error,
+            )
+        }
+        RecorderState.update {
+            it.copy(
+                running = false,
+                captureReady = false,
+                micDisconnected = true,
+                disconnectedAtMs = disconnectMs,
+                error = "Mic disconnected",
+            )
+        }
+        meetingActive = MeetingController.active != null
+        segmentStartedAt = MeetingController.active?.startMs ?: 0L
+        nowMs = System.currentTimeMillis()
+        DiagnosticsLogger.info("mic_disconnect_grace_expired", mapOf("disconnectMs" to disconnectMs))
     }
 
     val elapsedSecs = if (meetingActive) {
@@ -2194,6 +2367,18 @@ private fun requestUma8Permission(context: Context) {
         PendingIntent.FLAG_MUTABLE,
     )
     usbManager.requestPermission(device, intent)
+}
+
+private fun requestUma8PermissionForStart(context: Context): Boolean {
+    if (context is MainActivity) {
+        return context.requestUmaPermissionForRecorderStart()
+    }
+
+    val usbManager = context.getSystemService(UsbManager::class.java)
+    val device = Uma8Capture(context).findDevice() ?: return false
+    if (usbManager.hasPermission(device)) return false
+    requestUma8Permission(context)
+    return true
 }
 
 private fun openWifiSettings(context: Context) {

@@ -19,6 +19,8 @@ object RecorderState {
         val error: String? = null,
         val captureReady: Boolean = false,
         val micDisconnected: Boolean = false,
+        val disconnectedAtMs: Long = 0L,
+        val resumeOnReconnect: Boolean = false,
     ) {
         fun hasFreshAudio(nowMs: Long = System.currentTimeMillis()): Boolean =
             captureReady &&

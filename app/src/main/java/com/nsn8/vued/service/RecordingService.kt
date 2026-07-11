@@ -59,6 +59,15 @@ class RecordingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            RecorderState.update {
+                it.copy(
+                    running = false,
+                    captureReady = false,
+                    micDisconnected = false,
+                    disconnectedAtMs = 0L,
+                    resumeOnReconnect = false,
+                )
+            }
             stopSelf()
             return START_NOT_STICKY
         }
@@ -114,6 +123,8 @@ class RecordingService : Service() {
                         it.copy(
                             captureReady = false,
                             micDisconnected = true,
+                            disconnectedAtMs = System.currentTimeMillis(),
+                            resumeOnReconnect = true,
                             error = "Mic disconnected",
                         )
                     }
@@ -252,13 +263,13 @@ class RecordingService : Service() {
                 captureReady = false,
                 error = message,
                 micDisconnected = true,
+                disconnectedAtMs = System.currentTimeMillis(),
+                resumeOnReconnect = true,
             )
         }
         runCatching {
             runBlocking {
-                if (MeetingController.active != null) {
-                    MeetingController.stop(applicationContext)
-                } else {
+                if (MeetingController.active == null) {
                     AmbientFlusher.flushOnce(this@RecordingService)
                 }
             }
@@ -331,6 +342,8 @@ class RecordingService : Service() {
                 running = true,
                 captureReady = true,
                 micDisconnected = false,
+                disconnectedAtMs = 0L,
+                resumeOnReconnect = false,
                 lastAudioMs = lastAudioMs,
                 error = null,
             )
@@ -400,7 +413,12 @@ class RecordingService : Service() {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            val serviceType = if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
+            startForeground(NOTIF_ID, notification, serviceType)
         } else {
             startForeground(NOTIF_ID, notification)
         }

@@ -135,9 +135,13 @@ object MeetingController {
         StopResult(meeting.meetingId, result.durationSecs, result.sizeBytes)
     }
 
-    fun stopAsync(context: Context) {
+    fun stopAsync(context: Context, endMs: Long = System.currentTimeMillis()) {
         val meeting = active ?: error("No active meeting.")
-        val closed = ClosedMeeting(meeting.meetingId, meeting.startMs, System.currentTimeMillis())
+        val closed = ClosedMeeting(
+            meetingId = meeting.meetingId,
+            startMs = meeting.startMs,
+            endMs = endMs.coerceAtLeast(meeting.startMs),
+        )
         persistPending(context.applicationContext, closed)
         active = null
         Log.i(TAG, "stop async queued meeting=${meeting.meetingId} windowMs=${closed.endMs - meeting.startMs}")
@@ -188,12 +192,13 @@ object MeetingController {
     private data class ExportResult(val durationSecs: Double, val sizeBytes: Long)
 
     private fun exportAndEnqueue(context: Context, meeting: ClosedMeeting): ExportResult {
-        val buffer = rolling ?: error("Ambient buffer not running.")
         val totalStartMs = SystemClock.elapsedRealtime()
-        val flushStartMs = SystemClock.elapsedRealtime()
-        buffer.flush()
-        Log.i(TAG, "export flush done meeting=${meeting.meetingId} elapsedMs=${SystemClock.elapsedRealtime() - flushStartMs}")
-        val segments = buffer.listSegments()
+        val segments = rolling?.let { buffer ->
+            val flushStartMs = SystemClock.elapsedRealtime()
+            buffer.flush()
+            Log.i(TAG, "export flush done meeting=${meeting.meetingId} elapsedMs=${SystemClock.elapsedRealtime() - flushStartMs}")
+            buffer.listSegments()
+        } ?: finalizedSegments(context, meeting.meetingId)
         Log.i(TAG, "export segments meeting=${meeting.meetingId} count=${segments.size}")
         val out = File(context.cacheDir, "meeting_${meeting.meetingId}.m4a")
         val exportStartMs = SystemClock.elapsedRealtime()
@@ -237,6 +242,14 @@ object MeetingController {
             "totalElapsedMs" to (SystemClock.elapsedRealtime() - totalStartMs),
         ))
         return ExportResult(durationSecs, sizeBytes)
+    }
+
+    private fun finalizedSegments(context: Context, meetingId: String): List<RollingBuffer.Segment> {
+        val segmentsDir = context.getExternalFilesDir(null)?.let { File(it, "segments") }
+            ?: error("Ambient segment directory unavailable.")
+        val segments = RollingBuffer(segmentsDir).listSegments()
+        Log.i(TAG, "export using finalized segments meeting=$meetingId count=${segments.size}")
+        return segments
     }
 
     private fun prefs(context: Context) =
