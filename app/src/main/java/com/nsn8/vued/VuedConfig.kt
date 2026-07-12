@@ -32,7 +32,7 @@ object VuedConfig {
     val SUPABASE_ANON_KEY = when (MODE) {
         Mode.DEV -> SUPABASE_ANON_KEY_DEV
         Mode.PROD -> SUPABASE_ANON_KEY_DEV
-        Mode.STAGING -> SUPABASE_URL_STAGING
+        Mode.STAGING -> SUPABASE_ANON_KEY_STAGING
     }
 
     // Stateless STT / API backend for the fresh office-dev stack.
