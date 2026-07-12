@@ -5,12 +5,12 @@ import java.io.File
 import kotlin.math.abs
 
 /**
- * The Phase-1 audio chain: mic-array interleaved PCM -> mono downmix -> anti-aliased
+ * The Phase-1 audio chain: mic-array interleaved PCM -> first-channel selection -> anti-aliased
  * 48->16 kHz -> 30 s AAC/M4A rolling segments. [process] is the `onPcm` callback fed
  * by [Uma8Capture]; it must run synchronously on the capture thread.
  *
  * [inputChannels] is the array's real-mic channel count (7 for UMA-8, 16 for
- * UMA-16); the downmix is a plain mean, so any value works.
+ * UMA-16); channel 0 is used as the mono source.
  */
 class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
 
@@ -37,24 +37,13 @@ class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
     fun process(buffer: ByteArray, length: Int) {
         val frames = downmixer.frameCount(length)
         if (frames == 0) return
-        if (AudioPipelineDebugCapture.isActive) {
-            AudioPipelineDebugCapture.recordRawInterleavedInt32(buffer, length, inputChannels)
-            val averaged = downmixer.toMonoFloat(buffer, length, gain = 1.0)
-            AudioPipelineDebugCapture.recordAveraged48k(averaged, frames)
-        }
         val mono = downmixer.toMonoFloat(buffer, length)
-        if (AudioPipelineDebugCapture.isActive) {
-            AudioPipelineDebugCapture.recordGained48k(mono, frames)
-        }
         val outCount = resampler.process(mono, frames)
         process16kMono(resampler.output, outCount)
     }
 
     fun process16kMono(samples: FloatArray, count: Int) {
         if (count <= 0) return
-        if (AudioPipelineDebugCapture.isActive) {
-            AudioPipelineDebugCapture.recordDownsampled16k(samples, count)
-        }
         var p = 0f
         for (i in 0 until count) {
             val a = abs(samples[i])
