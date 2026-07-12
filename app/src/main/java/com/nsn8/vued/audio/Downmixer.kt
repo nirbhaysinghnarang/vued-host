@@ -16,7 +16,7 @@ class Downmixer(private val channels: Int) {
      * @return a mono FloatArray of length `frames`; valid only until the next call
      *         (the backing array is reused).
      */
-    fun toMonoFloat(buffer: ByteArray, length: Int): FloatArray {
+    fun toMonoFloat(buffer: ByteArray, length: Int, gain: Double = MAKEUP_GAIN): FloatArray {
         val bytesPerFrame = channels * 4
         val frames = length / bytesPerFrame
         if (scratch.size < frames) {
@@ -29,7 +29,7 @@ class Downmixer(private val channels: Int) {
                 sum += int32Le(buffer, offset)
                 offset += 4
             }
-            scratch[frame] = (sum / channels / INT32_FULL_SCALE * MAKEUP_GAIN).toFloat()
+            scratch[frame] = (sum / channels / INT32_FULL_SCALE * gain).toFloat()
         }
         return scratch
     }
@@ -43,7 +43,7 @@ class Downmixer(private val channels: Int) {
             ((b[i + 2].toInt() and 0xff) shl 16) or
             (b[i + 3].toInt() shl 24)
 
-    private companion object {
+    companion object {
         const val INT32_FULL_SCALE = 2_147_483_648.0 // 2^31
 
         // RAW-mode makeup gain. The UMA-8 applies NO gain in RAW mode (per the

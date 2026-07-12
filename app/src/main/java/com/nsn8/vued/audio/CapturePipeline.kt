@@ -37,13 +37,24 @@ class CapturePipeline(segmentsDir: File, initialInputChannels: Int) {
     fun process(buffer: ByteArray, length: Int) {
         val frames = downmixer.frameCount(length)
         if (frames == 0) return
+        if (AudioPipelineDebugCapture.isActive) {
+            AudioPipelineDebugCapture.recordRawInterleavedInt32(buffer, length, inputChannels)
+            val averaged = downmixer.toMonoFloat(buffer, length, gain = 1.0)
+            AudioPipelineDebugCapture.recordAveraged48k(averaged, frames)
+        }
         val mono = downmixer.toMonoFloat(buffer, length)
+        if (AudioPipelineDebugCapture.isActive) {
+            AudioPipelineDebugCapture.recordGained48k(mono, frames)
+        }
         val outCount = resampler.process(mono, frames)
         process16kMono(resampler.output, outCount)
     }
 
     fun process16kMono(samples: FloatArray, count: Int) {
         if (count <= 0) return
+        if (AudioPipelineDebugCapture.isActive) {
+            AudioPipelineDebugCapture.recordDownsampled16k(samples, count)
+        }
         var p = 0f
         for (i in 0 until count) {
             val a = abs(samples[i])

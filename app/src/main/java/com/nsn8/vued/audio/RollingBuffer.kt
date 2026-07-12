@@ -63,6 +63,9 @@ class RollingBuffer(
                     else -> scaled.toInt().toShort()
                 }
             }
+            if (AudioPipelineDebugCapture.isActive) {
+                AudioPipelineDebugCapture.recordPcm16(pcmScratch, count)
+            }
             writer?.write(pcmScratch, count)
             samplesInSegment += count
             lastAppendMs = System.currentTimeMillis()

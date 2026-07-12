@@ -5,6 +5,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.ambient.AmbientFlusher
+import com.nsn8.vued.audio.AudioPipelineDebugCapture
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.net.OutboundQueue
@@ -90,6 +91,8 @@ object MeetingController {
         buffer.flush()
         val meetingId = UUID.randomUUID().toString().replace("-", "")
         val startMs = System.currentTimeMillis()
+        val sliceId = meetingSliceId(meetingId)
+        AudioPipelineDebugCapture.start(context.applicationContext, meetingId, sliceId, startMs)
         Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
         DiagnosticsLogger.info("meeting_started", mapOf("meetingId" to meetingId, "startMs" to startMs))
         OutboundQueue.enqueueMeetingCreate(context, meetingId, title, startMs / 1000.0)
@@ -113,6 +116,7 @@ object MeetingController {
         val meeting = active ?: error("No active meeting.")
         val endMs = System.currentTimeMillis()
         active = null
+        AudioPipelineDebugCapture.finishCapture(meeting.meetingId, endMs)
         Log.i(TAG, "stop begin meeting=${meeting.meetingId} windowMs=${endMs - meeting.startMs}")
         DiagnosticsLogger.info("meeting_stop_started", mapOf("meetingId" to meeting.meetingId, "windowMs" to (endMs - meeting.startMs)))
         AmbientFlusher.resumeAfter(endMs)
@@ -144,6 +148,7 @@ object MeetingController {
         )
         persistPending(context.applicationContext, closed)
         active = null
+        AudioPipelineDebugCapture.finishCapture(meeting.meetingId, closed.endMs)
         Log.i(TAG, "stop async queued meeting=${meeting.meetingId} windowMs=${closed.endMs - meeting.startMs}")
         DiagnosticsLogger.info("meeting_stop_async_queued", mapOf("meetingId" to meeting.meetingId, "windowMs" to (closed.endMs - meeting.startMs)))
         AmbientFlusher.resumeAfter(closed.endMs)
@@ -224,7 +229,8 @@ object MeetingController {
             "elapsedMs" to (SystemClock.elapsedRealtime() - exportStartMs),
         ))
 
-        val sliceId = UUID.nameUUIDFromBytes("meeting:${meeting.meetingId}".toByteArray()).toString()
+        AudioPipelineDebugCapture.copyCompressedMeeting(meeting.meetingId, out)
+        val sliceId = meetingSliceId(meeting.meetingId)
         val enqueueStartMs = SystemClock.elapsedRealtime()
         OutboundQueue.enqueueMeeting(
             context, sliceId, sessionId, meeting.meetingId,
@@ -251,6 +257,9 @@ object MeetingController {
         Log.i(TAG, "export using finalized segments meeting=$meetingId count=${segments.size}")
         return segments
     }
+
+    private fun meetingSliceId(meetingId: String): String =
+        UUID.nameUUIDFromBytes("meeting:$meetingId".toByteArray()).toString()
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
