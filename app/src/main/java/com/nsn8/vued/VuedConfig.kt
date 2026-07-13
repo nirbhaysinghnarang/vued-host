@@ -26,12 +26,12 @@ object VuedConfig {
 
     val SUPABASE_URL = when (MODE) {
         Mode.DEV -> SUPABASE_URL_DEV
-        Mode.PROD -> SUPABASE_URL_DEV
+        Mode.PROD -> SUPABASE_URL_PROD
         Mode.STAGING -> SUPABASE_URL_STAGING
     }
     val SUPABASE_ANON_KEY = when (MODE) {
         Mode.DEV -> SUPABASE_ANON_KEY_DEV
-        Mode.PROD -> SUPABASE_ANON_KEY_DEV
+        Mode.PROD -> SUPABASE_ANON_KEY_PROD
         Mode.STAGING -> SUPABASE_ANON_KEY_STAGING
     }
 
@@ -43,7 +43,7 @@ object VuedConfig {
 
     val API_BASE_URL = when (MODE) {
         Mode.DEV -> API_BASE_URL_DEV
-        Mode.PROD -> API_BASE_URL_DEV
+        Mode.PROD -> API_BASE_URL_PROD
         Mode.STAGING -> API_BASE_URL_STAGING
     }
 
