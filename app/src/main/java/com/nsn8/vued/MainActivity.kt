@@ -2280,7 +2280,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                     }
                 },
             ) {
-                Text(if (meetingActive) "Stop Meeting" else "Start Meeting")
+                Text(if (meetingActive) "Stop Meeting" else "Start Meeting!")
             }
             OutlinedButton(onClick = {
                 scope.launch {

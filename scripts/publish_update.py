@@ -4,7 +4,7 @@ Prepare Android host update files for manual Supabase Storage upload.
 
 Edit the constants below, then run:
 
-    python3 scripts/publish_update.py
+    python3 scripts/publish_update.py --version-name 3.0 --version-code 3
 
 Then drag the opened folder's contents into the Supabase downloads/android-host/
 folder.
@@ -12,6 +12,7 @@ folder.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -23,7 +24,7 @@ from urllib.request import urlopen
 from urllib.parse import quote
 
 
-SUPABASE_URL = "https://fmzwemrvhiyyotswkplb.supabase.co"
+DEFAULT_SUPABASE_URL = "https://eubvwnuocitdcctwqjox.supabase.co"
 BUCKET = "downloads"
 PREFIX = "android-host"
 CHANNEL = "latest"
@@ -34,22 +35,21 @@ AAPT_PATH = Path.home() / "Library/Android/sdk/build-tools/36.0.0/aapt"
 OUTPUT_ROOT = REPO_ROOT / "dist/android-host"
 
 PACKAGE_NAME = "com.nsn8.vued"
-VERSION_NAME = "2.0"
-VERSION_CODE = 2
 
 
 def main() -> None:
+    args = parse_args()
     apk_path = APK_PATH
     if not apk_path.is_file():
         raise SystemExit(f"APK not found: {apk_path}")
 
-    validate_apk_metadata(apk_path)
-    validate_published_version()
+    validate_apk_metadata(apk_path, args.version_name, args.version_code)
+    validate_published_version(args.supabase_url, args.version_name, args.version_code)
 
-    apk_name = f"vued-host-{VERSION_CODE}.apk"
-    apk_output_path = OUTPUT_ROOT / str(VERSION_CODE) / apk_name
+    apk_name = f"vued-host-{args.version_code}.apk"
+    apk_output_path = OUTPUT_ROOT / str(args.version_code) / apk_name
     manifest_output_path = OUTPUT_ROOT / CHANNEL / "manifest.json"
-    apk_remote_path = f"{PREFIX}/{VERSION_CODE}/{apk_name}"
+    apk_remote_path = f"{PREFIX}/{args.version_code}/{apk_name}"
 
     apk_output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,9 +58,9 @@ def main() -> None:
     manifest = {
         "channel": CHANNEL,
         "packageName": PACKAGE_NAME,
-        "versionName": VERSION_NAME,
-        "versionCode": VERSION_CODE,
-        "url": public_object_url(apk_remote_path),
+        "versionName": args.version_name,
+        "versionCode": args.version_code,
+        "url": public_object_url(args.supabase_url, apk_remote_path),
         "sha256": sha256(apk_output_path),
         "sizeBytes": apk_output_path.stat().st_size,
     }
@@ -78,6 +78,29 @@ def main() -> None:
     open_output_folder(OUTPUT_ROOT)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Prepare Android host update files for manual Supabase Storage upload.",
+    )
+    parser.add_argument(
+        "--supabase-url",
+        default=DEFAULT_SUPABASE_URL,
+        help=f"Supabase project URL. Defaults to {DEFAULT_SUPABASE_URL}.",
+    )
+    parser.add_argument(
+        "--version-name",
+        required=True,
+        help="APK versionName to publish, for example 3.0.",
+    )
+    parser.add_argument(
+        "--version-code",
+        required=True,
+        type=int,
+        help="APK versionCode to publish, for example 3.",
+    )
+    return parser.parse_args()
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -86,7 +109,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_apk_metadata(apk_path: Path) -> None:
+def validate_apk_metadata(apk_path: Path, version_name: str, version_code: int) -> None:
     if not AAPT_PATH.is_file():
         raise SystemExit(f"aapt not found: {AAPT_PATH}")
     output = subprocess.check_output(
@@ -101,17 +124,17 @@ def validate_apk_metadata(apk_path: Path) -> None:
     mismatches = []
     if actual_package != PACKAGE_NAME:
         mismatches.append(f"PACKAGE_NAME is {PACKAGE_NAME}, APK has {actual_package}")
-    if actual_version_code != VERSION_CODE:
-        mismatches.append(f"VERSION_CODE is {VERSION_CODE}, APK has {actual_version_code}")
-    if actual_version_name != VERSION_NAME:
-        mismatches.append(f"VERSION_NAME is {VERSION_NAME}, APK has {actual_version_name}")
+    if actual_version_code != version_code:
+        mismatches.append(f"--version-code is {version_code}, APK has {actual_version_code}")
+    if actual_version_name != version_name:
+        mismatches.append(f"--version-name is {version_name}, APK has {actual_version_name}")
     if mismatches:
-        raise SystemExit("APK metadata does not match script constants:\n- " + "\n- ".join(mismatches))
+        raise SystemExit("APK metadata does not match publish arguments:\n- " + "\n- ".join(mismatches))
     print(f"Validated APK: {actual_package} {actual_version_name} ({actual_version_code})")
 
 
-def validate_published_version() -> None:
-    manifest_url = public_object_url(f"{PREFIX}/{CHANNEL}/manifest.json")
+def validate_published_version(supabase_url: str, version_name: str, version_code: int) -> None:
+    manifest_url = public_object_url(supabase_url, f"{PREFIX}/{CHANNEL}/manifest.json")
     current = fetch_json(manifest_url)
     if current is None:
         print(f"No current manifest found at {manifest_url}")
@@ -123,15 +146,15 @@ def validate_published_version() -> None:
 
     if current_package and current_package != PACKAGE_NAME:
         raise SystemExit(
-            "Published manifest packageName does not match script constants:\n"
+            "Published manifest packageName does not match publish arguments:\n"
             f"- current manifest has {current_package}\n"
             f"- script has {PACKAGE_NAME}"
         )
-    if VERSION_CODE <= current_version_code:
+    if version_code <= current_version_code:
         raise SystemExit(
-            "VERSION_CODE must be higher than the currently published manifest:\n"
+            "--version-code must be higher than the currently published manifest:\n"
             f"- current manifest: {current_version_name} ({current_version_code})\n"
-            f"- script constants: {VERSION_NAME} ({VERSION_CODE})"
+            f"- publish arguments: {version_name} ({version_code})"
         )
     print(f"Current published version: {current_version_name} ({current_version_code})")
 
@@ -155,9 +178,9 @@ def required_badging_value(line: str, key: str) -> str:
     return match.group(1)
 
 
-def public_object_url(remote_path: str) -> str:
+def public_object_url(supabase_url: str, remote_path: str) -> str:
     return (
-        f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/"
+        f"{supabase_url.rstrip('/')}/storage/v1/object/public/"
         f"{quote(BUCKET)}/{quote_path(remote_path)}"
     )
 
