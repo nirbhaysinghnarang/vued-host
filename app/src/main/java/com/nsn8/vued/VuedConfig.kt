@@ -38,7 +38,7 @@ object VuedConfig {
     // Stateless STT / API backend for the fresh office-dev stack.
     private const val API_BASE_URL_DEV = "https://vued-office-gss-api.onrender.com"
     private const val API_BASE_URL_PROD = "https://vued-office-api-dev.onrender.com"
-    private const val API_BASE_URL_STAGING = "https://vued-office-api-staging.onrender.com"
+    private const val API_BASE_URL_STAGING = "https://vued-office-staging-api.onrender.com"
 
 
     val API_BASE_URL = when (MODE) {
