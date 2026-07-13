@@ -98,6 +98,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.auth.VuedAuth
@@ -129,6 +130,8 @@ import kotlinx.coroutines.launch
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
 private const val RECONNECT_MEETING_GRACE_MS = 10_000L
+private const val RECORDER_RECONNECT_RETRY_MS = 250L
+private const val RECORDER_RECONNECT_TIMEOUT_MS = 10_000L
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -169,6 +172,7 @@ class MainActivity : ComponentActivity() {
     private var lastUsbPermissionRequestKey: String? = null
     private var lastUsbPermissionRequestMs: Long = 0
     private var kioskManuallyEscaped = false
+    private var recorderReconnectJob: Job? = null
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -183,9 +187,10 @@ class MainActivity : ComponentActivity() {
                         attachedDevice,
                         mapOf("matchesUma" to attachedDevice.matchesUmaSafely()),
                     )
-                    if (!resumeRecorderAfterUmaReconnect("usb_attached", attachedDevice)) {
-                        requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
+                    if (attachedDevice.matchesUmaSafely()) {
+                        scheduleRecorderReconnect(attachedDevice)
                     }
+                    requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
                 }
                 ACTION_USB_PERMISSION -> {
                     val device = intent.usbDeviceExtra()
@@ -347,6 +352,40 @@ class MainActivity : ComponentActivity() {
         return true
     }
 
+    private fun scheduleRecorderReconnect(device: UsbDevice) {
+        recorderReconnectJob?.cancel()
+        recorderReconnectJob = lifecycleScope.launch {
+            val attachedAtMs = System.currentTimeMillis()
+            val deadlineMs = SystemClock.elapsedRealtime() + RECORDER_RECONNECT_TIMEOUT_MS
+
+            while (SystemClock.elapsedRealtime() < deadlineMs) {
+                val status = RecorderState.state.value
+
+                // The existing capture recovered across the short USB reset.
+                if (status.running && status.hasFreshAudio() && status.lastAudioMs >= attachedAtMs) {
+                    logKioskUsbEvent(
+                        "recorder_usb_reconnect_recovered",
+                        device,
+                        mapOf("elapsedMs" to (System.currentTimeMillis() - attachedAtMs)),
+                    )
+                    return@launch
+                }
+
+                // A failed capture stops asynchronously. Retry once its service has
+                // published the stopped state instead of losing the early attach event.
+                if (!status.running && status.disconnectedAtMs > 0L && status.resumeOnReconnect) {
+                    if (resumeRecorderAfterUmaReconnect("usb_attach_retry", device)) {
+                        return@launch
+                    }
+                }
+
+                delay(RECORDER_RECONNECT_RETRY_MS)
+            }
+
+            logKioskUsbEvent("recorder_usb_reconnect_retry_expired", device)
+        }
+    }
+
     private fun requestUmaPermission(context: Context, unlockKioskForDialog: Boolean): Boolean {
         val usbManager = context.getSystemService(UsbManager::class.java)
         val device = Uma8Capture(context).findDevice()
@@ -414,6 +453,9 @@ class MainActivity : ComponentActivity() {
         val device = intent.usbDeviceExtra()
         dismissMicDisconnectedIfUmaDetected(device, trigger = trigger)
         logKioskUsbEvent("kiosk_usb_attach_activity_intent", device, mapOf("trigger" to trigger))
+        if (device.matchesUmaSafely()) {
+            scheduleRecorderReconnect(device)
+        }
         requestUmaPermissionForKioskRecovery(trigger = trigger)
     }
 
@@ -1162,7 +1204,7 @@ private fun ProdRecorderMainScreen() {
                     captureReady = false,
                     micDisconnected = true,
                     disconnectedAtMs = System.currentTimeMillis(),
-                    resumeOnReconnect = false,
+                    resumeOnReconnect = true,
                     error = "Mic disconnected",
                 )
             }
