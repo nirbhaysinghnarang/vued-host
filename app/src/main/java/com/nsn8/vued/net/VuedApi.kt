@@ -73,6 +73,7 @@ object VuedApi {
                 .put("endedAt", endedAtSec)
                 .put("audioDurationSecs", durationSecs)
                 .put("audioSizeBytes", sizeBytes)
+                .put("captureSource", "tablet")
                 .putOpt("roomId", roomId),
         )
     }
@@ -97,6 +98,7 @@ object VuedApi {
                 .put("endedAt", endedAtSec)
                 .put("audioDurationSecs", durationSecs)
                 .put("audioSizeBytes", sizeBytes)
+                .put("captureSource", "tablet")
                 .putOpt("roomId", roomId),
         )
     }
@@ -128,17 +130,50 @@ object VuedApi {
 
     // ---- speaker enrollment ----
 
+    data class SpeakerEnrollmentGroup(
+        val captureSource: String,
+        val model: String,
+        val sampleCount: Int,
+        val enrolled: Boolean,
+        val updatedAt: Double?,
+    )
+
     data class SpeakerProfile(
         val id: String,
         val displayName: String,
         val sampleCount: Int,
         val model: String,
+        val enrollmentGroups: List<SpeakerEnrollmentGroup>,
     )
 
     /** Thrown on 409 when a speaker with the same name exists — carries the
      *  existing profiles so the UI can offer "add a sample to ⟨X⟩". */
     class DuplicateSpeakerException(val profiles: List<SpeakerProfile>) :
         Exception("A speaker with that name already exists.")
+
+    private fun parseEnrollmentGroup(o: JSONObject?): SpeakerEnrollmentGroup? {
+        if (o == null) return null
+        val captureSource = o.optString("captureSource", o.optString("capture_source"))
+        if (captureSource != "tablet" && captureSource != "desktop") return null
+        val updatedAt = when {
+            o.has("updatedAt") && !o.isNull("updatedAt") -> o.optDouble("updatedAt")
+            o.has("updated_at") && !o.isNull("updated_at") -> o.optDouble("updated_at")
+            else -> null
+        }
+        return SpeakerEnrollmentGroup(
+            captureSource = captureSource,
+            model = o.optString("model"),
+            sampleCount = o.optInt("sampleCount", o.optInt("sample_count", 0)),
+            enrolled = o.optBoolean("enrolled", false),
+            updatedAt = updatedAt,
+        )
+    }
+
+    private fun parseEnrollmentGroups(o: JSONObject): List<SpeakerEnrollmentGroup> {
+        val arr = o.optJSONArray("enrollmentGroups") ?: o.optJSONArray("enrollment_groups")
+        return if (arr == null) emptyList()
+        else (0 until arr.length()).mapNotNull { parseEnrollmentGroup(arr.optJSONObject(it)) }
+    }
 
     private fun parseProfile(o: JSONObject?): SpeakerProfile? {
         if (o == null) return null
@@ -149,6 +184,7 @@ object VuedApi {
             displayName = o.optString("displayName", o.optString("display_name")),
             sampleCount = o.optInt("sampleCount", o.optInt("sample_count", 0)),
             model = o.optString("model"),
+            enrollmentGroups = parseEnrollmentGroups(o),
         )
     }
 
@@ -178,6 +214,7 @@ object VuedApi {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("display_name", displayName)
             .addFormDataPart("is_org_user", isOrgUser.toString())
+            .addFormDataPart("capture_source", "tablet")
             .addFormDataPart("audio", "enroll.wav", audio.toRequestBody("audio/wav".toMediaType()))
         if (profileId != null) body.addFormDataPart("profile_id", profileId)
         if (durationSecs != null) body.addFormDataPart("duration_secs", durationSecs.toString())
