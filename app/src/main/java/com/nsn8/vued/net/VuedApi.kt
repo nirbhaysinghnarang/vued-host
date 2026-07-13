@@ -49,6 +49,22 @@ object VuedApi {
         )
     }
 
+    /** Marks a meeting terminally failed when its locally retained audio is unusable. */
+    suspend fun markMeetingFailed(
+        meetingId: String,
+        endedAtSec: Double,
+        failureReason: String,
+    ) {
+        request(
+            "/api/v1/meetings/$meetingId",
+            method = "PATCH",
+            body = JSONObject()
+                .put("status", "failed")
+                .put("ended_at", endedAtSec)
+                .put("failure_reason", failureReason),
+        )
+    }
+
     /** Registers the audio-slice metadata row (status -> pending). [roomId] tags
      *  the slice with the tablet's assigned room; the server resolves mic/org. */
     suspend fun createSlice(

@@ -8,6 +8,7 @@ import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.audio.RollingBuffer
 import com.nsn8.vued.audio.SegmentExporter
 import com.nsn8.vued.net.OutboundQueue
+import com.nsn8.vued.net.RoomConfig
 import com.nsn8.vued.service.RecorderState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,6 +16,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -35,18 +38,39 @@ object MeetingController {
 
     data class ActiveMeeting(val meetingId: String, val startMs: Long)
     data class StopResult(val meetingId: String, val durationSecs: Double, val sizeBytes: Long)
-    private data class ClosedMeeting(val meetingId: String, val startMs: Long, val endMs: Long)
+    internal data class PersistedActiveMeeting(
+        val meetingId: String,
+        val title: String,
+        val startMs: Long,
+        val heartbeatMs: Long,
+        val roomId: String?,
+        val microphoneId: String?,
+    )
+    internal data class ClosedMeeting(
+        val meetingId: String,
+        val startMs: Long,
+        val endMs: Long,
+        val recoveredAfterRestart: Boolean = false,
+    )
+
+    private class NoUsableMeetingAudio(message: String) : IllegalStateException(message)
 
     private const val TAG = "VuedMeeting"
     private const val PREFS = "vued_meeting_exports"
+    private const val KEY_ACTIVE = "active_v1"
     private const val KEY_PENDING = "pending"
+    private const val ACTIVE_RECORD_VERSION = 1
     private const val ACTIVE_CREATE_RETRY_MS = 5_000L
+    private const val ACTIVE_HEARTBEAT_MS = 10_000L
+    private const val RECOVERY_FAILURE_REASON =
+        "Tablet restarted before the meeting could be finalized; no usable local audio remained."
 
     // One session id per app process (matches iOS session semantics).
     private val sessionId: String = UUID.randomUUID().toString()
     private val queueScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val exportSignals = Channel<Context>(Channel.CONFLATED)
     private val lock = Any()
+    private val exportMutex = Mutex()
 
     init {
         queueScope.launch {
@@ -82,6 +106,7 @@ object MeetingController {
      */
     suspend fun start(context: Context, title: String): String {
         val buffer = rolling ?: error("Start recording first — the ambient buffer isn't running.")
+        val appContext = context.applicationContext
         val nowMs = System.currentTimeMillis()
         check(RecorderState.state.value.hasFreshAudio(nowMs) && buffer.hasRecentAudio(RecorderState.CAPTURE_STALE_MS, nowMs)) {
             "Start recording first — the microphone is not ready."
@@ -90,11 +115,25 @@ object MeetingController {
         buffer.flush()
         val meetingId = UUID.randomUUID().toString().replace("-", "")
         val startMs = System.currentTimeMillis()
+        val persisted = PersistedActiveMeeting(
+            meetingId = meetingId,
+            title = title,
+            startMs = startMs,
+            heartbeatMs = startMs,
+            roomId = RoomConfig.roomId(appContext),
+            microphoneId = RoomConfig.microphoneId(appContext),
+        )
+        persistActive(appContext, persisted)
+        active = ActiveMeeting(meetingId, startMs)
         Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
         DiagnosticsLogger.info("meeting_started", mapOf("meetingId" to meetingId, "startMs" to startMs))
-        OutboundQueue.enqueueMeetingCreate(context, meetingId, title, startMs / 1000.0)
-        active = ActiveMeeting(meetingId, startMs)
-        val appContext = context.applicationContext
+        runCatching {
+            enqueueMeetingCreate(appContext, persisted)
+        }.onFailure { error ->
+            Log.w(TAG, "meeting create enqueue deferred meeting=$meetingId: ${error.message}", error)
+            DiagnosticsLogger.warn("meeting_create_enqueue_deferred", mapOf("meetingId" to meetingId), error)
+        }
+        startActiveHeartbeat(appContext, meetingId)
         queueScope.launch {
             Log.i(TAG, "start drain begin meeting=$meetingId")
             runCatching { OutboundQueue.drain(appContext) }
@@ -104,22 +143,41 @@ object MeetingController {
                     DiagnosticsLogger.warn("meeting_start_drain_failed", mapOf("meetingId" to meetingId), it)
                 }
         }
-        retryActiveMeetingCreate(appContext, meetingId)
+        retryActiveMeetingCreate(appContext, persisted)
         retryPendingExports(appContext)
         return meetingId
     }
 
     suspend fun stop(context: Context): StopResult = withContext(Dispatchers.IO) {
-        val meeting = active ?: error("No active meeting.")
-        val endMs = System.currentTimeMillis()
-        active = null
-        Log.i(TAG, "stop begin meeting=${meeting.meetingId} windowMs=${endMs - meeting.startMs}")
-        DiagnosticsLogger.info("meeting_stop_started", mapOf("meetingId" to meeting.meetingId, "windowMs" to (endMs - meeting.startMs)))
-        AmbientFlusher.resumeAfter(endMs)
         val appContext = context.applicationContext
-        val result = exportAndEnqueue(appContext, ClosedMeeting(meeting.meetingId, meeting.startMs, endMs))
+        val requestedEndMs = System.currentTimeMillis()
+        val (closed, result) = try {
+            exportMutex.withLock {
+                val claimed = closeActiveMeeting(appContext, requestedEndMs)
+                Log.i(TAG, "stop begin meeting=${claimed.meetingId} windowMs=${claimed.endMs - claimed.startMs}")
+                DiagnosticsLogger.info(
+                    "meeting_stop_started",
+                    mapOf("meetingId" to claimed.meetingId, "windowMs" to (claimed.endMs - claimed.startMs)),
+                )
+                AmbientFlusher.resumeAfter(claimed.endMs)
+                val exported = try {
+                    exportAndEnqueue(appContext, claimed).also { removePending(appContext, claimed.meetingId) }
+                } catch (error: NoUsableMeetingAudio) {
+                    enqueueFailureAndRemovePending(appContext, claimed)
+                    null
+                }
+                claimed to exported
+            }
+        } catch (error: Throwable) {
+            retryPendingExports(appContext)
+            throw error
+        }
+        val meeting = ActiveMeeting(closed.meetingId, closed.startMs)
         val drainStartMs = SystemClock.elapsedRealtime()
         OutboundQueue.drain(appContext)
+        if (result == null) {
+            throw NoUsableMeetingAudio("No usable audio captured for this meeting window.")
+        }
         Log.i(
             TAG,
             "stop drain done meeting=${meeting.meetingId} pending=${OutboundQueue.size(appContext)} " +
@@ -136,14 +194,8 @@ object MeetingController {
     }
 
     fun stopAsync(context: Context, endMs: Long = System.currentTimeMillis()) {
-        val meeting = active ?: error("No active meeting.")
-        val closed = ClosedMeeting(
-            meetingId = meeting.meetingId,
-            startMs = meeting.startMs,
-            endMs = endMs.coerceAtLeast(meeting.startMs),
-        )
-        persistPending(context.applicationContext, closed)
-        active = null
+        val closed = closeActiveMeeting(context.applicationContext, endMs)
+        val meeting = ActiveMeeting(closed.meetingId, closed.startMs)
         Log.i(TAG, "stop async queued meeting=${meeting.meetingId} windowMs=${closed.endMs - meeting.startMs}")
         DiagnosticsLogger.info("meeting_stop_async_queued", mapOf("meetingId" to meeting.meetingId, "windowMs" to (closed.endMs - meeting.startMs)))
         AmbientFlusher.resumeAfter(closed.endMs)
@@ -154,39 +206,120 @@ object MeetingController {
         exportSignals.trySend(context.applicationContext)
     }
 
-    private fun retryActiveMeetingCreate(context: Context, meetingId: String) {
+    /**
+     * Converts the active record left by a previous process into the normal durable
+     * closed-meeting export path. A fresh process never resumes an interrupted meeting.
+     */
+    internal fun recoverStaleMeetings(
+        context: Context,
+        nowMs: Long = System.currentTimeMillis(),
+        scheduleExport: Boolean = true,
+    ): Boolean {
+        val appContext = context.applicationContext
+        val persisted = persistedActive(appContext) ?: run {
+            if (scheduleExport) retryPendingExports(appContext)
+            return false
+        }
+        check(active == null) {
+            "Cannot recover a stale meeting while another meeting is active."
+        }
+        enqueueMeetingCreate(appContext, persisted)
+        val endMs = persisted.heartbeatMs.coerceIn(persisted.startMs, nowMs.coerceAtLeast(persisted.startMs))
+        val closed = ClosedMeeting(
+            persisted.meetingId,
+            persisted.startMs,
+            endMs,
+            recoveredAfterRestart = true,
+        )
+        transitionActiveToPending(appContext, closed)
+        Log.i(
+            TAG,
+            "recovered stale meeting=${persisted.meetingId} startMs=${persisted.startMs} " +
+                "endMs=$endMs heartbeatAgeMs=${(nowMs - persisted.heartbeatMs).coerceAtLeast(0L)}",
+        )
+        DiagnosticsLogger.warn("meeting_stale_recovered", mapOf(
+            "meetingId" to persisted.meetingId,
+            "startMs" to persisted.startMs,
+            "endMs" to endMs,
+            "heartbeatAgeMs" to (nowMs - persisted.heartbeatMs).coerceAtLeast(0L),
+        ))
+        if (scheduleExport) retryPendingExports(appContext)
+        return true
+    }
+
+    private fun retryActiveMeetingCreate(context: Context, meeting: PersistedActiveMeeting) {
         queueScope.launch {
-            while (active?.meetingId == meetingId) {
+            while (active?.meetingId == meeting.meetingId) {
                 delay(ACTIVE_CREATE_RETRY_MS)
-                if (active?.meetingId != meetingId) break
-                val created = runCatching { OutboundQueue.drainMeetingCreate(context, meetingId) }
-                    .onFailure { Log.w(TAG, "active create retry failed meeting=$meetingId: ${it.message}", it) }
+                if (active?.meetingId != meeting.meetingId) break
+                val created = runCatching {
+                    enqueueMeetingCreate(context, meeting)
+                    OutboundQueue.drainMeetingCreate(context, meeting.meetingId)
+                }
+                    .onFailure { Log.w(TAG, "active create retry failed meeting=${meeting.meetingId}: ${it.message}", it) }
                     .getOrDefault(false)
                 if (created) {
-                    Log.i(TAG, "active create retry done meeting=$meetingId")
+                    Log.i(TAG, "active create retry done meeting=${meeting.meetingId}")
                     break
                 }
             }
         }
     }
 
-    private suspend fun drainPendingExports(context: Context) {
+    private fun startActiveHeartbeat(context: Context, meetingId: String) {
+        queueScope.launch {
+            while (active?.meetingId == meetingId) {
+                delay(ACTIVE_HEARTBEAT_MS)
+                if (active?.meetingId != meetingId) break
+                runCatching { touchActive(context, meetingId, System.currentTimeMillis()) }
+                    .onFailure { error ->
+                        Log.w(TAG, "active heartbeat failed meeting=$meetingId: ${error.message}", error)
+                        DiagnosticsLogger.warn("meeting_active_heartbeat_failed", mapOf("meetingId" to meetingId), error)
+                    }
+            }
+        }
+    }
+
+    private suspend fun drainPendingExports(context: Context, drainOutbound: Boolean = true) {
         pendingExports(context).forEach { meeting ->
-            runCatching {
-                val result = exportAndEnqueue(context, meeting)
-                removePending(context, meeting.meetingId)
+            try {
+                val result = exportMutex.withLock {
+                    if (!hasPendingExport(context, meeting.meetingId)) return@withLock null
+                    if (OutboundQueue.hasDurableMeetingAudio(context, meeting.meetingId)) {
+                        removePending(context, meeting.meetingId)
+                        DiagnosticsLogger.info(
+                            "meeting_pending_export_already_durable",
+                            mapOf("meetingId" to meeting.meetingId),
+                        )
+                        return@withLock null
+                    }
+                    try {
+                        exportAndEnqueue(context, meeting).also { removePending(context, meeting.meetingId) }
+                    } catch (error: NoUsableMeetingAudio) {
+                        enqueueFailureAndRemovePending(context, meeting)
+                        null
+                    }
+                }
+                if (result == null) {
+                    if (drainOutbound) OutboundQueue.drain(context)
+                    return@forEach
+                }
                 val drainStartMs = SystemClock.elapsedRealtime()
-                OutboundQueue.drain(context)
+                if (drainOutbound) OutboundQueue.drain(context)
                 Log.i(
                     TAG,
                     "pending export done meeting=${meeting.meetingId} durationSecs=${result.durationSecs} " +
                         "pending=${OutboundQueue.size(context)} elapsedMs=${SystemClock.elapsedRealtime() - drainStartMs}",
                 )
-            }.onFailure { error ->
+            } catch (error: Throwable) {
                 Log.w(TAG, "meeting ${meeting.meetingId} export still pending: ${error.message}", error)
                 DiagnosticsLogger.warn("meeting_export_pending", mapOf("meetingId" to meeting.meetingId), error)
             }
         }
+    }
+
+    internal suspend fun drainPendingExportsForTest(context: Context) {
+        drainPendingExports(context.applicationContext, drainOutbound = false)
     }
 
     private data class ExportResult(val durationSecs: Double, val sizeBytes: Long)
@@ -207,7 +340,7 @@ object MeetingController {
             out.delete()
             Log.w(TAG, "export empty meeting=${meeting.meetingId}")
             DiagnosticsLogger.warn("meeting_export_empty", mapOf("meetingId" to meeting.meetingId))
-            error("No audio captured for this meeting window.")
+            throw NoUsableMeetingAudio("No usable audio captured for this meeting window.")
         }
         val durationSecs = export.durationMs / 1000.0
         val sizeBytes = out.length()
@@ -255,46 +388,161 @@ object MeetingController {
     private fun meetingSliceId(meetingId: String): String =
         UUID.nameUUIDFromBytes("meeting:$meetingId".toByteArray()).toString()
 
+    private fun enqueueMeetingCreate(context: Context, meeting: PersistedActiveMeeting) {
+        OutboundQueue.enqueueMeetingCreate(
+            context = context,
+            meetingId = meeting.meetingId,
+            title = meeting.title,
+            startedAtSec = meeting.startMs / 1000.0,
+            roomId = meeting.roomId,
+            microphoneId = meeting.microphoneId,
+        )
+    }
+
+    private fun enqueueFailureAndRemovePending(context: Context, meeting: ClosedMeeting) {
+        val reason = if (meeting.recoveredAfterRestart) {
+            RECOVERY_FAILURE_REASON
+        } else {
+            "Meeting ended without any usable local audio."
+        }
+        OutboundQueue.enqueueMeetingFailure(
+            context = context,
+            meetingId = meeting.meetingId,
+            endedAtSec = meeting.endMs / 1000.0,
+            failureReason = reason,
+        )
+        removePending(context, meeting.meetingId)
+        DiagnosticsLogger.warn("meeting_recovery_failed_no_audio", mapOf(
+            "meetingId" to meeting.meetingId,
+            "endedAtMs" to meeting.endMs,
+        ))
+    }
+
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private fun load(context: Context): JSONArray =
+    private fun loadPending(context: Context): JSONArray =
         runCatching { JSONArray(prefs(context).getString(KEY_PENDING, "[]")) }.getOrDefault(JSONArray())
 
-    private fun save(context: Context, arr: JSONArray) {
+    private fun savePending(context: Context, arr: JSONArray) {
         check(prefs(context).edit().putString(KEY_PENDING, arr.toString()).commit()) {
             "Could not persist closed meeting export."
         }
     }
 
-    private fun persistPending(context: Context, meeting: ClosedMeeting) = synchronized(lock) {
-        val arr = load(context)
+    private fun transitionActiveToPending(context: Context, meeting: ClosedMeeting) = synchronized(lock) {
+        val stored = loadActiveUnlocked(context)
+        check(stored == null || stored.meetingId == meeting.meetingId) {
+            "Persisted active meeting does not match ${meeting.meetingId}."
+        }
+        val arr = loadPending(context)
         if ((0 until arr.length()).none { arr.getJSONObject(it).getString("meetingId") == meeting.meetingId }) {
-            arr.put(
-                JSONObject()
-                    .put("meetingId", meeting.meetingId)
-                    .put("startMs", meeting.startMs)
-                    .put("endMs", meeting.endMs),
+            arr.put(meeting.toJson())
+        }
+        check(
+            prefs(context).edit()
+                .putString(KEY_PENDING, arr.toString())
+                .remove(KEY_ACTIVE)
+                .commit(),
+        ) { "Could not persist meeting close handoff." }
+    }
+
+    private fun closeActiveMeeting(context: Context, requestedEndMs: Long): ClosedMeeting = synchronized(lock) {
+        val meeting = active ?: error("No active meeting.")
+        val closed = ClosedMeeting(
+            meetingId = meeting.meetingId,
+            startMs = meeting.startMs,
+            endMs = requestedEndMs.coerceAtLeast(meeting.startMs),
+        )
+        transitionActiveToPending(context, closed)
+        active = null
+        closed
+    }
+
+    internal fun pendingExports(context: Context): List<ClosedMeeting> = synchronized(lock) {
+        val arr = loadPending(context)
+        (0 until arr.length()).map { i ->
+            val item = arr.getJSONObject(i)
+            ClosedMeeting(
+                meetingId = item.getString("meetingId"),
+                startMs = item.getLong("startMs"),
+                endMs = item.getLong("endMs"),
+                recoveredAfterRestart = item.optBoolean("recoveredAfterRestart", false),
             )
-            save(context, arr)
         }
     }
 
-    private fun pendingExports(context: Context): List<ClosedMeeting> = synchronized(lock) {
-        val arr = load(context)
-        (0 until arr.length()).map { i ->
-            val item = arr.getJSONObject(i)
-            ClosedMeeting(item.getString("meetingId"), item.getLong("startMs"), item.getLong("endMs"))
+    private fun hasPendingExport(context: Context, meetingId: String): Boolean = synchronized(lock) {
+        val arr = loadPending(context)
+        (0 until arr.length()).any { index ->
+            arr.getJSONObject(index).optString("meetingId") == meetingId
         }
     }
 
     private fun removePending(context: Context, meetingId: String) = synchronized(lock) {
-        val arr = load(context)
+        val arr = loadPending(context)
         val kept = JSONArray()
         for (i in 0 until arr.length()) {
             val item = arr.getJSONObject(i)
             if (item.getString("meetingId") != meetingId) kept.put(item)
         }
-        save(context, kept)
+        savePending(context, kept)
     }
+
+    internal fun persistedActive(context: Context): PersistedActiveMeeting? = synchronized(lock) {
+        loadActiveUnlocked(context)
+    }
+
+    private fun loadActiveUnlocked(context: Context): PersistedActiveMeeting? {
+        val raw = prefs(context).getString(KEY_ACTIVE, null) ?: return null
+        return runCatching {
+            val item = JSONObject(raw)
+            check(item.getInt("version") == ACTIVE_RECORD_VERSION) { "Unsupported active meeting version." }
+            PersistedActiveMeeting(
+                meetingId = item.getString("meetingId"),
+                title = item.getString("title"),
+                startMs = item.getLong("startMs"),
+                heartbeatMs = item.getLong("heartbeatMs"),
+                roomId = item.optString("roomId", "").ifEmpty { null },
+                microphoneId = item.optString("microphoneId", "").ifEmpty { null },
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "discarding invalid persisted active meeting: ${error.message}", error)
+            DiagnosticsLogger.warn("meeting_active_record_invalid", throwable = error)
+            prefs(context).edit().remove(KEY_ACTIVE).commit()
+        }.getOrNull()
+    }
+
+    internal fun persistActive(context: Context, meeting: PersistedActiveMeeting) = synchronized(lock) {
+        check(persistedActive(context) == null) { "A previous meeting is still being recovered." }
+        check(prefs(context).edit().putString(KEY_ACTIVE, meeting.toJson().toString()).commit()) {
+            "Could not persist active meeting."
+        }
+    }
+
+    internal fun touchActive(context: Context, meetingId: String, heartbeatMs: Long) = synchronized(lock) {
+        val stored = loadActiveUnlocked(context) ?: return@synchronized
+        if (stored.meetingId != meetingId) return@synchronized
+        val updated = stored.copy(heartbeatMs = maxOf(stored.heartbeatMs, stored.startMs, heartbeatMs))
+        check(prefs(context).edit().putString(KEY_ACTIVE, updated.toJson().toString()).commit()) {
+            "Could not persist active meeting heartbeat."
+        }
+    }
+
+    private fun PersistedActiveMeeting.toJson(): JSONObject =
+        JSONObject()
+            .put("version", ACTIVE_RECORD_VERSION)
+            .put("meetingId", meetingId)
+            .put("title", title)
+            .put("startMs", startMs)
+            .put("heartbeatMs", heartbeatMs)
+            .putOpt("roomId", roomId)
+            .putOpt("microphoneId", microphoneId)
+
+    private fun ClosedMeeting.toJson(): JSONObject =
+        JSONObject()
+            .put("meetingId", meetingId)
+            .put("startMs", startMs)
+            .put("endMs", endMs)
+            .put("recoveredAfterRestart", recoveredAfterRestart)
 }

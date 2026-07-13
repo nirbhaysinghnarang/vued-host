@@ -80,6 +80,7 @@ import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
@@ -131,6 +132,7 @@ private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
 private const val RECONNECT_MEETING_GRACE_MS = 60_000L
 private const val RECORDER_RECONNECT_RETRY_MS = 250L
 private const val RECORDER_RECONNECT_TIMEOUT_MS = 60_000L
+private const val LOW_BATTERY_THRESHOLD_PERCENT = 20
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -162,6 +164,7 @@ private val VuedTextPrimary = Color(0xFF0B0D12)
 private val VuedTextSecondary = Color(0xFF2F3744)
 private val VuedTextTertiary = Color(0xFF5B6573)
 private val VuedSuccess = Color(0xFF16764F)
+private val VuedChargingBolt = Color(0xFFFFC107)
 private val VuedDanger = Color(0xFFB42318)
 private val VuedIdleRing = Color(0xFFE5EAF0)
 
@@ -530,6 +533,23 @@ private fun AuthGate() {
     val authStatus by VuedAuth.sessionStatus.collectAsState()
     val scope = rememberCoroutineScope()
     var loginWifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
+    var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
+
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                batteryStatus = batteryStatusFromIntent(intent)
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
+    }
 
     val loginConnectionButtons: @Composable () -> Unit = {
         WifiSettingsButton(
@@ -542,26 +562,84 @@ private fun AuthGate() {
         )
     }
 
-    when (authStatus) {
-        is SessionStatus.Authenticated -> {
-            when (HOST_UI_MODE) {
-                HostUiMode.PROD -> ProdRecorderScreen()
-                HostUiMode.DEV -> {
-                    DevRecorderScreen(
-                        userEmail = VuedAuth.currentEmail(),
-                        onSignOut = { scope.launch { VuedAuth.signOut() } },
+    Box(modifier = Modifier.fillMaxSize()) {
+        when (authStatus) {
+            is SessionStatus.Authenticated -> {
+                when (HOST_UI_MODE) {
+                    HostUiMode.PROD -> ProdRecorderScreen()
+                    HostUiMode.DEV -> {
+                        DevRecorderScreen(
+                            userEmail = VuedAuth.currentEmail(),
+                            onSignOut = { scope.launch { VuedAuth.signOut() } },
+                        )
+                    }
+                }
+            }
+            is SessionStatus.RefreshFailure -> LoginScreen(
+                initialError = "Session expired, sign in again",
+                wifiSettingsButton = loginConnectionButtons,
+            )
+            SessionStatus.Initializing -> LoadingScreen()
+            is SessionStatus.NotAuthenticated -> LoginScreen(
+                wifiSettingsButton = loginConnectionButtons,
+            )
+        }
+
+        val batteryLevel = batteryStatus.levelPercent
+        if (batteryLevel != null &&
+            batteryLevel < LOW_BATTERY_THRESHOLD_PERCENT &&
+            !batteryStatus.plugged
+        ) {
+            LowBatteryPowerBanner(levelPercent = batteryLevel)
+        }
+    }
+}
+
+@Composable
+private fun LowBatteryPowerBanner(levelPercent: Int) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 32.dp, vertical = 20.dp),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 680.dp),
+            shape = RoundedCornerShape(14.dp),
+            color = VuedDanger,
+            tonalElevation = 0.dp,
+            shadowElevation = 10.dp,
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "!",
+                    color = Color.White,
+                    fontSize = 34.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        text = "Battery too low",
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = "Battery is at $levelPercent%. Plug in the tablet — this warning clears when power is connected.",
+                        color = Color.White.copy(alpha = 0.92f),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        lineHeight = 20.sp,
                     )
                 }
             }
         }
-        is SessionStatus.RefreshFailure -> LoginScreen(
-            initialError = "Session expired, sign in again",
-            wifiSettingsButton = loginConnectionButtons,
-        )
-        SessionStatus.Initializing -> LoadingScreen()
-        is SessionStatus.NotAuthenticated -> LoginScreen(
-            wifiSettingsButton = loginConnectionButtons,
-        )
     }
 }
 
@@ -2045,12 +2123,20 @@ private fun BatteryStatusBadge(
             horizontalArrangement = Arrangement.spacedBy(7.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            BatteryIcon(
-                levelPercent = level,
-                charging = status.charging,
-                color = color,
-                modifier = Modifier.size(width = 24.dp, height = 14.dp),
-            )
+            Box(
+                modifier = Modifier.size(width = 28.dp, height = 20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                BatteryIcon(
+                    levelPercent = level,
+                    charging = status.charging,
+                    color = color,
+                    modifier = Modifier.size(width = 24.dp, height = 14.dp),
+                )
+                if (status.charging) {
+                    ChargingBolt(modifier = Modifier.fillMaxSize())
+                }
+            }
             Text(
                 text = label,
                 color = VuedTextTertiary,
@@ -2101,6 +2187,22 @@ private fun BatteryIcon(
                 cornerRadius = androidx.compose.ui.geometry.CornerRadius(corner * 0.7f, corner * 0.7f),
             )
         }
+    }
+}
+
+@Composable
+private fun ChargingBolt(modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val bolt = Path().apply {
+            moveTo(size.width * 0.60f, size.height * 0.03f)
+            lineTo(size.width * 0.27f, size.height * 0.58f)
+            lineTo(size.width * 0.48f, size.height * 0.58f)
+            lineTo(size.width * 0.35f, size.height * 0.97f)
+            lineTo(size.width * 0.78f, size.height * 0.40f)
+            lineTo(size.width * 0.56f, size.height * 0.40f)
+            close()
+        }
+        drawPath(bolt, color = VuedChargingBolt)
     }
 }
 

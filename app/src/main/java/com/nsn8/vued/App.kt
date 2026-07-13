@@ -3,6 +3,9 @@ package com.nsn8.vued
 import android.app.Application
 import android.content.Context
 import com.nsn8.vued.auth.VuedAuth
+import com.nsn8.vued.meeting.MeetingController
+import com.nsn8.vued.net.OutboundQueue
+import io.github.jan.supabase.auth.status.SessionStatus
 import io.sentry.IScope
 import io.sentry.Sentry
 import io.sentry.android.core.SentryAndroid
@@ -25,7 +28,11 @@ class App : Application() {
         VuedAuth.init(this)
         AmplitudeTracker.init(this)
         initSentry()
-        bindSentryUserToAuth()
+        runCatching { MeetingController.recoverStaleMeetings(this) }
+            .onFailure { error ->
+                DiagnosticsLogger.error("meeting_startup_recovery_failed", throwable = error)
+            }
+        bindAppStateToAuth()
         val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             DiagnosticsLogger.fatal("uncaught_exception", mapOf("thread" to thread.name), throwable)
@@ -58,10 +65,17 @@ class App : Application() {
         ))
     }
 
-    private fun bindSentryUserToAuth() {
+    private fun bindAppStateToAuth() {
         appScope.launch {
-            VuedAuth.sessionStatus.collect {
+            VuedAuth.sessionStatus.collect { status ->
                 updateSentryContext(this@App)
+                if (status is SessionStatus.Authenticated) {
+                    MeetingController.retryPendingExports(this@App)
+                    runCatching { OutboundQueue.drain(this@App) }
+                        .onFailure { error ->
+                            DiagnosticsLogger.warn("auth_queue_drain_failed", throwable = error)
+                        }
+                }
             }
         }
     }
