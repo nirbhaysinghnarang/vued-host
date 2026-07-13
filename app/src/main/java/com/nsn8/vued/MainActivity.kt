@@ -47,7 +47,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -129,7 +128,7 @@ import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
-private const val RECONNECT_MEETING_GRACE_MS = 10_000L
+private const val RECONNECT_MEETING_GRACE_MS = 60_000L
 private const val RECORDER_RECONNECT_RETRY_MS = 250L
 private const val RECORDER_RECONNECT_TIMEOUT_MS = 10_000L
 private const val TAG = "VuedMainActivity"
@@ -352,7 +351,7 @@ class MainActivity : ComponentActivity() {
         return true
     }
 
-    private fun scheduleRecorderReconnect(device: UsbDevice) {
+    private fun scheduleRecorderReconnect(device: UsbDevice?) {
         recorderReconnectJob?.cancel()
         recorderReconnectJob = lifecycleScope.launch {
             val attachedAtMs = System.currentTimeMillis()
