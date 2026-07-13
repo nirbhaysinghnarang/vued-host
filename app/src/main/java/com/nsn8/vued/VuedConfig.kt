@@ -13,7 +13,7 @@ object VuedConfig {
         STAGING,
     }
 
-    val MODE = Mode.STAGING
+    val MODE = Mode.PROD
 
     private const val SUPABASE_URL_PROD = "https://fmzwemrvhiyyotswkplb.supabase.co"
     private const val SUPABASE_URL_DEV = "https://eubvwnuocitdcctwqjox.supabase.co"
