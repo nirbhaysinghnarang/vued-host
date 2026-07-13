@@ -162,6 +162,7 @@ private val VuedTextPrimary = Color(0xFF0B0D12)
 private val VuedTextSecondary = Color(0xFF2F3744)
 private val VuedTextTertiary = Color(0xFF5B6573)
 private val VuedSuccess = Color(0xFF16764F)
+private val VuedDanger = Color(0xFFB42318)
 private val VuedIdleRing = Color(0xFFE5EAF0)
 
 class MainActivity : ComponentActivity() {
@@ -1556,7 +1557,8 @@ private fun AudioMuteButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
-    val iconColor = if (unmuted && enabled) Color.White else VuedTextTertiary
+    val iconColor = Color.White
+    val containerColor = if (unmuted) VuedSuccess else VuedDanger
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -1565,10 +1567,10 @@ private fun AudioMuteButton(
             .size(112.dp)
             .semantics { contentDescription = if (unmuted) "Mute" else "Unmute" },
         colors = ButtonDefaults.buttonColors(
-            containerColor = if (unmuted) VuedSuccess else VuedIdleRing,
+            containerColor = containerColor,
             contentColor = iconColor,
-            disabledContainerColor = VuedIdleRing,
-            disabledContentColor = VuedTextTertiary,
+            disabledContainerColor = containerColor,
+            disabledContentColor = iconColor,
         ),
         contentPadding = PaddingValues(0.dp),
         elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
