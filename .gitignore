@@ -13,3 +13,7 @@
 .externalNativeBuild
 .cxx
 local.properties
+dist/android-host/2/vued-host-2.apk
+dist/android-host/3/vued-host-3.apk
+dist/android-host/latest/manifest.json
+*.apk

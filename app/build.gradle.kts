@@ -15,6 +15,7 @@ android {
         }
     }
 
+
     defaultConfig {
         applicationId = "com.nsn8.vued"
         minSdk = 30
@@ -27,6 +28,7 @@ android {
         buildConfigField("String", "SENTRY_ENVIRONMENT", buildConfigString(System.getenv("SENTRY_ENVIRONMENT") ?: System.getenv("VUED_ENVIRONMENT") ?: "production"))
         buildConfigField("String", "SENTRY_RELEASE", buildConfigString(System.getenv("SENTRY_RELEASE") ?: "vued-host@0.0.1"))
     }
+
 
     buildTypes {
         release {

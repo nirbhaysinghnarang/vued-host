@@ -81,6 +81,22 @@ object VuedApi {
         )
     }
 
+    /** Marks a meeting terminally failed when its locally retained audio is unusable. */
+    suspend fun markMeetingFailed(
+        meetingId: String,
+        endedAtSec: Double,
+        failureReason: String,
+    ) {
+        request(
+            "/api/v1/meetings/$meetingId",
+            method = "PATCH",
+            body = JSONObject()
+                .put("status", "failed")
+                .put("ended_at", endedAtSec)
+                .put("failure_reason", failureReason),
+        )
+    }
+
     /** Registers the audio-slice metadata row (status -> pending). [roomId] tags
      *  the slice with the tablet's assigned room; the server resolves mic/org. */
     suspend fun createSlice(
@@ -105,6 +121,7 @@ object VuedApi {
                 .put("endedAt", endedAtSec)
                 .put("audioDurationSecs", durationSecs)
                 .put("audioSizeBytes", sizeBytes)
+                .put("captureSource", "tablet")
                 .putOpt("roomId", roomId),
         )
     }
@@ -129,6 +146,7 @@ object VuedApi {
                 .put("endedAt", endedAtSec)
                 .put("audioDurationSecs", durationSecs)
                 .put("audioSizeBytes", sizeBytes)
+                .put("captureSource", "tablet")
                 .putOpt("roomId", roomId),
         )
     }
@@ -140,7 +158,7 @@ object VuedApi {
         durationSecs: Double,
         sizeBytes: Long,
     ) = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw ApiException("not signed in")
         val request = Request.Builder()
             .url("${VuedConfig.API_BASE_URL}/api/v1/transcript/audio-slices/$sliceId/audio")
             .header("Authorization", "Bearer $token")
@@ -370,17 +388,50 @@ object VuedApi {
 
     // ---- speaker enrollment ----
 
+    data class SpeakerEnrollmentGroup(
+        val captureSource: String,
+        val model: String,
+        val sampleCount: Int,
+        val enrolled: Boolean,
+        val updatedAt: Double?,
+    )
+
     data class SpeakerProfile(
         val id: String,
         val displayName: String,
         val sampleCount: Int,
         val model: String,
+        val enrollmentGroups: List<SpeakerEnrollmentGroup>,
     )
 
     /** Thrown on 409 when a speaker with the same name exists — carries the
      *  existing profiles so the UI can offer "add a sample to ⟨X⟩". */
     class DuplicateSpeakerException(val profiles: List<SpeakerProfile>) :
         Exception("A speaker with that name already exists.")
+
+    private fun parseEnrollmentGroup(o: JSONObject?): SpeakerEnrollmentGroup? {
+        if (o == null) return null
+        val captureSource = o.optString("captureSource", o.optString("capture_source"))
+        if (captureSource != "tablet" && captureSource != "desktop") return null
+        val updatedAt = when {
+            o.has("updatedAt") && !o.isNull("updatedAt") -> o.optDouble("updatedAt")
+            o.has("updated_at") && !o.isNull("updated_at") -> o.optDouble("updated_at")
+            else -> null
+        }
+        return SpeakerEnrollmentGroup(
+            captureSource = captureSource,
+            model = o.optString("model"),
+            sampleCount = o.optInt("sampleCount", o.optInt("sample_count", 0)),
+            enrolled = o.optBoolean("enrolled", false),
+            updatedAt = updatedAt,
+        )
+    }
+
+    private fun parseEnrollmentGroups(o: JSONObject): List<SpeakerEnrollmentGroup> {
+        val arr = o.optJSONArray("enrollmentGroups") ?: o.optJSONArray("enrollment_groups")
+        return if (arr == null) emptyList()
+        else (0 until arr.length()).mapNotNull { parseEnrollmentGroup(arr.optJSONObject(it)) }
+    }
 
     private fun parseProfile(o: JSONObject?): SpeakerProfile? {
         if (o == null) return null
@@ -391,6 +442,7 @@ object VuedApi {
             displayName = o.optString("displayName", o.optString("display_name")),
             sampleCount = o.optInt("sampleCount", o.optInt("sample_count", 0)),
             model = o.optString("model"),
+            enrollmentGroups = parseEnrollmentGroups(o),
         )
     }
 
@@ -416,10 +468,11 @@ object VuedApi {
         durationSecs: Double? = null,
         isOrgUser: Boolean = false,
     ): SpeakerProfile = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw ApiException("not signed in")
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("display_name", displayName)
             .addFormDataPart("is_org_user", isOrgUser.toString())
+            .addFormDataPart("capture_source", "tablet")
             .addFormDataPart("audio", "enroll.wav", audio.toRequestBody("audio/wav".toMediaType()))
         if (profileId != null) body.addFormDataPart("profile_id", profileId)
         if (durationSecs != null) body.addFormDataPart("duration_secs", durationSecs.toString())
@@ -518,7 +571,7 @@ object VuedApi {
         method: String,
         body: JSONObject? = null,
     ): JSONObject? = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw ApiException("not signed in")
         val builder = Request.Builder()
             .url(VuedConfig.API_BASE_URL + path)
             .header("Authorization", "Bearer $token")

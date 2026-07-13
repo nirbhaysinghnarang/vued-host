@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import com.nsn8.vued.AmplitudeTracker
 import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.VuedConfig
 import com.nsn8.vued.ambient.AmbientFlusher
@@ -57,6 +58,7 @@ class RecordingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            RecorderState.markCaptureStoppedByUser()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -117,13 +119,8 @@ class RecordingService : Service() {
                 val lastAudioMs = pipeline.lastAudioMs
                 val ageMs = if (lastAudioMs > 0L) System.currentTimeMillis() - lastAudioMs else Long.MAX_VALUE
                 if (running && status.captureReady && ageMs > RecorderState.CAPTURE_STALE_MS) {
-                    RecorderState.update {
-                        it.copy(
-                            captureReady = false,
-                            micDisconnected = true,
-                            error = "Mic disconnected",
-                        )
-                    }
+                    RecorderState.markMicDisconnected()
+                    AmplitudeTracker.track("mic_disconnected", mapOf("reason" to "capture_stale", "ageMs" to ageMs))
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastStaleReportMs >= CAPTURE_STALE_LOG_INTERVAL_MS) {
                         lastStaleReportMs = now
@@ -252,18 +249,14 @@ class RecordingService : Service() {
             mapOf("message" to (error?.message ?: "UMA mic unavailable")),
             error,
         )
-        RecorderState.update {
-            it.copy(
-                captureReady = false,
-                error = message,
-                micDisconnected = true,
-            )
-        }
+        AmplitudeTracker.track(
+            "mic_disconnected",
+            mapOf("reason" to "uma_unavailable", "message" to (error?.message ?: "UMA mic unavailable")),
+        )
+        RecorderState.markMicDisconnected()
         runCatching {
             runBlocking {
-                if (MeetingController.active != null) {
-                    MeetingController.stop(applicationContext)
-                } else {
+                if (MeetingController.active == null) {
                     AmbientFlusher.flushOnce(this@RecordingService)
                 }
             }
@@ -330,11 +323,14 @@ class RecordingService : Service() {
     private fun publishCaptureReadyIfNeeded(source: String, lastAudioMs: Long) {
         if (RecorderState.state.value.hasFreshAudio()) return
         DiagnosticsLogger.info("capture_ready", mapOf("source" to source))
+        AmplitudeTracker.track("mic_connected", mapOf("source" to source))
         RecorderState.update {
             it.copy(
                 running = true,
                 captureReady = true,
                 micDisconnected = false,
+                disconnectedAtMs = 0L,
+                resumeOnReconnect = false,
                 lastAudioMs = lastAudioMs,
                 error = null,
             )
@@ -407,7 +403,12 @@ class RecordingService : Service() {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            val serviceType = if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
+            startForeground(NOTIF_ID, notification, serviceType)
         } else {
             startForeground(NOTIF_ID, notification)
         }
@@ -431,6 +432,9 @@ class RecordingService : Service() {
         }
 
         fun stop(context: Context) {
+            // Publish mute intent before the service command is delivered so a USB
+            // detach immediately after a tap cannot be mistaken for active capture.
+            RecorderState.markCaptureStoppedByUser()
             context.startService(
                 Intent(context, RecordingService::class.java).setAction(ACTION_STOP)
             )

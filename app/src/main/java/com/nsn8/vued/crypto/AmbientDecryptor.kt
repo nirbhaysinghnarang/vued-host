@@ -46,7 +46,7 @@ object AmbientDecryptor {
     }
 
     suspend fun provision(context: Context, passphrase: String) = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw VuedApi.ApiException("not signed in")
         val userId = jwtSub(token) ?: throw VuedApi.ApiException("could not read user id")
         if (passphrase.isBlank()) throw VuedApi.ApiException("passphrase is required")
         val pair = generateX25519KeyPair()
@@ -88,7 +88,7 @@ object AmbientDecryptor {
     }
 
     suspend fun unlock(context: Context, passphrase: String) = withContext(Dispatchers.IO) {
-        val token = VuedAuth.currentAccessToken() ?: throw VuedApi.ApiException("not signed in")
+        val token = VuedAuth.currentAccessTokenReady() ?: throw VuedApi.ApiException("not signed in")
         val userId = jwtSub(token) ?: throw VuedApi.ApiException("could not read user id")
         val vault = VuedApi.fetchVault()
         val salt = b64(vault.getString("salt"))

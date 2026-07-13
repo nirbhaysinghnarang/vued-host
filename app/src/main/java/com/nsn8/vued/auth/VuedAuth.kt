@@ -9,7 +9,13 @@ import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.github.jan.supabase.createSupabaseClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 /**
  * Thin wrapper over the Supabase Auth (GoTrue) client: email/password sign-in,
@@ -20,6 +26,9 @@ import kotlinx.coroutines.flow.StateFlow
  * timer needed) and reloads the persisted session on init.
  */
 object VuedAuth {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val authReady = MutableStateFlow(false)
 
     @Volatile
     private var clientRef: SupabaseClient? = null
@@ -39,6 +48,18 @@ object VuedAuth {
                     sessionManager = SharedPrefsSessionManager(context)
                     alwaysAutoRefresh = true
                     autoLoadFromStorage = true
+                    autoSaveToStorage = true
+                    enableLifecycleCallbacks = false
+                }
+            }.also { client ->
+                scope.launch {
+                    runCatching {
+                        if (client.auth.loadFromStorage(autoRefresh = true)) {
+                            runCatching { client.auth.refreshCurrentSession() }
+                            client.auth.startAutoRefreshForCurrentSession()
+                        }
+                    }
+                    authReady.value = true
                 }
             }
         }
@@ -58,10 +79,19 @@ object VuedAuth {
         client.auth.signOut(SignOutScope.LOCAL)
     }
 
+    suspend fun awaitReady() {
+        authReady.first { it }
+    }
+
     fun currentUserId(): String? = client.auth.currentUserOrNull()?.id
 
     fun currentEmail(): String? = client.auth.currentUserOrNull()?.email
 
     /** Current (auto-refreshed) access token, or null if not signed in. */
     fun currentAccessToken(): String? = client.auth.currentSessionOrNull()?.accessToken
+
+    suspend fun currentAccessTokenReady(): String? {
+        awaitReady()
+        return currentAccessToken()
+    }
 }

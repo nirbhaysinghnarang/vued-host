@@ -2,6 +2,7 @@ package com.nsn8.vued.net
 
 import android.content.Context
 import android.util.Log
+import com.nsn8.vued.AmplitudeTracker
 import com.nsn8.vued.DiagnosticsLogger
 import com.nsn8.vued.audio.MultiChannelWavRollingBuffer
 import com.nsn8.vued.audio.RollingBuffer
@@ -23,11 +24,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - **Never miss audio / never lose a meeting:** exported audio artifacts and the
  *    meeting-create are committed to a persisted index before any network call. The
  *    capture/flush cursor advances on enqueue, not on upload.
- *  - **Ordering:** a meeting's audio slice will not upload until that meeting's
- *    `MEETING_CREATE` item has succeeded — enforced on every drain, including retries.
- *    (The create is enqueued at meeting start, so it always precedes the stop-time
- *    audio item in the queue.) The drain services items in priority tiers —
- *    `MEETING_CREATE → MEETING → MEETING_SOURCE_WAV → AMBIENT → AMBIENT_SOURCE_WAV`,
+ *  - **Ordering:** a meeting's audio slice, source sidecar, or terminal failure PATCH
+ *    will not upload until that meeting's `MEETING_CREATE` item has succeeded —
+ *    enforced on every drain, including retries. The drain services items in priority
+ *    tiers — `MEETING_CREATE → MEETING/MEETING_FAILURE → MEETING_SOURCE_WAV →
+ *    AMBIENT → AMBIENT_SOURCE_WAV`,
  *    FIFO within a tier — and reloads the index between items, so meeting work
  *    enqueued mid-drain preempts a queued ambient backlog instead of waiting behind
  *    it. Ambient source sidecars additionally yield between 4 MB chunks to pending
@@ -49,14 +50,17 @@ object OutboundQueue {
     private const val TAG = "VuedOutboundQueue"
     private const val PREFS = "vued_outbound"
     private const val KEY = "queue"
+    private const val KEY_COMPLETED_MEETING_AUDIO = "completed_meeting_audio"
+    private const val MAX_COMPLETED_MEETING_MARKERS = 512
 
-    enum class Kind { MEETING_CREATE, AMBIENT, MEETING, MEETING_SOURCE_WAV, AMBIENT_SOURCE_WAV }
+    enum class Kind { MEETING_CREATE, MEETING_FAILURE, AMBIENT, MEETING, MEETING_SOURCE_WAV, AMBIENT_SOURCE_WAV }
 
     /** Drain priority: lower value first; FIFO (insertion order) within a tier.
      *  Explicit `when` — not [Kind.ordinal] — because kind names are persisted. */
     private fun priority(kind: Kind): Int = when (kind) {
         Kind.MEETING_CREATE -> 0
         Kind.MEETING -> 1
+        Kind.MEETING_FAILURE -> 1
         Kind.MEETING_SOURCE_WAV -> 2 // includes streaming items
         Kind.AMBIENT -> 3
         Kind.AMBIENT_SOURCE_WAV -> 4
@@ -86,12 +90,23 @@ object OutboundQueue {
         }
     }
 
-    private fun append(context: Context, item: JSONObject) {
-        synchronized(lock) { save(context, load(context).put(item)) }
-    }
-
     /** Pending item count (for status display). */
     fun size(context: Context): Int = synchronized(lock) { load(context).length() }
+
+    /**
+     * True once a meeting slice is durably queued or has completed upload. The
+     * completion marker closes the crash window between upload success and removal of
+     * MeetingController's pending-export record.
+     */
+    fun hasDurableMeetingAudio(context: Context, meetingId: String): Boolean = synchronized(lock) {
+        val queued = load(context)
+        val hasQueuedAudio = (0 until queued.length()).any { index ->
+            val item = queued.getJSONObject(index)
+            item.optString("kind") == Kind.MEETING.name &&
+                item.optString("meetingId") == meetingId
+        }
+        hasQueuedAudio || loadCompletedMeetingAudio(context).contains(meetingId)
+    }
 
     // ---- enqueue (the commit points) ----
 
@@ -101,23 +116,92 @@ object OutboundQueue {
         meetingId: String,
         title: String,
         startedAtSec: Double,
+        roomId: String? = RoomConfig.roomId(context),
+        microphoneId: String? = RoomConfig.microphoneId(context),
     ) {
-        append(
-            context,
-            JSONObject()
-                .put("id", "meeting:$meetingId")
-                .put("kind", Kind.MEETING_CREATE.name)
-                .put("meetingId", meetingId)
-                .put("title", title)
-                .put("startedAtSec", startedAtSec)
-                // Snapshot the assigned room at meeting start so the in-progress
-                // placeholder is filed under the same room as the eventual audio.
-                .putOpt("roomId", RoomConfig.roomId(context))
-                .putOpt("microphoneId", RoomConfig.microphoneId(context)),
-        )
+        val inserted = synchronized(lock) {
+            val arr = load(context)
+            val alreadyPending = (0 until arr.length()).any { index ->
+                val item = arr.getJSONObject(index)
+                item.optString("kind") == Kind.MEETING_CREATE.name &&
+                    item.optString("meetingId") == meetingId
+            }
+            if (alreadyPending) {
+                false
+            } else {
+                save(
+                    context,
+                    arr.put(
+                        JSONObject()
+                            .put("id", "meeting:$meetingId")
+                            .put("kind", Kind.MEETING_CREATE.name)
+                            .put("meetingId", meetingId)
+                            .put("title", title)
+                            .put("startedAtSec", startedAtSec)
+                            // Callers recovering a persisted meeting pass the original
+                            // snapshots here rather than reading today's room assignment.
+                            .putOpt("roomId", roomId)
+                            .putOpt("microphoneId", microphoneId),
+                    ),
+                )
+                true
+            }
+        }
+        if (!inserted) {
+            Log.i(TAG, "MEETING_CREATE already pending $meetingId")
+            DiagnosticsLogger.info("queue_meeting_create_deduplicated", mapOf(
+                "meetingId" to meetingId,
+                "pending" to size(context),
+            ))
+            return
+        }
         Log.i(TAG, "enqueued MEETING_CREATE $meetingId")
         DiagnosticsLogger.info("queue_meeting_create_enqueued", mapOf(
             "meetingId" to meetingId,
+            "pending" to size(context),
+        ))
+    }
+
+    /**
+     * Durable terminal PATCH for a meeting whose retained local audio cannot be
+     * recovered. The fixed id makes repeated recovery attempts idempotent locally;
+     * drain ordering holds the PATCH until the corresponding create has succeeded.
+     */
+    fun enqueueMeetingFailure(
+        context: Context,
+        meetingId: String,
+        endedAtSec: Double,
+        failureReason: String,
+    ) {
+        val inserted = synchronized(lock) {
+            val arr = load(context)
+            val alreadyPending = (0 until arr.length()).any { index ->
+                val item = arr.getJSONObject(index)
+                item.optString("kind") == Kind.MEETING_FAILURE.name &&
+                    item.optString("meetingId") == meetingId
+            }
+            if (alreadyPending) {
+                false
+            } else {
+                save(
+                    context,
+                    arr.put(
+                        JSONObject()
+                            .put("id", "meeting-failure:$meetingId")
+                            .put("kind", Kind.MEETING_FAILURE.name)
+                            .put("meetingId", meetingId)
+                            .put("endedAtSec", endedAtSec)
+                            .put("failureReason", failureReason),
+                    ),
+                )
+                true
+            }
+        }
+        val event = if (inserted) "queue_meeting_failure_enqueued" else "queue_meeting_failure_deduplicated"
+        Log.i(TAG, if (inserted) "enqueued MEETING_FAILURE $meetingId" else "MEETING_FAILURE already pending $meetingId")
+        DiagnosticsLogger.info(event, mapOf(
+            "meetingId" to meetingId,
+            "endedAtSec" to endedAtSec,
             "pending" to size(context),
         ))
     }
@@ -353,13 +437,33 @@ object OutboundQueue {
     ) {
         synchronized(lock) {
             val dest = File(dir(context), "$sliceId.m4a")
+            val current = load(context)
+            val alreadyPending = (0 until current.length()).any { index ->
+                current.getJSONObject(index).optString("id") == sliceId
+            }
+            if (alreadyPending && dest.isFile) {
+                source.delete()
+                Log.i(TAG, "$kind slice $sliceId already pending")
+                DiagnosticsLogger.info("queue_audio_deduplicated", mapOf(
+                    "kind" to kind.name,
+                    "sliceId" to sliceId,
+                    "meetingId" to meetingId,
+                    "pending" to current.length(),
+                ))
+                return
+            }
+            val retained = JSONArray()
+            for (index in 0 until current.length()) {
+                val item = current.getJSONObject(index)
+                if (item.optString("id") != sliceId) retained.put(item)
+            }
             if (!source.renameTo(dest)) {
                 source.copyTo(dest, overwrite = true)
                 source.delete()
             }
             save(
                 context,
-                load(context).put(
+                retained.put(
                     JSONObject()
                         .put("id", sliceId)
                         .put("kind", kind.name)
@@ -383,6 +487,17 @@ object OutboundQueue {
                 "bytes" to dest.length(),
                 "pending" to load(context).length(),
             ))
+            AmplitudeTracker.track(
+                "audio_push_enqueued",
+                mapOf(
+                    "kind" to kind.name,
+                    "sliceId" to sliceId,
+                    "meetingId" to meetingId,
+                    "bytes" to dest.length(),
+                    "durationSecs" to durationSecs,
+                    "pending" to load(context).length(),
+                ),
+            )
         }
     }
 
@@ -392,10 +507,10 @@ object OutboundQueue {
      * Attempts every pending item at most once per pass, highest-priority tier first
      * ([priority]; insertion order within a tier), reloading the index between items so
      * meeting work enqueued mid-drain is picked up ahead of a queued ambient backlog.
-     * A meeting's audio slice is skipped while its `MEETING_CREATE` is still pending,
-     * so the meeting always exists server-side before its audio is uploaded — on first
-     * try and on every retry. Reruns while further drains were requested; a yielded
-     * ambient sidecar is re-pickable within the pass and is not counted as a failure.
+     * A meeting's audio slice, source sidecar, or failure PATCH is skipped while its
+     * `MEETING_CREATE` is pending. Reruns while further drains were requested; a
+     * yielded ambient sidecar is re-pickable within the pass and is not counted as a
+     * failure.
      */
     suspend fun drain(context: Context) {
         drainRequested.set(true) // set AFTER the caller's enqueue, so a request is never lost
@@ -415,6 +530,9 @@ object OutboundQueue {
             // `draining` (that caller's CAS failed, so nobody owns it) — re-claim.
             if (!drainRequested.get()) return
         }
+        // Close the small race where another caller requested a drain after the loop's
+        // final condition check but before [draining] was cleared.
+        if (drainRequested.getAndSet(false)) drain(context)
     }
 
     private suspend fun drainPass(context: Context) {
@@ -433,6 +551,7 @@ object OutboundQueue {
             attempts += 1
             val yielded = when (Kind.valueOf(item.getString("kind"))) {
                 Kind.MEETING_CREATE -> { drainMeetingCreate(context, item); false }
+                Kind.MEETING_FAILURE -> { drainMeetingFailure(context, item); false }
                 Kind.AMBIENT, Kind.MEETING -> { drainAudio(context, item); false }
                 Kind.MEETING_SOURCE_WAV -> { drainMeetingSourceWav(context, item); false }
                 Kind.AMBIENT_SOURCE_WAV -> drainAmbientSourceWav(context, item) {
@@ -508,6 +627,30 @@ object OutboundQueue {
         }
     }
 
+    private suspend fun drainMeetingFailure(context: Context, item: JSONObject) {
+        val meetingId = item.getString("meetingId")
+        if (hasPendingMeetingCreate(context, meetingId)) {
+            Log.i(TAG, "meeting failure $meetingId waiting on meeting-create")
+            return
+        }
+        try {
+            VuedApi.markMeetingFailed(
+                meetingId = meetingId,
+                endedAtSec = item.getDouble("endedAtSec"),
+                failureReason = item.getString("failureReason"),
+            )
+            remove(context, item.getString("id"))
+            Log.i(TAG, "marked queued meeting failed $meetingId")
+            DiagnosticsLogger.info("queue_meeting_failure_delivered", mapOf(
+                "meetingId" to meetingId,
+                "pending" to size(context),
+            ))
+        } catch (e: Exception) {
+            Log.w(TAG, "meeting $meetingId failure patch still pending: ${e.message}")
+            DiagnosticsLogger.warn("queue_meeting_failure_pending", mapOf("meetingId" to meetingId), e)
+        }
+    }
+
     private suspend fun drainAudio(context: Context, item: JSONObject) {
         val id = item.getString("id")
         val kind = Kind.valueOf(item.getString("kind"))
@@ -525,6 +668,17 @@ object OutboundQueue {
         try {
             val durationSecs = item.getDouble("durationSecs")
             val sizeBytes = item.getLong("sizeBytes")
+            AmplitudeTracker.track(
+                "audio_push_started",
+                mapOf(
+                    "sliceId" to id,
+                    "kind" to kind.name,
+                    "meetingId" to item.optString("meetingId", ""),
+                    "bytes" to sizeBytes,
+                    "durationSecs" to durationSecs,
+                    "metadataDone" to item.optBoolean("metadataDone", false),
+                ),
+            )
             if (!item.optBoolean("metadataDone", false)) {
                 val roomId = item.optString("roomId", "").ifEmpty { null }
                 when (kind) {
@@ -543,12 +697,35 @@ object OutboundQueue {
                 setMetadataDone(context, id) // persist so a retry skips re-create
             }
             VuedApi.uploadSliceAudio(id, file, durationSecs, sizeBytes)
+            if (kind == Kind.MEETING) {
+                markMeetingAudioCompleted(context, item.getString("meetingId"))
+            }
             runCatching { deleteUploadedSourceSegments(context, item) }
             file.delete()
             remove(context, id)
             Log.i(TAG, "uploaded queued slice $id (${kind.name})")
+            AmplitudeTracker.track(
+                "audio_push_succeeded",
+                mapOf(
+                    "sliceId" to id,
+                    "kind" to kind.name,
+                    "meetingId" to item.optString("meetingId", ""),
+                    "bytes" to sizeBytes,
+                    "durationSecs" to durationSecs,
+                    "pending" to size(context),
+                ),
+            )
         } catch (e: Exception) {
             Log.w(TAG, "slice $id still pending: ${e.message}")
+            AmplitudeTracker.track(
+                "audio_push_pending",
+                mapOf(
+                    "sliceId" to id,
+                    "kind" to kind.name,
+                    "meetingId" to item.optString("meetingId", ""),
+                    "message" to (e.message ?: e.javaClass.simpleName),
+                ),
+            )
             DiagnosticsLogger.warn("queue_audio_pending", mapOf(
                 "sliceId" to id,
                 "kind" to kind.name,
@@ -873,6 +1050,25 @@ object OutboundQueue {
                 "sliceId" to item.optString("sliceId"), "deleted" to deleted,
             ))
         }
+    }
+
+    private fun loadCompletedMeetingAudio(context: Context): List<String> =
+        runCatching {
+            val arr = JSONArray(prefs(context).getString(KEY_COMPLETED_MEETING_AUDIO, "[]"))
+            (0 until arr.length()).mapNotNull { index ->
+                arr.optString(index).takeIf { it.isNotEmpty() }
+            }
+        }.getOrDefault(emptyList())
+
+    private fun markMeetingAudioCompleted(context: Context, meetingId: String) = synchronized(lock) {
+        val current = loadCompletedMeetingAudio(context)
+        if (meetingId in current) return@synchronized
+        val retained = (current + meetingId).takeLast(MAX_COMPLETED_MEETING_MARKERS)
+        check(
+            prefs(context).edit()
+                .putString(KEY_COMPLETED_MEETING_AUDIO, JSONArray(retained).toString())
+                .commit(),
+        ) { "Could not persist completed meeting audio marker." }
     }
 
     // ---- index mutations (whole-array rewrite under lock, like iOS UserDefaults) ----

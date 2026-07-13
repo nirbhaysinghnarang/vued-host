@@ -84,6 +84,7 @@ object DiagnosticsLogger {
     private fun write(level: String, event: String, data: Map<String, Any?>, throwable: Throwable?, sentry: Boolean) {
         val line = lineFor(level, event, data, throwable)
         channel.trySend(line)
+        AmplitudeTracker.trackDiagnosticsEvent(event, data)
         when (level) {
             "warn" -> Log.w(TAG, event, throwable)
             "error", "fatal" -> Log.e(TAG, event, throwable)

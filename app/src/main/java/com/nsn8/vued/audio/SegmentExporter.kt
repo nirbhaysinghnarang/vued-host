@@ -2,7 +2,10 @@ package com.nsn8.vued.audio
 
 import android.media.MediaCodec
 import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.util.Log
+import com.nsn8.vued.DiagnosticsLogger
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -15,6 +18,15 @@ import java.nio.ByteBuffer
 object SegmentExporter {
 
     data class Result(val file: File, val durationMs: Long, val segmentCount: Int)
+    private data class EncodedSample(
+        val bytes: ByteArray,
+        val presentationTimeUs: Long,
+        val flags: Int,
+    )
+    private data class ReadableSegment(
+        val format: MediaFormat,
+        val samples: List<EncodedSample>,
+    )
 
     /** Pure selection: which segments overlap [startMs, endMs]. Exposed for tests. */
     fun overlappingSegments(
@@ -27,9 +39,10 @@ object SegmentExporter {
             .sortedBy { it.startMs }
 
     /**
-     * Concatenates the overlapping segments into [out]. Returns null if no segment
-     * overlaps the window. Caller flushes the rolling buffer first so the tail segment
-     * is finalized.
+     * Concatenates the usable overlapping segments into [out], skipping corrupt,
+     * incomplete, missing, or empty segments independently. Returns null if no usable
+     * audio remains. Caller flushes the rolling buffer first so the tail segment is
+     * finalized.
      */
     fun exportWindow(
         segments: List<RollingBuffer.Segment>,
@@ -45,58 +58,113 @@ object SegmentExporter {
         var muxerStarted = false
         var ptsOffsetUs = 0L
         var maxPtsUs = 0L
-        val buffer = ByteBuffer.allocate(MAX_SAMPLE_BYTES)
+        var successfulSegmentCount = 0
         val info = MediaCodec.BufferInfo()
 
         try {
             for (segment in selected) {
-                if (!segment.file.exists()) continue
-                val extractor = MediaExtractor()
-                try {
-                    extractor.setDataSource(segment.file.absolutePath)
-                    val track = (0 until extractor.trackCount).firstOrNull {
-                        extractor.getTrackFormat(it).getString(android.media.MediaFormat.KEY_MIME)
-                            ?.startsWith("audio/") == true
-                    } ?: continue
-                    extractor.selectTrack(track)
-                    val format = extractor.getTrackFormat(track)
-
-                    if (!muxerStarted) {
-                        muxTrack = muxer.addTrack(format)
-                        muxer.start()
-                        muxerStarted = true
-                    }
-
-                    var lastPtsUs = 0L
-                    while (true) {
-                        val size = extractor.readSampleData(buffer, 0)
-                        if (size < 0) break
-                        val ptsUs = extractor.sampleTime
-                        info.offset = 0
-                        info.size = size
-                        info.presentationTimeUs = ptsOffsetUs + ptsUs
-                        info.flags = MediaCodec.BUFFER_FLAG_KEY_FRAME // every AAC frame is a sync frame
-                        muxer.writeSampleData(muxTrack, buffer, info)
-                        lastPtsUs = info.presentationTimeUs
-                        maxPtsUs = maxOf(maxPtsUs, lastPtsUs)
-                        extractor.advance()
-                    }
-                    // Advance the timeline by this segment so the next one doesn't overlap.
-                    ptsOffsetUs = maxPtsUs + AAC_FRAME_US
-                } finally {
-                    extractor.release()
+                // Fully stage one segment before mutating the destination muxer. If a
+                // corrupt tail fails halfway through extraction, none of its partial
+                // samples or timestamps can poison the following valid segment.
+                val readable = readSegment(segment) ?: continue
+                if (!muxerStarted) {
+                    muxTrack = muxer.addTrack(readable.format)
+                    muxer.start()
+                    muxerStarted = true
                 }
+                readable.samples.forEach { sample ->
+                    info.offset = 0
+                    info.size = sample.bytes.size
+                    info.presentationTimeUs = ptsOffsetUs + sample.presentationTimeUs
+                    info.flags = sample.flags
+                    muxer.writeSampleData(muxTrack, ByteBuffer.wrap(sample.bytes), info)
+                    maxPtsUs = maxOf(maxPtsUs, info.presentationTimeUs)
+                }
+                successfulSegmentCount += 1
+                ptsOffsetUs = maxPtsUs + AAC_FRAME_US
             }
         } finally {
             if (muxerStarted) runCatching { muxer.stop() }
             runCatching { muxer.release() }
         }
 
-        if (!muxerStarted) return null
-        return Result(out, durationMs = maxPtsUs / 1000, segmentCount = selected.size)
+        if (!muxerStarted || successfulSegmentCount == 0) return null
+        return Result(out, durationMs = maxPtsUs / 1000, segmentCount = successfulSegmentCount)
+    }
+
+    private fun readSegment(segment: RollingBuffer.Segment): ReadableSegment? {
+        if (!segment.file.isFile) {
+            diagnoseSkippedSegment(segment, "missing", null)
+            return null
+        }
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(segment.file.absolutePath)
+            val track = (0 until extractor.trackCount).firstOrNull {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("audio/") == true
+            }
+            if (track == null) {
+                diagnoseSkippedSegment(segment, "no_audio_track", null)
+                return null
+            }
+            extractor.selectTrack(track)
+            val format = extractor.getTrackFormat(track)
+            val scratch = ByteBuffer.allocate(MAX_SAMPLE_BYTES)
+            val samples = mutableListOf<EncodedSample>()
+            while (true) {
+                scratch.clear()
+                val size = extractor.readSampleData(scratch, 0)
+                if (size < 0) break
+                val presentationTimeUs = extractor.sampleTime
+                check(presentationTimeUs >= 0L) { "Audio sample has no presentation timestamp." }
+                val bytes = ByteArray(size)
+                scratch.position(0)
+                scratch.limit(size)
+                scratch.get(bytes)
+                samples += EncodedSample(
+                    bytes = bytes,
+                    presentationTimeUs = presentationTimeUs,
+                    flags = extractor.sampleFlags,
+                )
+                extractor.advance()
+            }
+            if (samples.isEmpty()) {
+                diagnoseSkippedSegment(segment, "no_audio_samples", null)
+                null
+            } else {
+                ReadableSegment(format, samples)
+            }
+        } catch (error: Exception) {
+            diagnoseSkippedSegment(segment, "unreadable_or_corrupt", error)
+            null
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }
+
+    private fun diagnoseSkippedSegment(
+        segment: RollingBuffer.Segment,
+        reason: String,
+        error: Throwable?,
+    ) {
+        val data = mapOf(
+            "fileName" to segment.file.name,
+            "sizeBytes" to segment.file.length(),
+            "startMs" to segment.startMs,
+            "endMs" to segment.endMs,
+            "reason" to reason,
+        )
+        Log.w(
+            TAG,
+            "Skipping segment ${segment.file.name} reason=$reason sizeBytes=${segment.file.length()}: ${error?.message}",
+            error,
+        )
+        DiagnosticsLogger.warn("segment_export_skipped", data, error)
     }
 
     // One AAC-LC frame = 1024 samples; at 16 kHz that's 64 ms.
     private const val AAC_FRAME_US = 1024L * 1_000_000L / 16_000L
     private const val MAX_SAMPLE_BYTES = 64 * 1024
+    private const val TAG = "VuedSegmentExporter"
 }

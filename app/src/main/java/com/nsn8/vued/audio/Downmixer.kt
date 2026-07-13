@@ -1,11 +1,11 @@
 package com.nsn8.vued.audio
 
 /**
- * Collapses the interleaved [channels]-channel int32 LE PCM produced by the UMA-8
- * native stream into a single mono float channel in roughly [-1, 1].
+ * Selects the first channel from the interleaved [channels]-channel int32 LE PCM
+ * produced by the UMA native stream, returning mono float audio in roughly [-1, 1].
  *
- * v1 strategy is a plain average of the mics (safe against clipping since the mean
- * magnitude never exceeds the max). Delay-and-sum beamforming is a later upgrade.
+ * Keeping the other channels out of this stage avoids phase cancellation from a
+ * plain microphone average and leaves a clear replacement point for WPE later.
  */
 class Downmixer(private val channels: Int) {
 
@@ -16,20 +16,15 @@ class Downmixer(private val channels: Int) {
      * @return a mono FloatArray of length `frames`; valid only until the next call
      *         (the backing array is reused).
      */
-    fun toMonoFloat(buffer: ByteArray, length: Int): FloatArray {
+    fun toMonoFloat(buffer: ByteArray, length: Int, gain: Double = MAKEUP_GAIN): FloatArray {
         val bytesPerFrame = channels * 4
         val frames = length / bytesPerFrame
         if (scratch.size < frames) {
             scratch = FloatArray(frames)
         }
-        var offset = 0
         for (frame in 0 until frames) {
-            var sum = 0.0
-            for (channel in 0 until channels) {
-                sum += int32Le(buffer, offset)
-                offset += 4
-            }
-            scratch[frame] = (sum / channels / INT32_FULL_SCALE * MAKEUP_GAIN).toFloat()
+            val firstChannelOffset = frame * bytesPerFrame
+            scratch[frame] = (int32Le(buffer, firstChannelOffset) / INT32_FULL_SCALE * gain).toFloat()
         }
         return scratch
     }
@@ -43,7 +38,7 @@ class Downmixer(private val channels: Int) {
             ((b[i + 2].toInt() and 0xff) shl 16) or
             (b[i + 3].toInt() shl 24)
 
-    private companion object {
+    companion object {
         const val INT32_FULL_SCALE = 2_147_483_648.0 // 2^31
 
         // RAW-mode makeup gain. The UMA-8 applies NO gain in RAW mode (per the

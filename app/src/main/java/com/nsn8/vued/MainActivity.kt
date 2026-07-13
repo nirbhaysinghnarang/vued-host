@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -17,6 +18,7 @@ import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
@@ -45,8 +47,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -56,6 +57,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -79,6 +81,7 @@ import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
@@ -92,6 +95,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import com.nsn8.vued.ambient.AmbientFlusher
 import com.nsn8.vued.ambient.AmbientProcessor
 import com.nsn8.vued.auth.VuedAuth
@@ -109,14 +117,23 @@ import com.nsn8.vued.service.RecorderState
 import com.nsn8.vued.service.RecordingService
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
+import com.nsn8.vued.update.SelfUpdateManager
 import io.github.jan.supabase.auth.status.SessionStatus
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
+private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
+private const val RECONNECT_MEETING_GRACE_MS = 60_000L
+private const val RECORDER_RECONNECT_RETRY_MS = 250L
+private const val RECORDER_RECONNECT_TIMEOUT_MS = 60_000L
+private const val LOW_BATTERY_THRESHOLD_PERCENT = 20
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -134,6 +151,12 @@ private data class BatteryStatus(
     val powerSource: String?,
 )
 
+private data class MicConnectionUi(
+    val label: String,
+    val color: Color,
+    val contentDescription: String,
+)
+
 private val VuedBackground = Color(0xFFFFFFFF)
 private val VuedSurface = Color(0xFFF8F9FB)
 private val VuedSurfaceRaised = Color(0xFFFFFFFF)
@@ -142,16 +165,91 @@ private val VuedTextPrimary = Color(0xFF0B0D12)
 private val VuedTextSecondary = Color(0xFF2F3744)
 private val VuedTextTertiary = Color(0xFF5B6573)
 private val VuedSuccess = Color(0xFF16764F)
+private val VuedChargingBolt = Color(0xFFFFC107)
+private val VuedDanger = Color(0xFFB42318)
 private val VuedSuccessSoft = Color(0xFFEAF8F1)
 private val VuedIdleRing = Color(0xFFE5EAF0)
 
 class MainActivity : ComponentActivity() {
+    private var pendingKioskAfterUsbPermission = false
+    private var pendingRecorderStartAfterUsbPermission = false
+    private var pendingRecorderStartRequiresResumeState = false
+    private var lastUsbPermissionRequestKey: String? = null
+    private var lastUsbPermissionRequestMs: Long = 0
+    private var kioskManuallyEscaped = false
+    private var recorderReconnectJob: Job? = null
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    val attachedDevice = intent.usbDeviceExtra()
+                    if (attachedDevice.matchesUmaSafely()) {
+                        AmplitudeTracker.track("mic_connected", usbDeviceData(attachedDevice) + mapOf("source" to "usb_attached"))
+                    }
+                    dismissMicDisconnectedIfUmaDetected(attachedDevice, trigger = "usb_attached")
+                    logKioskUsbEvent(
+                        "kiosk_usb_attach_received",
+                        attachedDevice,
+                        mapOf("matchesUma" to attachedDevice.matchesUmaSafely()),
+                    )
+                    if (attachedDevice.matchesUmaSafely()) {
+                        scheduleRecorderReconnect(attachedDevice)
+                    }
+                    requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val detachedDevice = intent.usbDeviceExtra()
+                    if (detachedDevice.matchesUmaSafely()) {
+                        RecorderState.markMicDisconnected()
+                        AmplitudeTracker.track(
+                            "mic_disconnected",
+                            usbDeviceData(detachedDevice) + mapOf("reason" to "usb_detached"),
+                        )
+                        logKioskUsbEvent("kiosk_usb_detach_received", detachedDevice)
+                    }
+                }
+                ACTION_USB_PERMISSION -> {
+                    val device = intent.usbDeviceExtra()
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    val shouldStartRecorder = pendingRecorderStartAfterUsbPermission
+                    val requiresResumeState = pendingRecorderStartRequiresResumeState
+                    logKioskUsbEvent(
+                        "kiosk_usb_permission_result",
+                        device,
+                        mapOf(
+                            "granted" to granted,
+                            "willRelock" to isDeviceOwner(this@MainActivity),
+                        ),
+                    )
+                    lastUsbPermissionRequestKey = null
+                    pendingKioskAfterUsbPermission = false
+                    pendingRecorderStartAfterUsbPermission = false
+                    pendingRecorderStartRequiresResumeState = false
+                    if (granted && shouldStartRecorder) {
+                        if (requiresResumeState) {
+                            resumeRecorderAfterUmaReconnect("usb_permission_granted", device)
+                        } else {
+                            RecordingService.start(this@MainActivity)
+                        }
+                    } else if (granted) {
+                        resumeRecorderAfterUmaReconnect("usb_permission_granted", device)
+                    }
+                    if (isDeviceOwner(this@MainActivity)) {
+                        val result = startKiosk(this@MainActivity)
+                        logKioskUsbEvent("kiosk_usb_relock_after_permission", device, mapOf("result" to result))
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Keep the screen on during in-room operation so capture/upload remains
         // responsive while the recorder is foregrounded.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
+        hideStatusBar()
         setContent {
             VuedTheme(desktopTheme = HOST_UI_MODE == HostUiMode.PROD) {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -159,35 +257,392 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleUsbAttachIntent(intent, trigger = "activity_create_intent")
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUsbAttachIntent(intent, trigger = "activity_new_intent")
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(ACTION_USB_PERMISSION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(usbPermissionReceiver, filter)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unregisterReceiver(usbPermissionReceiver)
     }
 
     override fun onResume() {
         super.onResume()
+        hideStatusBar()
         if (isDeviceOwner(this)) {
-            Log.i(TAG, startKiosk(this))
+            logKioskUsbEvent("kiosk_resume_device_owner", data = mapOf("locked" to isKioskLocked(this)))
+            if (kioskManuallyEscaped) {
+                logKioskUsbEvent("kiosk_resume_lock_skipped_after_escape")
+                return
+            }
+            if (!requestUmaPermissionForKioskRecovery(trigger = "activity_resume")) {
+                val result = startKiosk(this)
+                logKioskUsbEvent("kiosk_resume_lock_started", data = mapOf("result" to result))
+            }
+        }
+    }
+
+    fun markKioskManuallyEscaped() {
+        kioskManuallyEscaped = true
+    }
+
+    fun requestUmaPermissionForKioskRecovery(trigger: String = "manual"): Boolean {
+        val requested = requestUmaPermission(this, unlockKioskForDialog = true)
+        logKioskUsbEvent(
+            "kiosk_usb_permission_recovery_checked",
+            Uma8Capture(this).findDevice(),
+            mapOf(
+                "trigger" to trigger,
+                "requested" to requested,
+                "locked" to isKioskLocked(this),
+            ),
+        )
+        if (requested) {
+            pendingKioskAfterUsbPermission = true
+        }
+        return requested
+    }
+
+    fun requestUmaPermissionForRecorderStart(
+        trigger: String = "manual",
+        requireResumeState: Boolean = false,
+    ): Boolean {
+        val requested = requestUmaPermission(this, unlockKioskForDialog = true)
+        logKioskUsbEvent(
+            "recorder_usb_permission_checked",
+            Uma8Capture(this).findDevice(),
+            mapOf(
+                "trigger" to trigger,
+                "requested" to requested,
+                "requireResumeState" to requireResumeState,
+            ),
+        )
+        if (requested) {
+            pendingRecorderStartAfterUsbPermission = true
+            pendingRecorderStartRequiresResumeState = requireResumeState
+        }
+        return requested
+    }
+
+    private fun resumeRecorderAfterUmaReconnect(trigger: String, device: UsbDevice?): Boolean {
+        if (!device.matchesUmaSafely()) return false
+        val status = RecorderState.state.value
+        val disconnectedAtMs = status.disconnectedAtMs
+        if (status.running || disconnectedAtMs <= 0L || !status.resumeOnReconnect) return false
+        val elapsedMs = System.currentTimeMillis() - disconnectedAtMs
+
+        val capture = Uma8Capture(this)
+        val connected = capture.findDevice() ?: return false
+        if (!capture.hasPermission(connected)) {
+            return requestUmaPermissionForRecorderStart(
+                trigger = trigger,
+                requireResumeState = true,
+            )
+        }
+
+        logKioskUsbEvent(
+            "recorder_usb_reconnect_autoresume",
+            connected,
+            mapOf("trigger" to trigger, "elapsedMs" to elapsedMs),
+        )
+        RecordingService.start(this)
+        return true
+    }
+
+    private fun scheduleRecorderReconnect(device: UsbDevice?) {
+        recorderReconnectJob?.cancel()
+        recorderReconnectJob = lifecycleScope.launch {
+            val attachedAtMs = System.currentTimeMillis()
+            val deadlineMs = SystemClock.elapsedRealtime() + RECORDER_RECONNECT_TIMEOUT_MS
+
+            while (SystemClock.elapsedRealtime() < deadlineMs) {
+                val status = RecorderState.state.value
+
+                // The existing capture recovered across the short USB reset.
+                if (status.running && status.hasFreshAudio() && status.lastAudioMs >= attachedAtMs) {
+                    logKioskUsbEvent(
+                        "recorder_usb_reconnect_recovered",
+                        device,
+                        mapOf("elapsedMs" to (System.currentTimeMillis() - attachedAtMs)),
+                    )
+                    return@launch
+                }
+
+                // A failed capture stops asynchronously. Retry once its service has
+                // published the stopped state instead of losing the early attach event.
+                if (!status.running && status.disconnectedAtMs > 0L && status.resumeOnReconnect) {
+                    if (resumeRecorderAfterUmaReconnect("usb_attach_retry", device)) {
+                        return@launch
+                    }
+                }
+
+                delay(RECORDER_RECONNECT_RETRY_MS)
+            }
+
+            logKioskUsbEvent("recorder_usb_reconnect_retry_expired", device)
+        }
+    }
+
+    private fun requestUmaPermission(context: Context, unlockKioskForDialog: Boolean): Boolean {
+        val usbManager = context.getSystemService(UsbManager::class.java)
+        val device = Uma8Capture(context).findDevice()
+        if (device == null) {
+            logKioskUsbEvent(
+                "kiosk_usb_permission_request_skipped",
+                data = mapOf("reason" to "no_uma_device", "unlockKioskForDialog" to unlockKioskForDialog),
+            )
+            return false
+        }
+        dismissMicDisconnectedIfUmaDetected(device, trigger = "usb_device_list")
+        if (usbManager.hasPermission(device)) {
+            logKioskUsbEvent(
+                "kiosk_usb_permission_request_skipped",
+                device,
+                mapOf("reason" to "already_authorized", "unlockKioskForDialog" to unlockKioskForDialog),
+            )
+            return false
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val deviceKey = "${device.vendorId}:${device.productId}:${device.deviceName}"
+        if (
+            pendingKioskAfterUsbPermission &&
+            deviceKey == lastUsbPermissionRequestKey &&
+            now - lastUsbPermissionRequestMs < USB_PERMISSION_REQUEST_INTERVAL_MS
+        ) {
+            logKioskUsbEvent(
+                "kiosk_usb_permission_request_debounced",
+                device,
+                mapOf("elapsedMs" to (now - lastUsbPermissionRequestMs)),
+            )
+            return true
+        }
+        lastUsbPermissionRequestKey = deviceKey
+        lastUsbPermissionRequestMs = now
+
+        if (unlockKioskForDialog && context is Activity && isKioskLocked(context)) {
+            val result = stopKiosk(context)
+            logKioskUsbEvent("kiosk_usb_unlock_for_permission_dialog", device, mapOf("result" to result))
+        } else {
+            logKioskUsbEvent(
+                "kiosk_usb_unlock_not_needed_for_permission_dialog",
+                device,
+                mapOf(
+                    "unlockKioskForDialog" to unlockKioskForDialog,
+                    "locked" to (context as? Activity)?.let(::isKioskLocked),
+                ),
+            )
+        }
+
+        val intent = PendingIntent.getBroadcast(
+            context,
+            0,
+            Intent(ACTION_USB_PERMISSION).setPackage(context.packageName),
+            PendingIntent.FLAG_MUTABLE,
+        )
+        usbManager.requestPermission(device, intent)
+        logKioskUsbEvent("kiosk_usb_permission_requested", device)
+        return true
+    }
+
+    private fun handleUsbAttachIntent(intent: Intent?, trigger: String) {
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        val device = intent.usbDeviceExtra()
+        dismissMicDisconnectedIfUmaDetected(device, trigger = trigger)
+        logKioskUsbEvent("kiosk_usb_attach_activity_intent", device, mapOf("trigger" to trigger))
+        if (device.matchesUmaSafely()) {
+            scheduleRecorderReconnect(device)
+        }
+        requestUmaPermissionForKioskRecovery(trigger = trigger)
+    }
+
+    private fun logKioskUsbEvent(
+        event: String,
+        device: UsbDevice? = null,
+        data: Map<String, Any?> = emptyMap(),
+    ) {
+        val eventData = usbDeviceData(device) + data
+        Log.i(TAG, "$event $eventData")
+        DiagnosticsLogger.info(event, eventData)
+    }
+
+    private fun dismissMicDisconnectedIfUmaDetected(device: UsbDevice?, trigger: String) {
+        if (!device.matchesUmaSafely()) return
+        val status = RecorderState.state.value
+        if (!status.micDisconnected) return
+        RecorderState.markMicReconnected()
+        logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", device, mapOf("trigger" to trigger))
+    }
+
+    private fun hideStatusBar() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.statusBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+}
+
+private fun Intent.usbDeviceExtra(): UsbDevice? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelableExtra(UsbManager.EXTRA_DEVICE) as? UsbDevice
+    }
+
+private fun usbDeviceData(device: UsbDevice?): Map<String, Any?> =
+    if (device == null) {
+        mapOf("devicePresent" to false)
+    } else {
+        mapOf(
+            "devicePresent" to true,
+            "vendorId" to device.vendorId,
+            "productId" to device.productId,
+            "deviceName" to device.deviceName,
+            "productName" to runCatching { device.productName }.getOrNull(),
+            "manufacturerName" to runCatching { device.manufacturerName }.getOrNull(),
+            "matchesUma" to device.matchesUmaSafely(),
+        )
+    }
+
+private fun UsbDevice?.matchesUmaSafely(): Boolean =
+    this?.let { runCatching { Uma8Capture.isMicArrayDevice(it) }.getOrDefault(false) } ?: false
+
+@Composable
+private fun AuthGate() {
+    val context = LocalContext.current
+    val authStatus by VuedAuth.sessionStatus.collectAsState()
+    val scope = rememberCoroutineScope()
+    var loginWifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
+    var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
+
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                batteryStatus = batteryStatusFromIntent(intent)
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
+    val loginConnectionButtons: @Composable () -> Unit = {
+        WifiSettingsButton(
+            status = loginWifiStatus,
+            labelOverride = "Set up Wi-Fi",
+            onClick = {
+                openWifiSettings(context)
+                loginWifiStatus = currentWifiStatus(context)
+            },
+        )
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        when (authStatus) {
+            is SessionStatus.Authenticated -> {
+                when (HOST_UI_MODE) {
+                    HostUiMode.PROD -> ProdRecorderScreen()
+                    HostUiMode.DEV -> {
+                        DevRecorderScreen(
+                            userEmail = VuedAuth.currentEmail(),
+                            onSignOut = { scope.launch { VuedAuth.signOut() } },
+                        )
+                    }
+                }
+            }
+            is SessionStatus.RefreshFailure -> LoginScreen(
+                initialError = "Session expired, sign in again",
+                wifiSettingsButton = loginConnectionButtons,
+            )
+            SessionStatus.Initializing -> LoadingScreen()
+            is SessionStatus.NotAuthenticated -> LoginScreen(
+                wifiSettingsButton = loginConnectionButtons,
+            )
+        }
+
+        val batteryLevel = batteryStatus.levelPercent
+        if (batteryLevel != null &&
+            batteryLevel < LOW_BATTERY_THRESHOLD_PERCENT &&
+            !batteryStatus.plugged
+        ) {
+            LowBatteryPowerBanner(levelPercent = batteryLevel)
         }
     }
 }
 
 @Composable
-private fun AuthGate() {
-    val status by VuedAuth.sessionStatus.collectAsState()
-    val scope = rememberCoroutineScope()
-    when (status) {
-        is SessionStatus.Authenticated -> {
-            when (HOST_UI_MODE) {
-                HostUiMode.PROD -> ProdRecorderScreen()
-                HostUiMode.DEV -> {
-                    DevRecorderScreen(
-                        userEmail = VuedAuth.currentEmail(),
-                        onSignOut = { scope.launch { VuedAuth.signOut() } },
+private fun LowBatteryPowerBanner(levelPercent: Int) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 32.dp, vertical = 20.dp),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 680.dp),
+            shape = RoundedCornerShape(14.dp),
+            color = VuedDanger,
+            tonalElevation = 0.dp,
+            shadowElevation = 10.dp,
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "!",
+                    color = Color.White,
+                    fontSize = 34.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(
+                        text = "Battery too low",
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = "Battery is at $levelPercent%. Plug in the tablet — this warning clears when power is connected.",
+                        color = Color.White.copy(alpha = 0.92f),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        lineHeight = 20.sp,
                     )
                 }
             }
         }
-        is SessionStatus.RefreshFailure -> LoginScreen(initialError = "Session expired, sign in again")
-        SessionStatus.Initializing -> LoadingScreen()
-        is SessionStatus.NotAuthenticated -> LoginScreen()
     }
 }
 
@@ -248,7 +703,6 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .statusBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 32.dp, vertical = 24.dp),
@@ -277,7 +731,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     text = if (creating) {
                         "This tablet needs a passphrase before ambient processing can run."
                     } else {
-                        "Unlock this tablet to process ambient candidates locally."
+                        "Unlock this tablet."
                     },
                     color = VuedTextTertiary,
                     fontSize = 15.sp,
@@ -289,7 +743,7 @@ private fun AmbientPassphraseOnboardingScreen(onUnlocked: () -> Unit) {
                     PassphraseTextField(
                         value = passphrase,
                         onValueChange = { passphrase = it },
-                        label = "Enter your passphrase to be able to decrypt your meetings",
+                        label = "Enter your passphrase.",
                         modifier = Modifier.fillMaxWidth(),
                     )
                     if (creating) {
@@ -458,7 +912,6 @@ private fun RoomOnboardingScreen(onRoomPicked: (String) -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .statusBarsPadding()
             .navigationBarsPadding()
             .imePadding()
             .verticalScroll(rememberScrollState())
@@ -648,13 +1101,21 @@ private fun ProdRecorderMainScreen() {
                 PackageManager.PERMISSION_GRANTED
         )
     }
+    var pendingStartAfterRuntimePermission by remember { mutableStateOf(false) }
+    var runtimePermissionRequestInFlight by remember { mutableStateOf(false) }
 
-    val audioLauncher = rememberLauncherForActivityResult(
+    val capturePermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> hasAudio = granted }
-    val notifLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { granted ->
+        hasAudio = granted
+        runtimePermissionRequestInFlight = false
+    }
+    val setupPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        grants[Manifest.permission.RECORD_AUDIO]?.let { granted -> hasAudio = granted }
+        requestUma8Permission(context)
+    }
 
     var meetingActive by remember { mutableStateOf(MeetingController.active != null) }
     var segmentStartedAt by remember { mutableStateOf(MeetingController.active?.startMs ?: 0L) }
@@ -663,7 +1124,14 @@ private fun ProdRecorderMainScreen() {
     var showEnroll by remember { mutableStateOf(false) }
     var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
     var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
+    var micArrayPresent by remember { mutableStateOf(isUmaMicPresent(context)) }
     var currentTime by remember { mutableStateOf(formatCurrentTime()) }
+    var updateDialogVisible by remember { mutableStateOf(false) }
+    var updateTitle by remember { mutableStateOf("Software update") }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var updateBusy by remember { mutableStateOf(false) }
+    var updateRunToken by remember { mutableStateOf(0) }
+    var updateJob by remember { mutableStateOf<Job?>(null) }
 
     DisposableEffect(Unit) {
         val connectivity = context.getSystemService(ConnectivityManager::class.java)
@@ -703,6 +1171,31 @@ private fun ProdRecorderMainScreen() {
         onDispose { context.unregisterReceiver(receiver) }
     }
 
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                val wasPresent = micArrayPresent
+                micArrayPresent = isUmaMicPresent(ctx)
+                if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED && wasPresent && !micArrayPresent) {
+                    // Physical disconnect handling is owned by MainActivity's lifecycle
+                    // receiver so it also works while recording is muted.
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+            addAction(ACTION_USB_PERMISSION)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
     LaunchedEffect(meetingActive, segmentStartedAt) {
         while (meetingActive) {
             nowMs = System.currentTimeMillis()
@@ -718,8 +1211,13 @@ private fun ProdRecorderMainScreen() {
     }
 
     val captureReady = status.running && status.hasFreshAudio()
+    val micConnectionStatus = micConnectionUi(
+        micArrayPresent = micArrayPresent,
+        status = status,
+    )
 
     LaunchedEffect(captureReady, status.running, status.micDisconnected) {
+        micArrayPresent = isUmaMicPresent(context)
         if (!captureReady) {
             val active = MeetingController.active
             meetingActive = active != null
@@ -743,19 +1241,98 @@ private fun ProdRecorderMainScreen() {
         }
     }
 
-    fun startCapture() {
+    fun setupPermissionsToRequest(): Array<String> {
+        val permissions = mutableListOf<String>()
         if (!hasAudio) {
-            audioLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            return
+            permissions += Manifest.permission.RECORD_AUDIO
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            permissions += Manifest.permission.POST_NOTIFICATIONS
         }
-        requestUma8Permission(context)
+        return permissions.toTypedArray()
+    }
+
+    fun requestSetupPermissions(): Boolean {
+        val permissions = setupPermissionsToRequest()
+        if (permissions.isEmpty()) {
+            requestUma8Permission(context)
+            return false
+        }
+        setupPermissionLauncher.launch(permissions)
+        return true
+    }
+
+    fun requestCapturePermission(): Boolean {
+        if (hasAudio) return false
+        runtimePermissionRequestInFlight = true
+        capturePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        return true
+    }
+
+    fun startCapture() {
+        if (requestCapturePermission()) {
+            pendingStartAfterRuntimePermission = true
+            return
+        }
+
+        val umaDevice = Uma8Capture(context).findDevice()
+        if (!VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && umaDevice == null) {
+            RecorderState.markMicDisconnected(captureWasRunning = false)
+            return
+        }
+
+        if (requestUma8PermissionForStart(context)) return
         RecordingService.start(context)
+    }
+
+    LaunchedEffect(Unit) {
+        requestSetupPermissions()
+    }
+
+    LaunchedEffect(
+        pendingStartAfterRuntimePermission,
+        runtimePermissionRequestInFlight,
+        hasAudio,
+    ) {
+        if (pendingStartAfterRuntimePermission && !runtimePermissionRequestInFlight && hasAudio) {
+            pendingStartAfterRuntimePermission = false
+            startCapture()
+        }
+    }
+
+    LaunchedEffect(status.micDisconnected, status.disconnectedAtMs) {
+        val disconnectMs = status.disconnectedAtMs
+        if (!status.micDisconnected || disconnectMs <= 0L) return@LaunchedEffect
+
+        val remainingMs = (disconnectMs + RECONNECT_MEETING_GRACE_MS - System.currentTimeMillis())
+            .coerceAtLeast(0L)
+        delay(remainingMs)
+
+        val latest = RecorderState.state.value
+        val stillSameDisconnect = latest.micDisconnected &&
+            latest.disconnectedAtMs == disconnectMs
+        if (!stillSameDisconnect) return@LaunchedEffect
+
+        runCatching {
+            if (MeetingController.active != null) {
+                MeetingController.stopAsync(context, endMs = disconnectMs)
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to finalize meeting after mic disconnect grace: ${error.message}", error)
+            DiagnosticsLogger.warn(
+                "meeting_disconnect_grace_finalize_failed",
+                mapOf("disconnectMs" to disconnectMs),
+                error,
+            )
+        }
+        RecorderState.markMicDisconnected(disconnectedAtMs = disconnectMs)
+        meetingActive = MeetingController.active != null
+        segmentStartedAt = MeetingController.active?.startMs ?: 0L
+        nowMs = System.currentTimeMillis()
+        DiagnosticsLogger.info("mic_disconnect_grace_expired", mapOf("disconnectMs" to disconnectMs))
     }
 
     val elapsedSecs = if (meetingActive) {
@@ -769,7 +1346,6 @@ private fun ProdRecorderMainScreen() {
         modifier = Modifier
             .fillMaxSize()
             .background(VuedBackground)
-            .statusBarsPadding()
             .padding(horizontal = 36.dp, vertical = 20.dp),
     ) {
         if (roomName.isNotBlank()) {
@@ -799,7 +1375,13 @@ private fun ProdRecorderMainScreen() {
             enabled = !status.running || status.captureReady,
             modifier = Modifier.align(Alignment.TopStart),
             onClick = {
-                if (status.running) RecordingService.stop(context) else startCapture()
+                if (status.running) {
+                    AmplitudeTracker.track("mute")
+                    RecordingService.stop(context)
+                } else {
+                    AmplitudeTracker.track("unmute")
+                    startCapture()
+                }
             },
         )
 
@@ -808,17 +1390,19 @@ private fun ProdRecorderMainScreen() {
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
-                WifiSettingsButton(
-                    status = wifiStatus,
-                    onClick = {
-                        openWifiSettings(context)
-                        wifiStatus = currentWifiStatus(context)
-                    },
-                )
-            }
+            WifiSettingsButton(
+                status = wifiStatus,
+                onClick = {
+                    openWifiSettings(context)
+                    wifiStatus = currentWifiStatus(context)
+                },
+            )
+            MicConnectionBadge(status = micConnectionStatus)
             BatteryStatusBadge(status = batteryStatus)
             AddSpeakerButton(onClick = { showEnroll = true })
+            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+                DebugExceptionButton()
+            }
         }
 
         BoxWithConstraints(
@@ -833,6 +1417,7 @@ private fun ProdRecorderMainScreen() {
             ) {
                 MeetingCircleButton(
                     meetingActive = meetingActive,
+                    recordingInterrupted = meetingActive && !captureReady,
                     enabled = !segmentBusy && (captureReady || meetingActive),
                     modifier = Modifier
                         .align(Alignment.Center)
@@ -873,8 +1458,8 @@ private fun ProdRecorderMainScreen() {
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 2.dp),
-                    color = if (showMicDisconnected) Color(0xFFB42318) else VuedTextTertiary.copy(alpha = 0.62f),
-                    fontSize = if (showMicDisconnected) 34.sp else 52.sp,
+                    color = if (showMicDisconnected) VuedDanger else VuedTextTertiary.copy(alpha = 0.62f),
+                    fontSize = if (showMicDisconnected) 40.sp else 52.sp,
                     fontWeight = if (showMicDisconnected) FontWeight.Medium else FontWeight.Thin,
                     letterSpacing = 0.sp,
                 )
@@ -892,31 +1477,134 @@ private fun ProdRecorderMainScreen() {
             fontWeight = FontWeight.Light,
             letterSpacing = 0.sp,
         )
+
+        SelfUpdateButton(
+            versionCode = BuildConfig.VERSION_CODE,
+            busy = updateBusy,
+            enabled = true,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .navigationBarsPadding()
+                .padding(bottom = 2.dp),
+            onClick = {
+                if (updateBusy) {
+                    return@SelfUpdateButton
+                }
+
+                AmplitudeTracker.track("self_update_button_pressed")
+                updateDialogVisible = true
+                updateBusy = true
+                updateRunToken += 1
+                val runToken = updateRunToken
+                updateTitle = "Checking for updates"
+                updateMessage = "Looking for a newer version. Current version: ${BuildConfig.VERSION_CODE}."
+                updateJob = scope.launch {
+                    try {
+                        when (val result = SelfUpdateManager.installLatest(context) { message ->
+                            scope.launch(Dispatchers.Main) {
+                                if (runToken == updateRunToken) {
+                                    updateTitle = updateTitleForProgress(message)
+                                    updateMessage = message
+                                }
+                            }
+                        }) {
+                            is SelfUpdateManager.UpdateResult.Installing -> {
+                                if (runToken == updateRunToken) {
+                                    updateTitle = "Installing update"
+                                    updateMessage = "Android is installing ${result.versionName} (version ${result.versionCode}). The app will reopen automatically when installation finishes."
+                                }
+                            }
+                            is SelfUpdateManager.UpdateResult.UpToDate -> {
+                                if (runToken == updateRunToken) {
+                                    updateTitle = "You're up to date"
+                                    updateMessage = "Current version: ${result.versionCode}. No newer update is available."
+                                }
+                            }
+                        }
+                    } catch (error: Throwable) {
+                        if (error is CancellationException) {
+                            throw error
+                        }
+                        if (runToken == updateRunToken) {
+                            updateTitle = "Update unavailable"
+                            updateMessage = error.message ?: "Could not complete the update check."
+                        }
+                        DiagnosticsLogger.error("self_update_ui_failed", throwable = error, sentry = false)
+                    } finally {
+                        if (runToken == updateRunToken) {
+                            updateBusy = false
+                            updateJob = null
+                        }
+                    }
+                }
+            },
+        )
     }
 
     if (showEnroll) {
         ProdSpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
+    }
+    if (updateDialogVisible) {
+        SelfUpdateDialog(
+            title = updateTitle,
+            busy = updateBusy,
+            message = updateMessage ?: "",
+            versionCode = BuildConfig.VERSION_CODE,
+            onDismiss = {
+                if (!updateBusy) updateDialogVisible = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun DebugExceptionButton() {
+    OutlinedButton(
+        onClick = {
+            throw IllegalStateException("Debug Sentry test exception from Vued host")
+        },
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, Color(0xFFF2B8B5)),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = Color(0xFFFFFBFA),
+            contentColor = Color(0xFFB42318),
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Text(
+            text = "Crash",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.sp,
+        )
     }
 }
 
 @Composable
 private fun MeetingCircleButton(
     meetingActive: Boolean,
+    recordingInterrupted: Boolean,
     enabled: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     val borderColor = when {
         !enabled -> VuedIdleRing
+        recordingInterrupted -> VuedDanger
         meetingActive -> VuedTextPrimary
         else -> VuedSuccess
     }
     val textColor = when {
         !enabled -> VuedTextTertiary
+        recordingInterrupted -> Color.White.copy(alpha = 0.92f)
         meetingActive -> Color.White
         else -> VuedSuccess
     }
-    val fillColor = if (meetingActive) VuedTextPrimary else Color.Transparent
+    val fillColor = when {
+        recordingInterrupted -> VuedTextPrimary.copy(alpha = 0.72f)
+        meetingActive -> VuedTextPrimary
+        else -> Color.Transparent
+    }
 
     Box(
         modifier = modifier
@@ -1011,7 +1699,8 @@ private fun AudioMuteButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
-    val iconColor = if (unmuted && enabled) Color.White else VuedTextTertiary
+    val iconColor = Color.White
+    val containerColor = if (unmuted) VuedSuccess else VuedDanger
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -1020,10 +1709,10 @@ private fun AudioMuteButton(
             .size(112.dp)
             .semantics { contentDescription = if (unmuted) "Mute" else "Unmute" },
         colors = ButtonDefaults.buttonColors(
-            containerColor = if (unmuted) VuedSuccess else VuedIdleRing,
+            containerColor = containerColor,
             contentColor = iconColor,
-            disabledContainerColor = VuedIdleRing,
-            disabledContentColor = VuedTextTertiary,
+            disabledContainerColor = containerColor,
+            disabledContentColor = iconColor,
         ),
         contentPadding = PaddingValues(0.dp),
         elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
@@ -1143,16 +1832,264 @@ private fun AddSpeakerButton(modifier: Modifier = Modifier, onClick: () -> Unit)
 }
 
 @Composable
+private fun MicConnectionBadge(status: MicConnectionUi) {
+    Surface(
+        modifier = Modifier.semantics { contentDescription = status.contentDescription },
+        shape = RoundedCornerShape(8.dp),
+        color = VuedSurfaceRaised.copy(alpha = 0.92f),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+        border = BorderStroke(1.dp, VuedHairline),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_mic_24),
+                contentDescription = null,
+                tint = status.color,
+                modifier = Modifier.size(20.dp),
+            )
+            Text(
+                text = status.label,
+                color = VuedTextTertiary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelfUpdateButton(
+    versionCode: Int,
+    busy: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, VuedHairline),
+        modifier = modifier.semantics {
+            contentDescription = "Check for app updates. Current version: $versionCode"
+        },
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = VuedSurfaceRaised.copy(alpha = 0.92f),
+            contentColor = VuedTextTertiary,
+            disabledContainerColor = VuedSurfaceRaised.copy(alpha = 0.72f),
+            disabledContentColor = VuedTextTertiary.copy(alpha = 0.45f),
+        ),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (busy) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = VuedTextTertiary,
+                )
+            } else {
+                Icon(
+                    painter = painterResource(R.drawable.ic_update_24),
+                    contentDescription = null,
+                    tint = VuedTextTertiary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = if (busy) "Checking updates" else "Check for updates",
+                    color = VuedTextTertiary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.sp,
+                )
+                Text(
+                    text = "Current version: $versionCode",
+                    color = VuedTextTertiary.copy(alpha = 0.72f),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Normal,
+                    letterSpacing = 0.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelfUpdateDialog(
+    title: String,
+    busy: Boolean,
+    message: String,
+    versionCode: Int,
+    onDismiss: () -> Unit,
+) {
+    val statusColor = when {
+        title.contains("unavailable", ignoreCase = true) -> Color(0xFFB42318)
+        title.contains("up to date", ignoreCase = true) -> VuedSuccess
+        title.contains("install", ignoreCase = true) -> VuedSuccess
+        else -> VuedTextTertiary
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 430.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = VuedSurfaceRaised,
+            shadowElevation = 20.dp,
+            tonalElevation = 0.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(statusColor.copy(alpha = 0.10f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (busy) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.5.dp,
+                                color = statusColor,
+                            )
+                        } else {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_update_24),
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(24.dp),
+                            )
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(
+                            text = title,
+                            color = VuedTextPrimary,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.sp,
+                        )
+                        Text(
+                            text = if (busy) "Update check in progress" else "Software update",
+                            color = VuedTextTertiary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            letterSpacing = 0.sp,
+                        )
+                    }
+                }
+
+                Text(
+                    text = message,
+                    color = VuedTextSecondary,
+                    fontSize = 15.sp,
+                    lineHeight = 21.sp,
+                    letterSpacing = 0.sp,
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(VuedSurface),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Current version",
+                        modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp),
+                        color = VuedTextTertiary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 0.sp,
+                    )
+                    Text(
+                        text = versionCode.toString(),
+                        modifier = Modifier.padding(end = 12.dp, top = 10.dp, bottom = 10.dp),
+                        color = VuedTextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 0.sp,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (busy) {
+                        Text(
+                            text = "Keep Vued open",
+                            color = VuedTextTertiary,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            letterSpacing = 0.sp,
+                        )
+                    } else {
+                        Button(
+                            onClick = onDismiss,
+                            shape = RoundedCornerShape(8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = VuedTextPrimary,
+                                contentColor = Color.White,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 9.dp),
+                        ) {
+                            Text(
+                                text = "Done",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun updateTitleForProgress(message: String): String = when {
+    message.startsWith("Downloading") -> "Downloading update"
+    message.startsWith("Preparing") -> "Installing update"
+    else -> "Checking for updates"
+}
+
+@Composable
 private fun WifiSettingsButton(
     status: WifiStatus,
+    labelOverride: String? = null,
     onClick: () -> Unit,
 ) {
     val color = if (status.connected) VuedSuccess else Color(0xFFB42318)
-    val label = when {
+    val statusLabel = when {
         status.ssid != null -> status.ssid
         status.connected -> "Wi-Fi"
         else -> "No Wi-Fi"
     }
+    val label = labelOverride ?: statusLabel
     OutlinedButton(
         onClick = onClick,
         shape = RoundedCornerShape(8.dp),
@@ -1160,9 +2097,9 @@ private fun WifiSettingsButton(
         modifier = Modifier
             .semantics {
                 contentDescription = if (status.connected) {
-                    "Wi-Fi connected: $label"
+                    "Wi-Fi connected: $statusLabel"
                 } else {
-                    "Wi-Fi disconnected"
+                    "$label, Wi-Fi disconnected"
                 }
             },
         colors = ButtonDefaults.outlinedButtonColors(
@@ -1192,6 +2129,26 @@ private fun WifiSettingsButton(
     }
 }
 
+private fun isUmaMicPresent(context: Context): Boolean =
+    Uma8Capture(context).findDevice() != null
+
+private fun micConnectionUi(
+    micArrayPresent: Boolean,
+    status: RecorderState.Status,
+): MicConnectionUi =
+    when {
+        micArrayPresent && !status.micDisconnected -> MicConnectionUi(
+            label = "Connected",
+            color = VuedSuccess,
+            contentDescription = "Mic connected",
+        )
+        else -> MicConnectionUi(
+            label = "Disconnected",
+            color = Color(0xFFB42318),
+            contentDescription = "Mic disconnected",
+        )
+    }
+
 private fun formatSegmentTime(totalSecs: Long): String {
     val minutes = totalSecs / 60
     val seconds = totalSecs % 60
@@ -1214,10 +2171,7 @@ private fun BatteryStatusBadge(
     }
     val label = buildString {
         append(level?.let { "$it%" } ?: "--%")
-        when {
-            status.charging -> append(" Charging")
-            status.plugged -> append(" Plugged")
-        }
+
     }
 
     Surface(
@@ -1233,12 +2187,20 @@ private fun BatteryStatusBadge(
             horizontalArrangement = Arrangement.spacedBy(7.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            BatteryIcon(
-                levelPercent = level,
-                charging = status.charging,
-                color = color,
-                modifier = Modifier.size(width = 24.dp, height = 14.dp),
-            )
+            Box(
+                modifier = Modifier.size(width = 28.dp, height = 20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                BatteryIcon(
+                    levelPercent = level,
+                    charging = status.charging,
+                    color = color,
+                    modifier = Modifier.size(width = 24.dp, height = 14.dp),
+                )
+                if (status.charging) {
+                    ChargingBolt(modifier = Modifier.fillMaxSize())
+                }
+            }
             Text(
                 text = label,
                 color = VuedTextTertiary,
@@ -1293,6 +2255,22 @@ private fun BatteryIcon(
 }
 
 @Composable
+private fun ChargingBolt(modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val bolt = Path().apply {
+            moveTo(size.width * 0.60f, size.height * 0.03f)
+            lineTo(size.width * 0.27f, size.height * 0.58f)
+            lineTo(size.width * 0.48f, size.height * 0.58f)
+            lineTo(size.width * 0.35f, size.height * 0.97f)
+            lineTo(size.width * 0.78f, size.height * 0.40f)
+            lineTo(size.width * 0.56f, size.height * 0.40f)
+            close()
+        }
+        drawPath(bolt, color = VuedChargingBolt)
+    }
+}
+
+@Composable
 private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
     val context = LocalContext.current
     val status by RecorderState.state.collectAsState()
@@ -1336,7 +2314,6 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .statusBarsPadding()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -1476,7 +2453,7 @@ private fun DevRecorderScreen(userEmail: String?, onSignOut: () -> Unit) {
                     }
                 },
             ) {
-                Text(if (meetingActive) "Stop Meeting" else "Start Meeting")
+                Text(if (meetingActive) "Stop Meeting" else "Start Meeting!")
             }
             OutlinedButton(onClick = {
                 scope.launch {
@@ -1589,9 +2566,14 @@ private fun MicArraySelection.uiLabel(): String = when (this) {
 }
 
 private fun requestUma8Permission(context: Context) {
+    if (context is MainActivity && context.requestUmaPermissionForKioskRecovery()) return
+
     val usbManager = context.getSystemService(UsbManager::class.java)
     val device = Uma8Capture(context).findDevice() ?: return
     if (usbManager.hasPermission(device)) return
+    if (context is Activity && isKioskLocked(context)) {
+        stopKiosk(context)
+    }
     val intent = PendingIntent.getBroadcast(
         context,
         0,
@@ -1599,6 +2581,18 @@ private fun requestUma8Permission(context: Context) {
         PendingIntent.FLAG_MUTABLE,
     )
     usbManager.requestPermission(device, intent)
+}
+
+private fun requestUma8PermissionForStart(context: Context): Boolean {
+    if (context is MainActivity) {
+        return context.requestUmaPermissionForRecorderStart()
+    }
+
+    val usbManager = context.getSystemService(UsbManager::class.java)
+    val device = Uma8Capture(context).findDevice() ?: return false
+    if (usbManager.hasPermission(device)) return false
+    requestUma8Permission(context)
+    return true
 }
 
 private fun openWifiSettings(context: Context) {
@@ -1691,11 +2685,4 @@ private fun Int.powerSourceLabel(): String? = when {
 private fun batteryContentDescription(status: BatteryStatus): String = buildString {
     append("Battery ")
     append(status.levelPercent?.let { "$it percent" } ?: "level unknown")
-    when {
-        status.charging && status.powerSource != null -> append(", charging via ${status.powerSource}")
-        status.charging -> append(", charging")
-        status.plugged && status.powerSource != null -> append(", plugged in via ${status.powerSource}")
-        status.plugged -> append(", plugged in")
-        else -> append(", not charging")
-    }
 }
