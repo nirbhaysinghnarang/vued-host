@@ -1406,6 +1406,7 @@ private fun ProdRecorderMainScreen() {
             ) {
                 MeetingCircleButton(
                     meetingActive = meetingActive,
+                    recordingInterrupted = meetingActive && !captureReady,
                     enabled = !segmentBusy && (captureReady || meetingActive),
                     modifier = Modifier
                         .align(Alignment.Center)
@@ -1446,8 +1447,8 @@ private fun ProdRecorderMainScreen() {
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 2.dp),
-                    color = if (showMicDisconnected) Color(0xFFB42318) else VuedTextTertiary.copy(alpha = 0.62f),
-                    fontSize = if (showMicDisconnected) 34.sp else 52.sp,
+                    color = if (showMicDisconnected) VuedDanger else VuedTextTertiary.copy(alpha = 0.62f),
+                    fontSize = if (showMicDisconnected) 40.sp else 52.sp,
                     fontWeight = if (showMicDisconnected) FontWeight.Medium else FontWeight.Thin,
                     letterSpacing = 0.sp,
                 )
@@ -1571,21 +1572,28 @@ private fun DebugExceptionButton() {
 @Composable
 private fun MeetingCircleButton(
     meetingActive: Boolean,
+    recordingInterrupted: Boolean,
     enabled: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     val borderColor = when {
         !enabled -> VuedIdleRing
+        recordingInterrupted -> VuedDanger
         meetingActive -> VuedTextPrimary
         else -> VuedSuccess
     }
     val textColor = when {
         !enabled -> VuedTextTertiary
+        recordingInterrupted -> Color.White.copy(alpha = 0.92f)
         meetingActive -> Color.White
         else -> VuedSuccess
     }
-    val fillColor = if (meetingActive) VuedTextPrimary else Color.Transparent
+    val fillColor = when {
+        recordingInterrupted -> VuedTextPrimary.copy(alpha = 0.72f)
+        meetingActive -> VuedTextPrimary
+        else -> Color.Transparent
+    }
 
     Box(
         modifier = modifier
