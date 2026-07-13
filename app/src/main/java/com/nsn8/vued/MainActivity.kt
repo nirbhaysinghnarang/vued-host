@@ -130,7 +130,7 @@ private const val ACTION_USB_PERMISSION = "com.nsn8.vued.USB_PERMISSION"
 private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
 private const val RECONNECT_MEETING_GRACE_MS = 60_000L
 private const val RECORDER_RECONNECT_RETRY_MS = 250L
-private const val RECORDER_RECONNECT_TIMEOUT_MS = 10_000L
+private const val RECORDER_RECONNECT_TIMEOUT_MS = 60_000L
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
