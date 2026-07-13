@@ -59,15 +59,7 @@ class RecordingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            RecorderState.update {
-                it.copy(
-                    running = false,
-                    captureReady = false,
-                    micDisconnected = false,
-                    disconnectedAtMs = 0L,
-                    resumeOnReconnect = false,
-                )
-            }
+            RecorderState.markCaptureStoppedByUser()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -119,15 +111,7 @@ class RecordingService : Service() {
                 val lastAudioMs = pipeline.lastAudioMs
                 val ageMs = if (lastAudioMs > 0L) System.currentTimeMillis() - lastAudioMs else Long.MAX_VALUE
                 if (running && status.captureReady && ageMs > RecorderState.CAPTURE_STALE_MS) {
-                    RecorderState.update {
-                        it.copy(
-                            captureReady = false,
-                            micDisconnected = true,
-                            disconnectedAtMs = System.currentTimeMillis(),
-                            resumeOnReconnect = true,
-                            error = "Mic disconnected",
-                        )
-                    }
+                    RecorderState.markMicDisconnected()
                     AmplitudeTracker.track("mic_disconnected", mapOf("reason" to "capture_stale", "ageMs" to ageMs))
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastStaleReportMs >= CAPTURE_STALE_LOG_INTERVAL_MS) {
@@ -258,15 +242,7 @@ class RecordingService : Service() {
             "mic_disconnected",
             mapOf("reason" to "uma_unavailable", "message" to (error?.message ?: "UMA mic unavailable")),
         )
-        RecorderState.update {
-            it.copy(
-                captureReady = false,
-                error = message,
-                micDisconnected = true,
-                disconnectedAtMs = System.currentTimeMillis(),
-                resumeOnReconnect = true,
-            )
-        }
+        RecorderState.markMicDisconnected()
         runCatching {
             runBlocking {
                 if (MeetingController.active == null) {
@@ -442,6 +418,9 @@ class RecordingService : Service() {
         }
 
         fun stop(context: Context) {
+            // Publish mute intent before the service command is delivered so a USB
+            // detach immediately after a tap cannot be mistaken for active capture.
+            RecorderState.markCaptureStoppedByUser()
             context.startService(
                 Intent(context, RecordingService::class.java).setAction(ACTION_STOP)
             )

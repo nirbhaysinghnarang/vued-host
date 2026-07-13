@@ -195,6 +195,17 @@ class MainActivity : ComponentActivity() {
                     }
                     requestUmaPermissionForKioskRecovery(trigger = "usb_attached")
                 }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val detachedDevice = intent.usbDeviceExtra()
+                    if (detachedDevice.matchesUmaSafely()) {
+                        RecorderState.markMicDisconnected()
+                        AmplitudeTracker.track(
+                            "mic_disconnected",
+                            usbDeviceData(detachedDevice) + mapOf("reason" to "usb_detached"),
+                        )
+                        logKioskUsbEvent("kiosk_usb_detach_received", detachedDevice)
+                    }
+                }
                 ACTION_USB_PERMISSION -> {
                     val device = intent.usbDeviceExtra()
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
@@ -257,6 +268,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         val filter = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
             addAction(ACTION_USB_PERMISSION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -476,18 +488,7 @@ class MainActivity : ComponentActivity() {
         if (!device.matchesUmaSafely()) return
         val status = RecorderState.state.value
         if (!status.micDisconnected) return
-        if (status.resumeOnReconnect && !status.running && !status.hasFreshAudio()) {
-            logKioskUsbEvent("kiosk_usb_detected_waiting_for_resume", device, mapOf("trigger" to trigger))
-            return
-        }
-
-        RecorderState.update {
-            it.copy(
-                captureReady = false,
-                micDisconnected = false,
-                error = null,
-            )
-        }
+        RecorderState.markMicReconnected()
         logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", device, mapOf("trigger" to trigger))
     }
 
@@ -1174,7 +1175,8 @@ private fun ProdRecorderMainScreen() {
                 val wasPresent = micArrayPresent
                 micArrayPresent = isUmaMicPresent(ctx)
                 if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED && wasPresent && !micArrayPresent) {
-                    AmplitudeTracker.track("mic_disconnected", mapOf("reason" to "usb_detached"))
+                    // Physical disconnect handling is owned by MainActivity's lifecycle
+                    // receiver so it also works while recording is muted.
                 }
             }
         }
@@ -1276,16 +1278,7 @@ private fun ProdRecorderMainScreen() {
 
         val umaDevice = Uma8Capture(context).findDevice()
         if (!VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && umaDevice == null) {
-            RecorderState.update {
-                it.copy(
-                    running = false,
-                    captureReady = false,
-                    micDisconnected = true,
-                    disconnectedAtMs = System.currentTimeMillis(),
-                    resumeOnReconnect = true,
-                    error = "Mic disconnected",
-                )
-            }
+            RecorderState.markMicDisconnected(captureWasRunning = false)
             return
         }
 
@@ -1312,13 +1305,13 @@ private fun ProdRecorderMainScreen() {
         val disconnectMs = status.disconnectedAtMs
         if (!status.micDisconnected || disconnectMs <= 0L) return@LaunchedEffect
 
-        delay(RECONNECT_MEETING_GRACE_MS)
+        val remainingMs = (disconnectMs + RECONNECT_MEETING_GRACE_MS - System.currentTimeMillis())
+            .coerceAtLeast(0L)
+        delay(remainingMs)
 
         val latest = RecorderState.state.value
         val stillSameDisconnect = latest.micDisconnected &&
-            latest.disconnectedAtMs == disconnectMs &&
-            !latest.running &&
-            !latest.hasFreshAudio()
+            latest.disconnectedAtMs == disconnectMs
         if (!stillSameDisconnect) return@LaunchedEffect
 
         runCatching {
@@ -1333,15 +1326,7 @@ private fun ProdRecorderMainScreen() {
                 error,
             )
         }
-        RecorderState.update {
-            it.copy(
-                running = false,
-                captureReady = false,
-                micDisconnected = true,
-                disconnectedAtMs = disconnectMs,
-                error = "Mic disconnected",
-            )
-        }
+        RecorderState.markMicDisconnected(disconnectedAtMs = disconnectMs)
         meetingActive = MeetingController.active != null
         segmentStartedAt = MeetingController.active?.startMs ?: 0L
         nowMs = System.currentTimeMillis()
