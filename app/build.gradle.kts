@@ -64,6 +64,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(platform(libs.supabase.bom))
     implementation(libs.supabase.auth)
+    implementation(libs.supabase.realtime)
     implementation(libs.ktor.client.okhttp)
     implementation(libs.okhttp)
     implementation(libs.bouncycastle)
