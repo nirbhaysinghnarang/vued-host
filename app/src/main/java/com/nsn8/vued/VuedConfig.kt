@@ -51,7 +51,11 @@ object VuedConfig {
     // recording backend above. Used to fetch the org's rooms so the tablet can
     // assign itself to one.
     val ORG_API_BASE_URL = API_BASE_URL
-    val ALLOW_BUILT_IN_MIC_FALLBACK = MODE == Mode.DEV
+
+    // Keep recording available when no UMA array is attached. The recording
+    // service still prefers UMA-8/16 and automatically switches back when one
+    // becomes available.
+    const val ALLOW_BUILT_IN_MIC_FALLBACK = true
 
     const val AMPLITUDE_API_KEY = "a238d3271139545c5a533d67df8d8351"
 

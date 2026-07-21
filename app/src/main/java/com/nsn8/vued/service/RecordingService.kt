@@ -54,6 +54,9 @@ class RecordingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastUsbPermissionRequestKey: String? = null
     private var lastUsbPermissionRequestMs: Long = 0
+    private val foregroundTypeLock = Any()
+    private var foregroundNotification: Notification? = null
+    private var foregroundServiceTypes: Int = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -132,6 +135,7 @@ class RecordingService : Service() {
 
                 if (umaProfile != null) {
                     try {
+                        addUmaForegroundServiceType()
                         pipeline.configureInputChannels(umaProfile.outChannels)
                         Log.i(TAG, "capture profile=${umaProfile.label} channels=${umaProfile.outChannels}")
                         DiagnosticsLogger.info("capture_profile_selected", mapOf(
@@ -383,20 +387,49 @@ class RecordingService : Service() {
         }
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Vued is recording")
-            .setContentText("Ambient capture from UMA-8")
+            .setContentText("Ambient audio capture")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .build()
+        foregroundNotification = notification
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Start with only the type whose runtime prerequisite is already
+            // guaranteed. Declaring connectedDevice before USB permission exists
+            // causes Android 14+ to throw a SecurityException. If UMA capture is
+            // selected, add that type immediately before opening its USB stream.
             val serviceType = if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             } else {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             }
-            startForeground(NOTIF_ID, notification, serviceType)
+            updateForegroundServiceTypes(serviceType)
         } else {
             startForeground(NOTIF_ID, notification)
+        }
+    }
+
+    /**
+     * Adds the USB/connected-device type only after [readyUmaProfile] has verified
+     * that Android granted access to the attached UMA device. Foreground-service
+     * types are additive for the lifetime of a running service, so microphone stays
+     * declared in case capture later falls back to the tablet.
+     */
+    private fun addUmaForegroundServiceType() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        updateForegroundServiceTypes(
+            foregroundServiceTypes or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        )
+    }
+
+    private fun updateForegroundServiceTypes(types: Int) {
+        synchronized(foregroundTypeLock) {
+            if (types == foregroundServiceTypes) return
+            val notification = checkNotNull(foregroundNotification) {
+                "Foreground notification must be created before assigning service types"
+            }
+            startForeground(NOTIF_ID, notification, types)
+            foregroundServiceTypes = types
         }
     }
 

@@ -1389,7 +1389,7 @@ private fun ProdRecorderMainScreen() {
             MicConnectionBadge(status = micConnectionStatus)
             BatteryStatusBadge(status = batteryStatus)
             AddSpeakerButton(onClick = { showEnroll = true })
-            if (VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK) {
+            if (VuedConfig.MODE == VuedConfig.Mode.DEV) {
                 DebugExceptionButton()
             }
         }
@@ -2061,7 +2061,12 @@ private fun micConnectionUi(
         micArrayPresent && !status.micDisconnected -> MicConnectionUi(
             label = "Connected",
             color = VuedSuccess,
-            contentDescription = "Mic connected",
+            contentDescription = "UMA microphone connected",
+        )
+        status.hasFreshAudio() -> MicConnectionUi(
+            label = "Tablet mic",
+            color = VuedSuccess,
+            contentDescription = "Recording with tablet microphone",
         )
         else -> MicConnectionUi(
             label = "Disconnected",
