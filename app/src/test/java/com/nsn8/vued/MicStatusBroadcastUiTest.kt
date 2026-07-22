@@ -114,6 +114,29 @@ class MicStatusBroadcastUiTest {
     }
 
     @Test
+    fun micStatusPanelRequiresMultipleOrganizationMicrophones() {
+        val oneMic = listOf(
+            OrgApi.Room("room-1", "mic-1", "Current"),
+        )
+        val twoMics = oneMic + OrgApi.Room("room-2", "mic-2", "Conference Room")
+
+        assertEquals(false, hasMultipleOrganizationMicrophones(emptyList()))
+        assertEquals(false, hasMultipleOrganizationMicrophones(oneMic))
+        assertEquals(true, hasMultipleOrganizationMicrophones(twoMics))
+    }
+
+    @Test
+    fun duplicateAndBlankMicrophoneIdsDoNotEnablePanel() {
+        val rooms = listOf(
+            OrgApi.Room("room-1", "mic-1", "Current"),
+            OrgApi.Room("room-2", "mic-1", "Duplicate Assignment"),
+            OrgApi.Room("room-3", "  ", "Unassigned"),
+        )
+
+        assertEquals(false, hasMultipleOrganizationMicrophones(rooms))
+    }
+
+    @Test
     fun staleHeartbeatUsesUnavailableIndicator() {
         val nowMs = 200_000L
         val room = OrgApi.Room(
