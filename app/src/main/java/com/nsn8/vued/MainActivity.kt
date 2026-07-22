@@ -1597,7 +1597,6 @@ private fun MicStatusEdgeSwipeDetector(
         modifier = modifier
             .fillMaxHeight()
             .width(28.dp)
-            .semantics { contentDescription = "Swipe left to open microphone statuses" }
             .pointerInput(onOpen, thresholdPx) {
                 var dragDistance = 0f
                 detectHorizontalDragGestures(
@@ -1610,7 +1609,43 @@ private fun MicStatusEdgeSwipeDetector(
                     onDragCancel = { dragDistance = 0f },
                 )
             },
-    )
+        contentAlignment = Alignment.CenterEnd,
+    ) {
+        val handleShape = RoundedCornerShape(topStart = 13.dp, bottomStart = 13.dp)
+        Box(
+            modifier = Modifier
+                .width(22.dp)
+                .height(76.dp)
+                .clip(handleShape)
+                .background(VuedSurfaceRaised.copy(alpha = 0.96f))
+                .border(BorderStroke(1.dp, VuedHairline), handleShape)
+                .clickable(onClick = onOpen)
+                .semantics { contentDescription = "Open microphone statuses" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(
+                modifier = Modifier
+                    .width(9.dp)
+                    .height(18.dp),
+            ) {
+                val stroke = 2.2.dp.toPx()
+                drawLine(
+                    color = VuedTextTertiary,
+                    start = Offset(size.width * 0.72f, size.height * 0.18f),
+                    end = Offset(size.width * 0.28f, size.height * 0.5f),
+                    strokeWidth = stroke,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = VuedTextTertiary,
+                    start = Offset(size.width * 0.28f, size.height * 0.5f),
+                    end = Offset(size.width * 0.72f, size.height * 0.82f),
+                    strokeWidth = stroke,
+                    cap = StrokeCap.Round,
+                )
+            }
+        }
+    }
 }
 
 private data class PendingMicCommand(
