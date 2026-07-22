@@ -27,26 +27,39 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -75,6 +88,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.geometry.Offset
@@ -83,7 +97,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -92,9 +108,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -114,6 +132,11 @@ import com.nsn8.vued.ui.RoomPickerDialog
 import com.nsn8.vued.ui.SpeakerEnrollmentDialog
 import com.nsn8.vued.service.RecorderState
 import com.nsn8.vued.service.RecordingService
+import com.nsn8.vued.status.RoomMicCommand
+import com.nsn8.vued.status.RoomMicStatus
+import com.nsn8.vued.status.RoomMicStatusBroadcast
+import com.nsn8.vued.status.RoomMicStatusBroadcasts
+import com.nsn8.vued.status.isMicCommandRejectedAsDisconnected
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
 import com.nsn8.vued.update.SelfUpdateManager
@@ -133,6 +156,9 @@ private const val RECONNECT_MEETING_GRACE_MS = 60_000L
 private const val RECORDER_RECONNECT_RETRY_MS = 250L
 private const val RECORDER_RECONNECT_TIMEOUT_MS = 60_000L
 private const val LOW_BATTERY_THRESHOLD_PERCENT = 20
+private const val MIC_STATUS_OFFLINE_AFTER_MS = 60_000L
+private const val MIC_COMMAND_CONFIRM_TIMEOUT_MS = 15_000L
+private const val MIC_DRAWER_ANIMATION_MS = 220
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -223,6 +249,9 @@ class MainActivity : ComponentActivity() {
                     pendingKioskAfterUsbPermission = false
                     pendingRecorderStartAfterUsbPermission = false
                     pendingRecorderStartRequiresResumeState = false
+                    if (granted) {
+                        dismissMicDisconnectedIfUmaDetected(device, trigger = "usb_permission_granted")
+                    }
                     if (granted && shouldStartRecorder) {
                         if (requiresResumeState) {
                             resumeRecorderAfterUmaReconnect("usb_permission_granted", device)
@@ -485,11 +514,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun dismissMicDisconnectedIfUmaDetected(device: UsbDevice?, trigger: String) {
-        if (!device.matchesUmaSafely()) return
+        val umaDevice = device?.takeIf { it.matchesUmaSafely() } ?: return
+        if (!Uma8Capture(this).hasPermission(umaDevice)) {
+            logKioskUsbEvent(
+                "kiosk_usb_detected_waiting_for_permission",
+                umaDevice,
+                mapOf("trigger" to trigger),
+            )
+            return
+        }
         val status = RecorderState.state.value
         if (!status.micDisconnected) return
         RecorderState.markMicReconnected()
-        logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", device, mapOf("trigger" to trigger))
+        logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", umaDevice, mapOf("trigger" to trigger))
     }
 
     private fun hideStatusBar() {
@@ -1120,6 +1157,8 @@ private fun ProdRecorderMainScreen() {
     var segmentBusy by remember { mutableStateOf(false) }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showEnroll by remember { mutableStateOf(false) }
+    var showMicStatuses by remember { mutableStateOf(false) }
+    var hasMultipleOrganizationMics by remember { mutableStateOf(false) }
     var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
     var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
     var micArrayPresent by remember { mutableStateOf(isUmaMicPresent(context)) }
@@ -1230,7 +1269,9 @@ private fun ProdRecorderMainScreen() {
             val orgId = assignedOrgId?.takeIf { it.isNotBlank() }
                 ?: OrgApi.getOrgs().firstOrNull()?.id
                 ?: return@runCatching
-            OrgApi.getRooms(orgId).firstOrNull { it.id == assignedRoomId }?.let { room ->
+            val organizationRooms = OrgApi.getRooms(orgId)
+            hasMultipleOrganizationMics = hasMultipleOrganizationMicrophones(organizationRooms)
+            organizationRooms.firstOrNull { it.id == assignedRoomId }?.let { room ->
                 if (room.displayName.isNotBlank() && room.displayName != roomName) {
                     RoomConfig.set(context, room.id, room.displayName, orgId, room.microphoneId)
                     roomName = room.displayName
@@ -1340,12 +1381,13 @@ private fun ProdRecorderMainScreen() {
     }
     val showMicDisconnected = !VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && status.micDisconnected
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(VuedBackground)
-            .padding(horizontal = 36.dp, vertical = 20.dp),
-    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(VuedBackground)
+                .padding(horizontal = 36.dp, vertical = 20.dp),
+        ) {
         if (roomName.isNotBlank()) {
             Text(
                 text = roomName,
@@ -1528,10 +1570,30 @@ private fun ProdRecorderMainScreen() {
                 }
             },
         )
+
+        }
+
+        if (hasMultipleOrganizationMics && !showMicStatuses) {
+            MicStatusPhysicalEdgeSwipeDetector(
+                modifier = Modifier.align(Alignment.CenterEnd),
+                onOpen = { showMicStatuses = true },
+            )
+            MicStatusEdgeSwipeDetector(
+                modifier = Modifier.align(Alignment.CenterEnd),
+                onOpen = { showMicStatuses = true },
+            )
+        }
     }
 
     if (showEnroll) {
         ProdSpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
+    }
+    if (hasMultipleOrganizationMics && showMicStatuses) {
+        MicStatusesDrawer(
+            initialOrgId = assignedOrgId,
+            currentRoomId = assignedRoomId,
+            onDismiss = { showMicStatuses = false },
+        )
     }
     if (updateDialogVisible) {
         SelfUpdateDialog(
@@ -1543,6 +1605,636 @@ private fun ProdRecorderMainScreen() {
                 if (!updateBusy) updateDialogVisible = false
             },
         )
+    }
+}
+
+@Composable
+internal fun MicStatusPhysicalEdgeSwipeDetector(
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit,
+) {
+    val thresholdPx = with(LocalDensity.current) { 36.dp.toPx() }
+    Spacer(
+        modifier = modifier
+            .fillMaxHeight()
+            .width(36.dp)
+            .semantics { contentDescription = "Swipe left to open microphone statuses" }
+            .pointerInput(onOpen, thresholdPx) {
+                var dragDistance = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { dragDistance = 0f },
+                    onHorizontalDrag = { _, dragAmount -> dragDistance += dragAmount },
+                    onDragEnd = {
+                        if (dragDistance <= -thresholdPx) onOpen()
+                        dragDistance = 0f
+                    },
+                    onDragCancel = { dragDistance = 0f },
+                )
+            },
+    )
+}
+
+@Composable
+private fun MicStatusEdgeSwipeDetector(
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit,
+) {
+    val thresholdPx = with(LocalDensity.current) { 36.dp.toPx() }
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .width(28.dp)
+            .pointerInput(onOpen, thresholdPx) {
+                var dragDistance = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { dragDistance = 0f },
+                    onHorizontalDrag = { _, dragAmount -> dragDistance += dragAmount },
+                    onDragEnd = {
+                        if (dragDistance <= -thresholdPx) onOpen()
+                        dragDistance = 0f
+                    },
+                    onDragCancel = { dragDistance = 0f },
+                )
+            },
+        contentAlignment = Alignment.CenterEnd,
+    ) {
+        val handleShape = RoundedCornerShape(topStart = 13.dp, bottomStart = 13.dp)
+        Box(
+            modifier = Modifier
+                .width(22.dp)
+                .height(76.dp)
+                .clip(handleShape)
+                .background(VuedSurfaceRaised.copy(alpha = 0.96f))
+                .border(BorderStroke(1.dp, VuedHairline), handleShape)
+                .clickable(onClick = onOpen)
+                .semantics { contentDescription = "Open microphone statuses" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(
+                modifier = Modifier
+                    .width(9.dp)
+                    .height(18.dp),
+            ) {
+                val stroke = 2.2.dp.toPx()
+                drawLine(
+                    color = VuedTextTertiary,
+                    start = Offset(size.width * 0.72f, size.height * 0.18f),
+                    end = Offset(size.width * 0.28f, size.height * 0.5f),
+                    strokeWidth = stroke,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = VuedTextTertiary,
+                    start = Offset(size.width * 0.28f, size.height * 0.5f),
+                    end = Offset(size.width * 0.72f, size.height * 0.82f),
+                    strokeWidth = stroke,
+                    cap = StrokeCap.Round,
+                )
+            }
+        }
+    }
+}
+
+private data class PendingMicCommand(
+    val command: RoomMicCommand,
+    val statusAtDispatch: String?,
+    val token: Long,
+)
+
+internal data class MicCommandError(
+    val roomId: String,
+    val message: String,
+    val clearsWhenMicReconnects: Boolean = false,
+)
+
+internal fun micCommandFailureMessage(
+    command: RoomMicCommand,
+    status: String?,
+    roomName: String,
+): String? = if (isMicCommandRejectedAsDisconnected(command, status)) {
+    "$roomName's microphone is disconnected."
+} else {
+    null
+}
+
+internal fun messageForDisconnectedApiFailure(
+    command: RoomMicCommand,
+    apiMessage: String?,
+    roomName: String,
+): String? = if (
+    command == RoomMicCommand.UNMUTE &&
+    apiMessage?.contains("microphone is disconnected", ignoreCase = true) == true
+) {
+    micCommandFailureMessage(
+        command = command,
+        status = RoomMicStatus.MIC_DISCONNECTED.apiValue,
+        roomName = roomName,
+    )
+} else {
+    null
+}
+
+internal fun shouldClearMicCommandError(error: MicCommandError, room: OrgApi.Room): Boolean =
+    error.clearsWhenMicReconnects &&
+        error.roomId == room.id &&
+        room.status != RoomMicStatus.MIC_DISCONNECTED.apiValue
+
+internal fun isMicDisconnectedStatus(status: String?): Boolean =
+    status == RoomMicStatus.MIC_DISCONNECTED.apiValue
+
+internal fun hasMicStatusChangedSinceDispatch(
+    statusAtDispatch: String?,
+    currentStatus: String?,
+): Boolean = currentStatus != statusAtDispatch
+
+internal fun isMicOnline(room: OrgApi.Room, nowMs: Long): Boolean {
+    val updatedAtMs = room.statusUpdatedAt?.times(1_000.0)?.toLong()
+    return updatedAtMs != null &&
+        nowMs - updatedAtMs <= MIC_STATUS_OFFLINE_AFTER_MS
+}
+
+internal fun shouldShowMicUnavailableIndicator(room: OrgApi.Room, nowMs: Long): Boolean =
+    !isMicOnline(room, nowMs) || isMicDisconnectedStatus(room.status)
+
+@Composable
+private fun MeetingRecordingDot() {
+    val transition = rememberInfiniteTransition(label = "meeting-recording-dot")
+    val dotAlpha by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 650),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "meeting-recording-dot-alpha",
+    )
+    Box(
+        modifier = Modifier
+            .size(10.dp)
+            .alpha(dotAlpha)
+            .background(VuedDanger, CircleShape)
+            .semantics { contentDescription = "Meeting recording" },
+    )
+}
+
+internal fun visibleMicRooms(
+    rooms: List<OrgApi.Room>,
+    currentRoomId: String?,
+): List<OrgApi.Room> = rooms.filter { room ->
+    room.status != null && room.id != currentRoomId
+}
+
+internal fun hasMultipleOrganizationMicrophones(rooms: List<OrgApi.Room>): Boolean =
+    rooms.asSequence()
+        .map { it.microphoneId.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .take(2)
+        .count() > 1
+
+private fun isNewerMicStatus(existingTimestamp: Double?, candidateTimestamp: Double?): Boolean =
+    when {
+        existingTimestamp == null -> true
+        candidateTimestamp == null -> false
+        else -> candidateTimestamp > existingTimestamp
+    }
+
+internal fun mergeMicStatusSnapshot(
+    rooms: List<OrgApi.Room>,
+    snapshot: List<OrgApi.Room>,
+    currentRoomId: String?,
+): List<OrgApi.Room> = visibleMicRooms(snapshot, currentRoomId).map { candidate ->
+    val existing = rooms.firstOrNull { it.id == candidate.id }
+    if (existing != null && !isNewerMicStatus(existing.statusUpdatedAt, candidate.statusUpdatedAt)) {
+        candidate.copy(
+            status = existing.status,
+            statusUpdatedAt = existing.statusUpdatedAt,
+        )
+    } else {
+        candidate
+    }
+}
+
+internal fun isMicStatusBroadcastNewer(
+    rooms: List<OrgApi.Room>,
+    update: RoomMicStatusBroadcast,
+    currentRoomId: String?,
+): Boolean {
+    if (update.roomId == currentRoomId) return false
+    val existing = rooms.firstOrNull { it.id == update.roomId }
+    return existing == null || isNewerMicStatus(existing.statusUpdatedAt, update.statusUpdatedAt)
+}
+
+internal fun mergeMicStatusBroadcast(
+    rooms: List<OrgApi.Room>,
+    update: RoomMicStatusBroadcast,
+    currentRoomId: String?,
+): List<OrgApi.Room> {
+    if (!isMicStatusBroadcastNewer(rooms, update, currentRoomId)) return rooms
+    val updatedRoom = OrgApi.Room(
+        id = update.roomId,
+        microphoneId = update.microphoneId,
+        displayName = update.displayName,
+        status = update.status,
+        statusUpdatedAt = update.statusUpdatedAt,
+    )
+    val existingIndex = rooms.indexOfFirst { it.id == update.roomId }
+    return if (existingIndex >= 0) {
+        rooms.toMutableList().apply { this[existingIndex] = updatedRoom }
+    } else {
+        rooms + updatedRoom
+    }
+}
+
+@Composable
+private fun MicStatusesDrawer(
+    initialOrgId: String?,
+    currentRoomId: String?,
+    onDismiss: () -> Unit,
+) {
+    var rooms by remember { mutableStateOf<List<OrgApi.Room>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var commandError by remember { mutableStateOf<MicCommandError?>(null) }
+    var resolvedOrgId by remember(initialOrgId) {
+        mutableStateOf(initialOrgId?.takeIf { it.isNotBlank() })
+    }
+    var pendingCommands by remember {
+        mutableStateOf<Map<String, PendingMicCommand>>(emptyMap())
+    }
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    var panelVisible by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val closeThresholdPx = with(LocalDensity.current) { 56.dp.toPx() }
+
+    fun closeDrawer() {
+        if (!panelVisible) return
+        panelVisible = false
+        scope.launch {
+            delay(MIC_DRAWER_ANIMATION_MS.toLong())
+            onDismiss()
+        }
+    }
+
+    fun dispatchCommand(room: OrgApi.Room, command: RoomMicCommand) {
+        val orgId = resolvedOrgId
+        if (orgId.isNullOrBlank() || pendingCommands.containsKey(room.id)) return
+        val pending = PendingMicCommand(
+            command = command,
+            statusAtDispatch = room.status,
+            token = System.nanoTime(),
+        )
+        pendingCommands = pendingCommands + (room.id to pending)
+        commandError = null
+        scope.launch {
+            try {
+                OrgApi.sendRoomMicCommand(orgId, room.id, command.apiValue)
+            } catch (failure: Throwable) {
+                if (pendingCommands[room.id]?.token == pending.token) {
+                    pendingCommands = pendingCommands - room.id
+                    val disconnectedFailure = messageForDisconnectedApiFailure(
+                        pending.command,
+                        failure.message,
+                        room.displayName,
+                    )
+                    commandError = MicCommandError(
+                        roomId = room.id,
+                        message = disconnectedFailure
+                            ?: failure.message
+                            ?: "Could not send microphone command.",
+                        clearsWhenMicReconnects = disconnectedFailure != null,
+                    )
+                }
+                return@launch
+            }
+
+            delay(MIC_COMMAND_CONFIRM_TIMEOUT_MS)
+            if (pendingCommands[room.id]?.token == pending.token) {
+                pendingCommands = pendingCommands - room.id
+                commandError = MicCommandError(
+                    roomId = room.id,
+                    message = "${room.displayName} did not confirm the command.",
+                )
+            }
+        }
+    }
+
+    LaunchedEffect(initialOrgId, currentRoomId) {
+        val orgId = initialOrgId?.takeIf { it.isNotBlank() }
+            ?: runCatching { OrgApi.getOrgs().firstOrNull()?.id }.getOrNull()
+        if (orgId.isNullOrBlank()) {
+            error = "No organization is assigned to this tablet."
+            loading = false
+            return@LaunchedEffect
+        }
+        resolvedOrgId = orgId
+
+        suspend fun refreshSnapshot() {
+            runCatching { OrgApi.getRooms(orgId) }
+                .onSuccess { fetched ->
+                    val visible = mergeMicStatusSnapshot(rooms, fetched, currentRoomId)
+                    rooms = visible
+                    val unresolved = pendingCommands.toMutableMap()
+                    pendingCommands.forEach { (roomId, pending) ->
+                        val room = visible.firstOrNull { it.id == roomId } ?: return@forEach
+                        val failureMessage = micCommandFailureMessage(
+                            pending.command,
+                            room.status,
+                            room.displayName,
+                        )
+                        if (failureMessage != null) {
+                            unresolved.remove(roomId)
+                            commandError = MicCommandError(
+                                roomId = roomId,
+                                message = failureMessage,
+                                clearsWhenMicReconnects = true,
+                            )
+                        } else if (
+                            hasMicStatusChangedSinceDispatch(pending.statusAtDispatch, room.status)
+                        ) {
+                            unresolved.remove(roomId)
+                        }
+                    }
+                    pendingCommands = unresolved
+                    commandError?.let { currentError ->
+                        if (visible.any { shouldClearMicCommandError(currentError, it) }) {
+                            commandError = null
+                        }
+                    }
+                    error = null
+                }
+                .onFailure { failure ->
+                    error = failure.message ?: "Could not load microphone statuses."
+                }
+            loading = false
+        }
+
+        // Render a snapshot immediately. Once Broadcast subscribes it refreshes
+        // again, closing the small gap between this request and channel setup.
+        refreshSnapshot()
+        try {
+            RoomMicStatusBroadcasts.listen(
+                orgId = orgId,
+                onConnected = { refreshSnapshot() },
+                onStatus = statusUpdate@{ update ->
+                    if (!isMicStatusBroadcastNewer(rooms, update, currentRoomId)) {
+                        return@statusUpdate
+                    }
+                    rooms = mergeMicStatusBroadcast(rooms, update, currentRoomId)
+                    commandError?.let { currentError ->
+                        val updatedRoom = rooms.firstOrNull { it.id == update.roomId }
+                        if (updatedRoom != null && shouldClearMicCommandError(currentError, updatedRoom)) {
+                            commandError = null
+                        }
+                    }
+                    pendingCommands[update.roomId]?.let { pending ->
+                        val failureMessage = micCommandFailureMessage(
+                            pending.command,
+                            update.status,
+                            update.displayName,
+                        )
+                        if (failureMessage != null) {
+                            pendingCommands = pendingCommands - update.roomId
+                            commandError = MicCommandError(
+                                roomId = update.roomId,
+                                message = failureMessage,
+                                clearsWhenMicReconnects = true,
+                            )
+                        } else if (
+                            hasMicStatusChangedSinceDispatch(pending.statusAtDispatch, update.status)
+                        ) {
+                            pendingCommands = pendingCommands - update.roomId
+                        }
+                    }
+                    error = null
+                },
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            error = failure.message ?: "Live microphone updates are unavailable."
+            DiagnosticsLogger.warn(
+                "mic_status_broadcast_failed",
+                mapOf("orgId" to orgId),
+                failure,
+            )
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        panelVisible = true
+        while (true) {
+            nowMs = System.currentTimeMillis()
+            delay(1_000L)
+        }
+    }
+
+    Dialog(
+        onDismissRequest = { closeDrawer() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.18f)),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Spacer(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clickable(onClick = { closeDrawer() }),
+            )
+            AnimatedVisibility(
+                visible = panelVisible,
+                enter = slideInHorizontally(
+                    initialOffsetX = { it },
+                    animationSpec = tween(MIC_DRAWER_ANIMATION_MS),
+                ),
+                exit = slideOutHorizontally(
+                    targetOffsetX = { it },
+                    animationSpec = tween(MIC_DRAWER_ANIMATION_MS),
+                ),
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(480.dp)
+                        .pointerInput(onDismiss, closeThresholdPx) {
+                            var dragDistance = 0f
+                            detectHorizontalDragGestures(
+                                onDragStart = { dragDistance = 0f },
+                                onHorizontalDrag = { _, dragAmount -> dragDistance += dragAmount },
+                                onDragEnd = {
+                                    if (dragDistance >= closeThresholdPx) closeDrawer()
+                                    dragDistance = 0f
+                                },
+                                onDragCancel = { dragDistance = 0f },
+                            )
+                        },
+                    shape = RoundedCornerShape(topStart = 18.dp, bottomStart = 18.dp),
+                    color = VuedSurfaceRaised,
+                    shadowElevation = 20.dp,
+                    tonalElevation = 0.dp,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(22.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text(
+                                text = "Microphones",
+                                color = VuedTextPrimary,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.sp,
+                            )
+                            Text(
+                                text = "Live status by room",
+                                color = VuedTextTertiary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                letterSpacing = 0.sp,
+                            )
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            when {
+                                loading -> {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 28.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(28.dp),
+                                            strokeWidth = 2.5.dp,
+                                            color = VuedTextTertiary,
+                                        )
+                                    }
+                                }
+                                rooms.isEmpty() -> {
+                                    Text(
+                                        text = error ?: "No other microphones have reported a status yet.",
+                                        color = if (error == null) VuedTextTertiary else VuedDanger,
+                                        fontSize = 14.sp,
+                                    )
+                                }
+                                else -> {
+                                    rooms.forEach { room ->
+                                        val online = isMicOnline(room, nowMs)
+                                        val unavailable = shouldShowMicUnavailableIndicator(room, nowMs)
+                                        val recording = room.status in
+                                            setOf("ambient_recording", "meeting_recording")
+                                        val muted = room.status in setOf("ambient_muted", "meeting_muted")
+                                        val muteEnabled = online &&
+                                            (muted || room.status == "ambient_recording")
+                                        val pending = pendingCommands[room.id]
+                                        val muteCommand = if (muted) {
+                                            RoomMicCommand.UNMUTE
+                                        } else {
+                                            RoomMicCommand.MUTE
+                                        }
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(VuedSurface)
+                                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Text(
+                                                text = room.displayName,
+                                                color = VuedTextPrimary,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                if (online && room.status == "meeting_recording") {
+                                                    MeetingRecordingDot()
+                                                }
+                                                if (pending != null) {
+                                                    MicCommandLoadingIndicator(
+                                                        unmuted = recording,
+                                                        contentDescription =
+                                                            "Updating ${room.displayName} microphone",
+                                                    )
+                                                } else if (unavailable) {
+                                                    MicDisconnectedIndicator(
+                                                        contentDescription = if (online) {
+                                                            "Microphone disconnected"
+                                                        } else {
+                                                            "Tablet offline"
+                                                        },
+                                                    )
+                                                } else {
+                                                    AudioMuteButton(
+                                                        unmuted = recording,
+                                                        enabled = muteEnabled,
+                                                        buttonSize = 46.dp,
+                                                        iconSize = 25.dp,
+                                                        onClick = { dispatchCommand(room, muteCommand) },
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (error != null) {
+                                        Text(
+                                            text = "Live updates: $error",
+                                            color = VuedDanger,
+                                            fontSize = 12.sp,
+                                        )
+                                    }
+                                    if (commandError != null) {
+                                        Text(
+                                            text = commandError?.message.orEmpty(),
+                                            color = VuedDanger,
+                                            fontSize = 12.sp,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            Button(
+                                onClick = { closeDrawer() },
+                                shape = RoundedCornerShape(8.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = VuedTextPrimary,
+                                    contentColor = Color.White,
+                                ),
+                                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 9.dp),
+                            ) {
+                                Text(
+                                    text = "Done",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1626,6 +2318,8 @@ private fun AudioMuteButton(
     unmuted: Boolean,
     enabled: Boolean,
     modifier: Modifier = Modifier,
+    buttonSize: Dp = 112.dp,
+    iconSize: Dp = 60.dp,
     onClick: () -> Unit,
 ) {
     val iconColor = Color.White
@@ -1635,7 +2329,7 @@ private fun AudioMuteButton(
         enabled = enabled,
         shape = CircleShape,
         modifier = modifier
-            .size(112.dp)
+            .size(buttonSize)
             .semantics { contentDescription = if (unmuted) "Mute" else "Unmute" },
         colors = ButtonDefaults.buttonColors(
             containerColor = containerColor,
@@ -1647,11 +2341,11 @@ private fun AudioMuteButton(
         elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
     ) {
         Box(
-            modifier = Modifier.size(60.dp),
+            modifier = Modifier.size(iconSize),
             contentAlignment = Alignment.Center,
         ) {
             Canvas(Modifier.fillMaxSize()) {
-                val stroke = 4.dp.toPx()
+                val stroke = size.minDimension * (4f / 60f)
                 val micCenterX = size.width * 0.5f
                 val micTop = size.height * 0.13f
                 val micSize = Size(size.width * 0.34f, size.height * 0.48f)
@@ -1700,6 +2394,62 @@ private fun AudioMuteButton(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+internal fun MicCommandLoadingIndicator(
+    unmuted: Boolean,
+    contentDescription: String = "Updating microphone",
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .size(46.dp)
+            .clip(CircleShape)
+            .background(if (unmuted) VuedSuccess else VuedDanger),
+        contentAlignment = Alignment.Center,
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier
+                .size(25.dp)
+                .semantics { this.contentDescription = contentDescription },
+            color = Color.White,
+            strokeWidth = 2.5.dp,
+        )
+    }
+}
+
+@Composable
+internal fun MicDisconnectedIndicator(
+    modifier: Modifier = Modifier,
+    contentDescription: String = "Microphone disconnected",
+) {
+    Box(
+        modifier = modifier
+            .size(46.dp)
+            .semantics { this.contentDescription = contentDescription },
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(30.dp)) {
+            val stroke = size.minDimension * 0.09f
+            drawCircle(
+                color = VuedDanger,
+                style = Stroke(width = stroke),
+            )
+            drawLine(
+                color = VuedDanger,
+                start = Offset(size.width * 0.5f, size.height * 0.24f),
+                end = Offset(size.width * 0.5f, size.height * 0.58f),
+                strokeWidth = stroke,
+                cap = StrokeCap.Round,
+            )
+            drawCircle(
+                color = VuedDanger,
+                radius = stroke * 0.62f,
+                center = Offset(size.width * 0.5f, size.height * 0.74f),
+            )
         }
     }
 }

@@ -5,6 +5,8 @@ import android.content.Context
 import com.nsn8.vued.auth.VuedAuth
 import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.OutboundQueue
+import com.nsn8.vued.status.RoomMicCommandBroadcasts
+import com.nsn8.vued.status.RoomMicStatusReporter
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.sentry.IScope
 import io.sentry.Sentry
@@ -12,6 +14,7 @@ import io.sentry.android.core.SentryAndroid
 import io.sentry.protocol.User
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -21,6 +24,8 @@ import kotlinx.coroutines.launch
  */
 class App : Application() {
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var roomMicStatusReporterJob: Job? = null
+    private var roomMicCommandJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -70,11 +75,26 @@ class App : Application() {
             VuedAuth.sessionStatus.collect { status ->
                 updateSentryContext(this@App)
                 if (status is SessionStatus.Authenticated) {
+                    if (roomMicStatusReporterJob?.isActive != true) {
+                        roomMicStatusReporterJob = appScope.launch {
+                            RoomMicStatusReporter.run(this@App)
+                        }
+                    }
+                    if (roomMicCommandJob?.isActive != true) {
+                        roomMicCommandJob = appScope.launch {
+                            RoomMicCommandBroadcasts.run(this@App)
+                        }
+                    }
                     MeetingController.retryPendingExports(this@App)
                     runCatching { OutboundQueue.drain(this@App) }
                         .onFailure { error ->
                             DiagnosticsLogger.warn("auth_queue_drain_failed", throwable = error)
                         }
+                } else {
+                    roomMicStatusReporterJob?.cancel()
+                    roomMicStatusReporterJob = null
+                    roomMicCommandJob?.cancel()
+                    roomMicCommandJob = null
                 }
             }
         }

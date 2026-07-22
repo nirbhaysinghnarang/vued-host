@@ -15,6 +15,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -81,9 +83,11 @@ object MeetingController {
     @Volatile
     private var rolling: RollingBuffer? = null
 
-    @Volatile
-    var active: ActiveMeeting? = null
-        private set
+    private val _activeState = MutableStateFlow<ActiveMeeting?>(null)
+    val activeState: StateFlow<ActiveMeeting?> = _activeState
+
+    val active: ActiveMeeting?
+        get() = _activeState.value
 
     val isCapturing: Boolean
         get() = rolling?.hasRecentAudio(RecorderState.CAPTURE_STALE_MS) == true &&
@@ -123,8 +127,16 @@ object MeetingController {
             roomId = RoomConfig.roomId(appContext),
             microphoneId = RoomConfig.microphoneId(appContext),
         )
-        persistActive(appContext, persisted)
-        active = ActiveMeeting(meetingId, startMs)
+        synchronized(lock) {
+            check(active == null) { "A meeting is already in progress." }
+            val lockedNowMs = System.currentTimeMillis()
+            check(
+                RecorderState.state.value.hasFreshAudio(lockedNowMs) &&
+                    buffer.hasRecentAudio(RecorderState.CAPTURE_STALE_MS, lockedNowMs)
+            ) { "Start recording first — the microphone is not ready." }
+            persistActive(appContext, persisted)
+            _activeState.value = ActiveMeeting(meetingId, startMs)
+        }
         Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
         DiagnosticsLogger.info("meeting_started", mapOf("meetingId" to meetingId, "startMs" to startMs))
         runCatching {
@@ -204,6 +216,16 @@ object MeetingController {
 
     fun retryPendingExports(context: Context) {
         exportSignals.trySend(context.applicationContext)
+    }
+
+    /**
+     * Runs [action] only while no manual meeting is active. Meeting start uses
+     * the same lock and rechecks capture state, closing the remote-mute race.
+     */
+    internal fun runIfNoActiveMeeting(action: () -> Unit): Boolean = synchronized(lock) {
+        if (active != null) return@synchronized false
+        action()
+        true
     }
 
     /**
@@ -455,7 +477,7 @@ object MeetingController {
             endMs = requestedEndMs.coerceAtLeast(meeting.startMs),
         )
         transitionActiveToPending(context, closed)
-        active = null
+        _activeState.value = null
         closed
     }
 

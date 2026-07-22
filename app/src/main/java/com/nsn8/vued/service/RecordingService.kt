@@ -43,10 +43,17 @@ import kotlin.math.log10
  * [VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK] is enabled, Android microphone capture
  * backs up unavailable arrays; otherwise UMA availability is required.
  */
+internal fun canStartRecordingCapture(
+    allowBuiltInMicFallback: Boolean,
+    umaConnected: Boolean,
+    usbPermissionGranted: Boolean,
+): Boolean = allowBuiltInMicFallback || (umaConnected && usbPermissionGranted)
+
 class RecordingService : Service() {
 
     @Volatile
     private var running = false
+    private var activeCaptureSessionId: Long? = null
     private var captureThread: Thread? = null
     private val ambientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var ambientJob: Job? = null
@@ -59,23 +66,66 @@ class RecordingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            running = false
+            activeCaptureSessionId?.let(captureSessions::invalidateIfActive)
             RecorderState.markCaptureStoppedByUser()
             stopSelf()
             return START_NOT_STICKY
         }
         if (running) return START_STICKY
 
-        startForegroundNotification()
-        acquireWakeLock()
-        running = true
-        RecorderState.reset()
-        RecorderState.update { it.copy(running = true) }
+        if (!isCaptureStartEligible(this)) {
+            RecorderState.markMicDisconnected(captureWasRunning = false)
+            DiagnosticsLogger.warn("recording_start_rejected", mapOf("reason" to "mic_disconnected"))
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
 
-        captureThread = Thread({ captureLoop() }, "uma8-capture").also { it.start() }
+        try {
+            startForegroundNotification()
+        } catch (error: SecurityException) {
+            if (!VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && !hasAuthorizedUma(this)) {
+                RecorderState.markMicDisconnected(captureWasRunning = false)
+            } else {
+                RecorderState.update {
+                    it.copy(
+                        running = false,
+                        captureReady = false,
+                        error = error.message ?: "Unable to start recording",
+                    )
+                }
+            }
+            DiagnosticsLogger.warn(
+                "recording_foreground_start_rejected",
+                mapOf("message" to (error.message ?: "")),
+                error,
+            )
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+        acquireWakeLock()
+        val captureSessionId = captureSessions.begin()
+        activeCaptureSessionId = captureSessionId
+        val initialized = captureSessions.runIfActive(captureSessionId) {
+            running = true
+            RecorderState.reset()
+            RecorderState.update { it.copy(running = true) }
+        }
+        if (!initialized) {
+            running = false
+            releaseWakeLock()
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+
+        captureThread = Thread(
+            { captureLoop(captureSessionId) },
+            "uma8-capture",
+        ).also { it.start() }
         return START_STICKY
     }
 
-    private fun captureLoop() {
+    private fun captureLoop(captureSessionId: Long) {
         val segmentsDir = File(getExternalFilesDir(null), "segments")
         // Manual selection overrides auto-detect. Keep a single rolling buffer alive
         // while the physical capture source changes underneath it.
@@ -110,20 +160,30 @@ class RecordingService : Service() {
                 val status = RecorderState.state.value
                 val lastAudioMs = pipeline.lastAudioMs
                 val ageMs = if (lastAudioMs > 0L) System.currentTimeMillis() - lastAudioMs else Long.MAX_VALUE
-                if (running && status.captureReady && ageMs > RecorderState.CAPTURE_STALE_MS) {
-                    RecorderState.markMicDisconnected()
-                    AmplitudeTracker.track("mic_disconnected", mapOf("reason" to "capture_stale", "ageMs" to ageMs))
-                    val now = SystemClock.elapsedRealtime()
-                    if (now - lastStaleReportMs >= CAPTURE_STALE_LOG_INTERVAL_MS) {
-                        lastStaleReportMs = now
-                        DiagnosticsLogger.warn("capture_stale", mapOf("ageMs" to ageMs))
+                if (
+                    running &&
+                    captureSessions.isActive(captureSessionId) &&
+                    status.captureReady &&
+                    ageMs > RecorderState.CAPTURE_STALE_MS
+                ) {
+                    captureSessions.runIfActive(captureSessionId) {
+                        RecorderState.markMicDisconnected()
+                        AmplitudeTracker.track(
+                            "mic_disconnected",
+                            mapOf("reason" to "capture_stale", "ageMs" to ageMs),
+                        )
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastStaleReportMs >= CAPTURE_STALE_LOG_INTERVAL_MS) {
+                            lastStaleReportMs = now
+                            DiagnosticsLogger.warn("capture_stale", mapOf("ageMs" to ageMs))
+                        }
                     }
                 }
             }
         }
 
         try {
-            while (running) {
+            while (running && captureSessions.isActive(captureSessionId)) {
                 val umaProfile = if (SystemClock.elapsedRealtime() >= nextUmaAttemptMs) {
                     readyUmaProfile(capture)
                 } else {
@@ -140,37 +200,55 @@ class RecordingService : Service() {
                         ))
                         capture.streamPcm(
                             onPcm = { buffer, length ->
-                                pipeline.process(buffer, length)
-                                publishCaptureReadyIfNeeded("uma", pipeline.lastAudioMs)
-                                lastPublish = publishStateIfDue(pipeline, lastPublish)
+                                if (captureSessions.isActive(captureSessionId)) {
+                                    pipeline.process(buffer, length)
+                                    publishCaptureReadyIfNeeded(
+                                        captureSessionId,
+                                        "uma",
+                                        pipeline.lastAudioMs,
+                                    )
+                                    lastPublish = publishStateIfDue(
+                                        captureSessionId,
+                                        pipeline,
+                                        lastPublish,
+                                    )
+                                }
                             },
-                            shouldContinue = { running },
+                            shouldContinue = {
+                                running && captureSessions.isActive(captureSessionId)
+                            },
                         )
                         nextUmaAttemptMs = 0L
                     } catch (error: Throwable) {
-                        if (!running) throw error
+                        if (!running || !captureSessions.isActive(captureSessionId)) throw error
                         if (!allowBuiltInMicFallback) {
-                            handleUmaUnavailableWithoutFallback(pipeline, error)
-                            shouldStopSelf = true
-                            running = false
+                            handleUmaUnavailableWithoutFallback(captureSessionId, pipeline, error)
+                            captureSessions.runIfActive(captureSessionId) {
+                                shouldStopSelf = true
+                                running = false
+                            }
                             break
                         }
                         Log.w(TAG, "UMA capture ended; falling back to Android mic: ${error.message}", error)
                         DiagnosticsLogger.warn("uma_capture_fallback", mapOf("message" to (error.message ?: "")), error)
-                        RecorderState.update {
-                            it.copy(
-                                captureReady = false,
-                                error = "UMA unavailable; using Android mic",
-                            )
+                        captureSessions.runIfActive(captureSessionId) {
+                            RecorderState.update {
+                                it.copy(
+                                    captureReady = false,
+                                    error = "UMA unavailable; using Android mic",
+                                )
+                            }
                         }
                         nextUmaAttemptMs = SystemClock.elapsedRealtime() + UMA_RETRY_AFTER_FAILURE_MS
                     }
                 } else {
                     requestUmaPermissionIfNeeded(capture)
                     if (!allowBuiltInMicFallback) {
-                        handleUmaUnavailableWithoutFallback(pipeline, null)
-                        shouldStopSelf = true
-                        running = false
+                        handleUmaUnavailableWithoutFallback(captureSessionId, pipeline, null)
+                        captureSessions.runIfActive(captureSessionId) {
+                            shouldStopSelf = true
+                            running = false
+                        }
                         break
                     }
                     Log.i(TAG, "capture profile=Android mic sampleRate=${AndroidMicCapture.SAMPLE_RATE_HZ}")
@@ -178,28 +256,41 @@ class RecordingService : Service() {
                         "profile" to "android_mic",
                         "sampleRate" to AndroidMicCapture.SAMPLE_RATE_HZ,
                     ))
-                    RecorderState.update { it.copy(captureReady = false, micDisconnected = false) }
+                    captureSessions.runIfActive(captureSessionId) {
+                        RecorderState.update {
+                            it.copy(captureReady = false, micDisconnected = false)
+                        }
+                    }
                     lastPublish = streamAndroidMic(
+                        captureSessionId = captureSessionId,
                         pipeline = pipeline,
                         initialLastPublish = lastPublish,
                         onReady = {
-                            publishCaptureReadyIfNeeded("android_mic", pipeline.lastAudioMs)
+                            publishCaptureReadyIfNeeded(
+                                captureSessionId,
+                                "android_mic",
+                                pipeline.lastAudioMs,
+                            )
                         },
                         shouldContinue = {
                             requestUmaPermissionIfNeeded(capture)
-                            running && !shouldAttemptUmaCapture(capture, nextUmaAttemptMs)
+                            running &&
+                                captureSessions.isActive(captureSessionId) &&
+                                !shouldAttemptUmaCapture(capture, nextUmaAttemptMs)
                         },
                     )
                 }
             }
         } catch (error: Throwable) {
-            Log.e(TAG, "Capture loop ended: ${error.message}", error)
-            DiagnosticsLogger.error("capture_loop_failed", throwable = error)
-            RecorderState.update {
-                it.copy(
-                    captureReady = false,
-                    error = error.message ?: error.javaClass.simpleName,
-                )
+            captureSessions.runIfActive(captureSessionId) {
+                Log.e(TAG, "Capture loop ended: ${error.message}", error)
+                DiagnosticsLogger.error("capture_loop_failed", throwable = error)
+                RecorderState.update {
+                    it.copy(
+                        captureReady = false,
+                        error = error.message ?: error.javaClass.simpleName,
+                    )
+                }
             }
         } finally {
             ambientJob?.cancel()
@@ -207,18 +298,22 @@ class RecordingService : Service() {
             AmbientFlusher.detach()
             MeetingController.detach()
             pipeline.close()
-            RecorderState.update {
-                it.copy(
-                    running = false,
-                    captureReady = false,
-                    lastSegment = pipeline.lastSegmentPath,
-                    lastAudioMs = pipeline.lastAudioMs,
-                    segmentCount = pipeline.segmentCount,
-                )
-            }
-            if (running || shouldStopSelf) {
-                // Stream died on its own (e.g. UMA-8 unplugged); tear the service down.
+            var stopServiceForEndedStream = false
+            captureSessions.finishIfActive(captureSessionId) {
+                stopServiceForEndedStream = running || shouldStopSelf
                 running = false
+                RecorderState.update {
+                    it.copy(
+                        running = false,
+                        captureReady = false,
+                        lastSegment = pipeline.lastSegmentPath,
+                        lastAudioMs = pipeline.lastAudioMs,
+                        segmentCount = pipeline.segmentCount,
+                    )
+                }
+            }
+            if (stopServiceForEndedStream) {
+                // Stream died on its own (e.g. UMA-8 unplugged); tear the service down.
                 stopSelf()
             }
         }
@@ -230,7 +325,11 @@ class RecordingService : Service() {
         return capture.resolveProfile()
     }
 
-    private fun handleUmaUnavailableWithoutFallback(pipeline: CapturePipeline, error: Throwable?) {
+    private fun handleUmaUnavailableWithoutFallback(
+        captureSessionId: Long,
+        pipeline: CapturePipeline,
+        error: Throwable?,
+    ) {
         val message = "Mic disconnected"
         Log.w(TAG, if (error == null) message else "$message: ${error.message}", error)
         DiagnosticsLogger.warn(
@@ -242,7 +341,9 @@ class RecordingService : Service() {
             "mic_disconnected",
             mapOf("reason" to "uma_unavailable", "message" to (error?.message ?: "UMA mic unavailable")),
         )
-        RecorderState.markMicDisconnected()
+        captureSessions.runIfActive(captureSessionId) {
+            RecorderState.markMicDisconnected()
+        }
         runCatching {
             runBlocking {
                 if (MeetingController.active == null) {
@@ -292,6 +393,7 @@ class RecordingService : Service() {
     }
 
     private fun streamAndroidMic(
+        captureSessionId: Long,
         pipeline: CapturePipeline,
         initialLastPublish: Long,
         onReady: () -> Unit,
@@ -300,54 +402,80 @@ class RecordingService : Service() {
         var lastPublish = initialLastPublish
         AndroidMicCapture().streamPcm(
             onPcm = { samples, length ->
-                pipeline.process16kMono(samples, length)
-                onReady()
-                lastPublish = publishStateIfDue(pipeline, lastPublish)
+                if (captureSessions.isActive(captureSessionId)) {
+                    pipeline.process16kMono(samples, length)
+                    onReady()
+                    lastPublish = publishStateIfDue(
+                        captureSessionId,
+                        pipeline,
+                        lastPublish,
+                    )
+                }
             },
             shouldContinue = shouldContinue,
         )
         return lastPublish
     }
 
-    private fun publishCaptureReadyIfNeeded(source: String, lastAudioMs: Long) {
+    private fun publishCaptureReadyIfNeeded(
+        captureSessionId: Long,
+        source: String,
+        lastAudioMs: Long,
+    ) {
         if (RecorderState.state.value.hasFreshAudio()) return
-        DiagnosticsLogger.info("capture_ready", mapOf("source" to source))
-        AmplitudeTracker.track("mic_connected", mapOf("source" to source))
-        RecorderState.update {
-            it.copy(
-                running = true,
-                captureReady = true,
-                micDisconnected = false,
-                disconnectedAtMs = 0L,
-                resumeOnReconnect = false,
-                lastAudioMs = lastAudioMs,
-                error = null,
-            )
+        captureSessions.runIfActive(captureSessionId) {
+            if (RecorderState.state.value.hasFreshAudio()) return@runIfActive
+            DiagnosticsLogger.info("capture_ready", mapOf("source" to source))
+            AmplitudeTracker.track("mic_connected", mapOf("source" to source))
+            RecorderState.update {
+                it.copy(
+                    running = true,
+                    captureReady = true,
+                    micDisconnected = false,
+                    disconnectedAtMs = 0L,
+                    resumeOnReconnect = false,
+                    lastAudioMs = lastAudioMs,
+                    error = null,
+                )
+            }
         }
     }
 
-    private fun publishStateIfDue(pipeline: CapturePipeline, lastPublish: Long): Long {
+    private fun publishStateIfDue(
+        captureSessionId: Long,
+        pipeline: CapturePipeline,
+        lastPublish: Long,
+    ): Long {
         val now = System.currentTimeMillis()
         if (now - lastPublish < PUBLISH_INTERVAL_MS) return lastPublish
-        val peak = pipeline.peak
-        val db = if (peak > 0f) 20f * log10(peak) else Float.NEGATIVE_INFINITY
-        RecorderState.update {
-            it.copy(
-                segmentCount = pipeline.segmentCount,
-                lastSegment = pipeline.lastSegmentPath,
-                lastAudioMs = pipeline.lastAudioMs,
-                peakDb = db,
-            )
+        var nextPublish = lastPublish
+        captureSessions.runIfActive(captureSessionId) {
+            val peak = pipeline.peak
+            val db = if (peak > 0f) 20f * log10(peak) else Float.NEGATIVE_INFINITY
+            RecorderState.update {
+                it.copy(
+                    segmentCount = pipeline.segmentCount,
+                    lastSegment = pipeline.lastSegmentPath,
+                    lastAudioMs = pipeline.lastAudioMs,
+                    peakDb = db,
+                )
+            }
+            nextPublish = now
         }
-        return now
+        return nextPublish
     }
 
     override fun onDestroy() {
         running = false
+        val invalidatedActiveSession = activeCaptureSessionId
+            ?.let(captureSessions::invalidateIfActive)
+            ?: false
         captureThread?.join(2_000)
         captureThread = null
         releaseWakeLock()
-        RecorderState.update { it.copy(running = false, captureReady = false) }
+        if (invalidatedActiveSession) {
+            RecorderState.update { it.copy(running = false, captureReady = false) }
+        }
         super.onDestroy()
     }
 
@@ -411,19 +539,50 @@ class RecordingService : Service() {
         private const val UMA_RETRY_AFTER_FAILURE_MS = 5_000L
         private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
         private const val TAG = "VuedRecordingService"
+        private val captureSessions = CaptureSessionGate()
 
-        fun start(context: Context) {
+        fun start(context: Context): Boolean {
+            if (!isCaptureStartEligible(context)) {
+                RecorderState.markMicDisconnected(captureWasRunning = false)
+                return false
+            }
             val intent = Intent(context, RecordingService::class.java)
             context.startForegroundService(intent)
+            return true
         }
 
         fun stop(context: Context) {
             // Publish mute intent before the service command is delivered so a USB
             // detach immediately after a tap cannot be mistaken for active capture.
+            captureSessions.invalidateCurrent()
             RecorderState.markCaptureStoppedByUser()
             context.startService(
                 Intent(context, RecordingService::class.java).setAction(ACTION_STOP)
             )
+        }
+
+        internal fun isCaptureStartEligible(context: Context): Boolean {
+            val allowFallback = VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK
+            if (allowFallback) {
+                return canStartRecordingCapture(
+                    allowBuiltInMicFallback = true,
+                    umaConnected = false,
+                    usbPermissionGranted = false,
+                )
+            }
+            val capture = Uma8Capture(context.applicationContext)
+            val device = capture.findDevice()
+            return canStartRecordingCapture(
+                allowBuiltInMicFallback = false,
+                umaConnected = device != null,
+                usbPermissionGranted = device?.let(capture::hasPermission) == true,
+            )
+        }
+
+        private fun hasAuthorizedUma(context: Context): Boolean {
+            val capture = Uma8Capture(context.applicationContext)
+            val device = capture.findDevice() ?: return false
+            return capture.hasPermission(device)
         }
     }
 }

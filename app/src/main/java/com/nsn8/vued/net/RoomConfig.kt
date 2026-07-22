@@ -1,6 +1,8 @@
 package com.nsn8.vued.net
 
 import android.content.Context
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 
 /**
  * The room this tablet is assigned to. Tagged onto every uploaded slice so the
@@ -10,6 +12,9 @@ import android.content.Context
  */
 object RoomConfig {
     private const val PREFS = "vued_room"
+    private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    val changes: SharedFlow<Unit> = _changes
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -28,9 +33,11 @@ object RoomConfig {
             .putString("orgId", orgId)
             .putString("microphoneId", microphoneId)
             .apply()
+        _changes.tryEmit(Unit)
     }
 
     fun clear(context: Context) {
         prefs(context).edit().clear().apply()
+        _changes.tryEmit(Unit)
     }
 }

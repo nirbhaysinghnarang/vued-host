@@ -21,7 +21,13 @@ object OrgApi {
     private val client = OkHttpClient()
 
     data class Org(val id: String, val name: String, val role: String)
-    data class Room(val id: String, val microphoneId: String, val displayName: String)
+    data class Room(
+        val id: String,
+        val microphoneId: String,
+        val displayName: String,
+        val status: String? = null,
+        val statusUpdatedAt: Double? = null,
+    )
     data class Member(val userId: String, val email: String, val displayName: String, val role: String)
 
     /** Orgs this account belongs to (a tablet account typically has one). */
@@ -43,6 +49,8 @@ object OrgApi {
                 id = r.optString("id"),
                 microphoneId = microphoneId,
                 displayName = r.optRoomName(microphoneId),
+                status = r.optNullableString("status"),
+                statusUpdatedAt = r.optFiniteDouble("status_updated_at"),
             )
         }
     }
@@ -85,6 +93,23 @@ object OrgApi {
         putJson(
             "/api/v1/orgs/$orgId/speaker-profile-links/$speakerProfileId",
             JSONObject().put("userId", userId),
+        )
+    }
+
+    /** Updates the assigned room's current microphone state. The backend stamps
+     *  `status_updated_at` using server time, so the tablet sends only the state. */
+    suspend fun updateRoomMicStatus(orgId: String, roomId: String, status: String) {
+        putJson(
+            "/api/v1/orgs/$orgId/rooms/$roomId/mic-status",
+            JSONObject().put("status", status),
+        )
+    }
+
+    /** Ask the API to transiently broadcast a command to the assigned tablet. */
+    suspend fun sendRoomMicCommand(orgId: String, roomId: String, command: String) {
+        postJson(
+            "/api/v1/orgs/$orgId/rooms/$roomId/mic-command",
+            JSONObject().put("command", command),
         )
     }
 
@@ -147,5 +172,17 @@ object OrgApi {
             if (value.isNotEmpty() && value != microphoneId) return value
         }
         return optString("display_name").trim().ifEmpty { microphoneId }
+    }
+
+    private fun JSONObject.optFiniteDouble(key: String): Double? {
+        if (!has(key) || isNull(key)) return null
+        return optDouble(key).takeIf { it.isFinite() }
+    }
+
+    private fun JSONObject.optNullableString(key: String): String? {
+        if (!has(key) || isNull(key)) return null
+        return optString(key)
+            .trim()
+            .takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
     }
 }

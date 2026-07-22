@@ -9,6 +9,7 @@ import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.realtime.Realtime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -51,6 +52,7 @@ object VuedAuth {
                     autoSaveToStorage = true
                     enableLifecycleCallbacks = false
                 }
+                install(Realtime)
             }.also { client ->
                 scope.launch {
                     runCatching {
@@ -89,6 +91,8 @@ object VuedAuth {
 
     /** Current (auto-refreshed) access token, or null if not signed in. */
     fun currentAccessToken(): String? = client.auth.currentSessionOrNull()?.accessToken
+
+    internal fun supabaseClient(): SupabaseClient = client
 
     suspend fun currentAccessTokenReady(): String? {
         awaitReady()
