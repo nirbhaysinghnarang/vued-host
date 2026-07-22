@@ -127,8 +127,16 @@ object MeetingController {
             roomId = RoomConfig.roomId(appContext),
             microphoneId = RoomConfig.microphoneId(appContext),
         )
-        persistActive(appContext, persisted)
-        _activeState.value = ActiveMeeting(meetingId, startMs)
+        synchronized(lock) {
+            check(active == null) { "A meeting is already in progress." }
+            val lockedNowMs = System.currentTimeMillis()
+            check(
+                RecorderState.state.value.hasFreshAudio(lockedNowMs) &&
+                    buffer.hasRecentAudio(RecorderState.CAPTURE_STALE_MS, lockedNowMs)
+            ) { "Start recording first — the microphone is not ready." }
+            persistActive(appContext, persisted)
+            _activeState.value = ActiveMeeting(meetingId, startMs)
+        }
         Log.i(TAG, "start meeting=$meetingId title=$title startMs=$startMs")
         DiagnosticsLogger.info("meeting_started", mapOf("meetingId" to meetingId, "startMs" to startMs))
         runCatching {
@@ -208,6 +216,16 @@ object MeetingController {
 
     fun retryPendingExports(context: Context) {
         exportSignals.trySend(context.applicationContext)
+    }
+
+    /**
+     * Runs [action] only while no manual meeting is active. Meeting start uses
+     * the same lock and rechecks capture state, closing the remote-mute race.
+     */
+    internal fun runIfNoActiveMeeting(action: () -> Unit): Boolean = synchronized(lock) {
+        if (active != null) return@synchronized false
+        action()
+        true
     }
 
     /**

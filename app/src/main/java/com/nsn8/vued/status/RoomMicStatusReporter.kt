@@ -45,10 +45,14 @@ internal fun deriveRoomMicStatus(
  */
 object RoomMicStatusReporter {
     const val HEARTBEAT_INTERVAL_MS = 30_000L
+    private val signals = Channel<Unit>(Channel.CONFLATED)
+
+    fun requestImmediateUpdate() {
+        signals.trySend(Unit)
+    }
 
     suspend fun run(context: Context) = coroutineScope {
         val appContext = context.applicationContext
-        val signals = Channel<Unit>(Channel.CONFLATED)
 
         launch {
             combine(RecorderState.state, MeetingController.activeState) { recorder, meeting ->

@@ -5,6 +5,7 @@ import android.content.Context
 import com.nsn8.vued.auth.VuedAuth
 import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.OutboundQueue
+import com.nsn8.vued.status.RoomMicCommandBroadcasts
 import com.nsn8.vued.status.RoomMicStatusReporter
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.sentry.IScope
@@ -24,6 +25,7 @@ import kotlinx.coroutines.launch
 class App : Application() {
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var roomMicStatusReporterJob: Job? = null
+    private var roomMicCommandJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -78,6 +80,11 @@ class App : Application() {
                             RoomMicStatusReporter.run(this@App)
                         }
                     }
+                    if (roomMicCommandJob?.isActive != true) {
+                        roomMicCommandJob = appScope.launch {
+                            RoomMicCommandBroadcasts.run(this@App)
+                        }
+                    }
                     MeetingController.retryPendingExports(this@App)
                     runCatching { OutboundQueue.drain(this@App) }
                         .onFailure { error ->
@@ -86,6 +93,8 @@ class App : Application() {
                 } else {
                     roomMicStatusReporterJob?.cancel()
                     roomMicStatusReporterJob = null
+                    roomMicCommandJob?.cancel()
+                    roomMicCommandJob = null
                 }
             }
         }

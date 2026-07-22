@@ -27,18 +27,29 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -48,6 +59,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -76,6 +88,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusEvent
 import androidx.compose.ui.geometry.Offset
@@ -84,7 +97,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -93,9 +108,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -115,8 +132,10 @@ import com.nsn8.vued.ui.RoomPickerDialog
 import com.nsn8.vued.ui.SpeakerEnrollmentDialog
 import com.nsn8.vued.service.RecorderState
 import com.nsn8.vued.service.RecordingService
+import com.nsn8.vued.status.RoomMicCommand
 import com.nsn8.vued.status.RoomMicStatusBroadcast
 import com.nsn8.vued.status.RoomMicStatusBroadcasts
+import com.nsn8.vued.status.isMicCommandConfirmed
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
 import com.nsn8.vued.update.SelfUpdateManager
@@ -137,6 +156,8 @@ private const val RECORDER_RECONNECT_RETRY_MS = 250L
 private const val RECORDER_RECONNECT_TIMEOUT_MS = 60_000L
 private const val LOW_BATTERY_THRESHOLD_PERCENT = 20
 private const val MIC_STATUS_OFFLINE_AFTER_MS = 60_000L
+private const val MIC_COMMAND_CONFIRM_TIMEOUT_MS = 15_000L
+private const val MIC_DRAWER_ANIMATION_MS = 220
 private const val TAG = "VuedMainActivity"
 private val HOST_UI_MODE = HostUiMode.PROD
 
@@ -1384,7 +1405,6 @@ private fun ProdRecorderMainScreen() {
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            MicStatusesButton(onClick = { showMicStatuses = true })
             WifiSettingsButton(
                 status = wifiStatus,
                 onClick = {
@@ -1533,13 +1553,22 @@ private fun ProdRecorderMainScreen() {
                 }
             },
         )
+
+        if (!showMicStatuses) {
+            MicStatusEdgeSwipeDetector(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .offset(x = 36.dp),
+                onOpen = { showMicStatuses = true },
+            )
+        }
     }
 
     if (showEnroll) {
         ProdSpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
     }
     if (showMicStatuses) {
-        MicStatusesDialog(
+        MicStatusesDrawer(
             initialOrgId = assignedOrgId,
             currentRoomId = assignedRoomId,
             onDismiss = { showMicStatuses = false },
@@ -1559,50 +1588,61 @@ private fun ProdRecorderMainScreen() {
 }
 
 @Composable
-private fun MicStatusesButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
-    OutlinedButton(
-        onClick = onClick,
-        shape = CircleShape,
-        border = BorderStroke(1.dp, VuedHairline),
+private fun MicStatusEdgeSwipeDetector(
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit,
+) {
+    val thresholdPx = with(LocalDensity.current) { 36.dp.toPx() }
+    Box(
         modifier = modifier
-            .size(46.dp)
-            .semantics { contentDescription = "Microphone statuses" },
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = VuedSurfaceRaised.copy(alpha = 0.92f),
-            contentColor = VuedTextTertiary,
-        ),
-        contentPadding = PaddingValues(0.dp),
-    ) {
-        Text(
-            text = "i",
-            color = VuedTextTertiary,
-            fontSize = 20.sp,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 0.sp,
-        )
-    }
+            .fillMaxHeight()
+            .width(28.dp)
+            .semantics { contentDescription = "Swipe left to open microphone statuses" }
+            .pointerInput(onOpen, thresholdPx) {
+                var dragDistance = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { dragDistance = 0f },
+                    onHorizontalDrag = { _, dragAmount -> dragDistance += dragAmount },
+                    onDragEnd = {
+                        if (dragDistance <= -thresholdPx) onOpen()
+                        dragDistance = 0f
+                    },
+                    onDragCancel = { dragDistance = 0f },
+                )
+            },
+    )
 }
 
-private data class MicStatusPresentation(
-    val label: String,
-    val color: Color,
-    val online: Boolean,
+private data class PendingMicCommand(
+    val command: RoomMicCommand,
+    val token: Long,
 )
 
-private fun micStatusPresentation(room: OrgApi.Room, nowMs: Long): MicStatusPresentation {
+private fun isMicOnline(room: OrgApi.Room, nowMs: Long): Boolean {
     val updatedAtMs = room.statusUpdatedAt?.times(1_000.0)?.toLong()
-    val online = updatedAtMs != null &&
+    return updatedAtMs != null &&
         nowMs - updatedAtMs <= MIC_STATUS_OFFLINE_AFTER_MS
-    if (!online) {
-        return MicStatusPresentation("Offline", VuedTextTertiary, online = false)
-    }
-    return when (room.status) {
-        "ambient_recording" -> MicStatusPresentation("Ambient recording", VuedSuccess, online = true)
-        "ambient_muted" -> MicStatusPresentation("Ambient muted", Color(0xFF9A6700), online = true)
-        "meeting_recording" -> MicStatusPresentation("Meeting recording", VuedDanger, online = true)
-        "meeting_muted" -> MicStatusPresentation("Meeting muted", Color(0xFF9A6700), online = true)
-        else -> MicStatusPresentation("Offline", VuedTextTertiary, online = false)
-    }
+}
+
+@Composable
+private fun MeetingRecordingDot() {
+    val transition = rememberInfiniteTransition(label = "meeting-recording-dot")
+    val dotAlpha by transition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 650),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "meeting-recording-dot-alpha",
+    )
+    Box(
+        modifier = Modifier
+            .size(10.dp)
+            .alpha(dotAlpha)
+            .background(VuedDanger, CircleShape)
+            .semantics { contentDescription = "Meeting recording" },
+    )
 }
 
 internal fun visibleMicRooms(
@@ -1634,7 +1674,7 @@ internal fun mergeMicStatusBroadcast(
 }
 
 @Composable
-private fun MicStatusesDialog(
+private fun MicStatusesDrawer(
     initialOrgId: String?,
     currentRoomId: String?,
     onDismiss: () -> Unit,
@@ -1642,7 +1682,51 @@ private fun MicStatusesDialog(
     var rooms by remember { mutableStateOf<List<OrgApi.Room>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+    var commandError by remember { mutableStateOf<String?>(null) }
+    var resolvedOrgId by remember(initialOrgId) {
+        mutableStateOf(initialOrgId?.takeIf { it.isNotBlank() })
+    }
+    var pendingCommands by remember {
+        mutableStateOf<Map<String, PendingMicCommand>>(emptyMap())
+    }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    var panelVisible by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val closeThresholdPx = with(LocalDensity.current) { 56.dp.toPx() }
+
+    fun closeDrawer() {
+        if (!panelVisible) return
+        panelVisible = false
+        scope.launch {
+            delay(MIC_DRAWER_ANIMATION_MS.toLong())
+            onDismiss()
+        }
+    }
+
+    fun dispatchCommand(room: OrgApi.Room, command: RoomMicCommand) {
+        val orgId = resolvedOrgId
+        if (orgId.isNullOrBlank() || pendingCommands.containsKey(room.id)) return
+        val pending = PendingMicCommand(command, System.nanoTime())
+        pendingCommands = pendingCommands + (room.id to pending)
+        commandError = null
+        scope.launch {
+            try {
+                OrgApi.sendRoomMicCommand(orgId, room.id, command.apiValue)
+            } catch (failure: Throwable) {
+                if (pendingCommands[room.id]?.token == pending.token) {
+                    pendingCommands = pendingCommands - room.id
+                    commandError = failure.message ?: "Could not send microphone command."
+                }
+                return@launch
+            }
+
+            delay(MIC_COMMAND_CONFIRM_TIMEOUT_MS)
+            if (pendingCommands[room.id]?.token == pending.token) {
+                pendingCommands = pendingCommands - room.id
+                commandError = "${room.displayName} did not confirm the command."
+            }
+        }
+    }
 
     LaunchedEffect(initialOrgId, currentRoomId) {
         val orgId = initialOrgId?.takeIf { it.isNotBlank() }
@@ -1652,11 +1736,17 @@ private fun MicStatusesDialog(
             loading = false
             return@LaunchedEffect
         }
+        resolvedOrgId = orgId
 
         suspend fun refreshSnapshot() {
             runCatching { OrgApi.getRooms(orgId) }
                 .onSuccess { fetched ->
-                    rooms = visibleMicRooms(fetched, currentRoomId)
+                    val visible = visibleMicRooms(fetched, currentRoomId)
+                    rooms = visible
+                    pendingCommands = pendingCommands.filter { (roomId, pending) ->
+                        val status = visible.firstOrNull { it.id == roomId }?.status
+                        !isMicCommandConfirmed(pending.command, status)
+                    }
                     error = null
                 }
                 .onFailure { failure ->
@@ -1674,6 +1764,11 @@ private fun MicStatusesDialog(
                 onConnected = { refreshSnapshot() },
                 onStatus = { update ->
                     rooms = mergeMicStatusBroadcast(rooms, update, currentRoomId)
+                    pendingCommands[update.roomId]?.let { pending ->
+                        if (isMicCommandConfirmed(pending.command, update.status)) {
+                            pendingCommands = pendingCommands - update.roomId
+                        }
+                    }
                     error = null
                 },
             )
@@ -1690,184 +1785,198 @@ private fun MicStatusesDialog(
     }
 
     LaunchedEffect(Unit) {
+        panelVisible = true
         while (true) {
             nowMs = System.currentTimeMillis()
             delay(1_000L)
         }
     }
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
+    Dialog(
+        onDismissRequest = { closeDrawer() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Row(
             modifier = Modifier
-                .fillMaxWidth()
-                .widthIn(max = 760.dp),
-            shape = RoundedCornerShape(18.dp),
-            color = VuedSurfaceRaised,
-            shadowElevation = 20.dp,
-            tonalElevation = 0.dp,
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.18f)),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(
-                modifier = Modifier.padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+            Spacer(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clickable(onClick = { closeDrawer() }),
+            )
+            AnimatedVisibility(
+                visible = panelVisible,
+                enter = slideInHorizontally(
+                    initialOffsetX = { it },
+                    animationSpec = tween(MIC_DRAWER_ANIMATION_MS),
+                ),
+                exit = slideOutHorizontally(
+                    targetOffsetX = { it },
+                    animationSpec = tween(MIC_DRAWER_ANIMATION_MS),
+                ),
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text(
-                        text = "Microphones",
-                        color = VuedTextPrimary,
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        letterSpacing = 0.sp,
-                    )
-                    Text(
-                        text = "Live status by room",
-                        color = VuedTextTertiary,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium,
-                        letterSpacing = 0.sp,
-                    )
-                }
-
-                Column(
+                Surface(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 460.dp)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                        .fillMaxHeight()
+                        .width(480.dp)
+                        .pointerInput(onDismiss, closeThresholdPx) {
+                            var dragDistance = 0f
+                            detectHorizontalDragGestures(
+                                onDragStart = { dragDistance = 0f },
+                                onHorizontalDrag = { _, dragAmount -> dragDistance += dragAmount },
+                                onDragEnd = {
+                                    if (dragDistance >= closeThresholdPx) closeDrawer()
+                                    dragDistance = 0f
+                                },
+                                onDragCancel = { dragDistance = 0f },
+                            )
+                        },
+                    shape = RoundedCornerShape(topStart = 18.dp, bottomStart = 18.dp),
+                    color = VuedSurfaceRaised,
+                    shadowElevation = 20.dp,
+                    tonalElevation = 0.dp,
                 ) {
-                    when {
-                        loading -> {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 28.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(28.dp),
-                                    strokeWidth = 2.5.dp,
-                                    color = VuedTextTertiary,
-                                )
-                            }
-                        }
-                        rooms.isEmpty() -> {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(22.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             Text(
-                                text = error ?: "No other microphones have reported a status yet.",
-                                color = if (error == null) VuedTextTertiary else VuedDanger,
-                                fontSize = 14.sp,
+                                text = "Microphones",
+                                color = VuedTextPrimary,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                letterSpacing = 0.sp,
+                            )
+                            Text(
+                                text = "Live status by room",
+                                color = VuedTextTertiary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                letterSpacing = 0.sp,
                             )
                         }
-                        else -> {
-                            rooms.forEach { room ->
-                                val presentation = micStatusPresentation(room, nowMs)
-                                val meetingRunning = presentation.online &&
-                                    room.status in setOf("meeting_recording", "meeting_muted")
-                                val muted = room.status in setOf("ambient_muted", "meeting_muted")
-                                val muteEnabled = presentation.online &&
-                                    (muted || room.status == "ambient_recording")
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(VuedSurface)
-                                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Column(
-                                        modifier = Modifier.weight(1f),
-                                        verticalArrangement = Arrangement.spacedBy(2.dp),
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            when {
+                                loading -> {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 28.dp),
+                                        contentAlignment = Alignment.Center,
                                     ) {
-                                        Text(
-                                            text = room.displayName,
-                                            color = VuedTextPrimary,
-                                            fontSize = 14.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                        )
-                                        Text(
-                                            text = room.microphoneId,
-                                            color = VuedTextTertiary.copy(alpha = 0.76f),
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Normal,
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(28.dp),
+                                            strokeWidth = 2.5.dp,
+                                            color = VuedTextTertiary,
                                         )
                                     }
-                                    Row(
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
+                                }
+                                rooms.isEmpty() -> {
+                                    Text(
+                                        text = error ?: "No other microphones have reported a status yet.",
+                                        color = if (error == null) VuedTextTertiary else VuedDanger,
+                                        fontSize = 14.sp,
+                                    )
+                                }
+                                else -> {
+                                    rooms.forEach { room ->
+                                        val online = isMicOnline(room, nowMs)
+                                        val recording = room.status in
+                                            setOf("ambient_recording", "meeting_recording")
+                                        val muted = room.status in setOf("ambient_muted", "meeting_muted")
+                                        val muteEnabled = online &&
+                                            (muted || room.status == "ambient_recording")
+                                        val pending = pendingCommands[room.id]
+                                        val muteCommand = if (muted) {
+                                            RoomMicCommand.UNMUTE
+                                        } else {
+                                            RoomMicCommand.MUTE
+                                        }
                                         Row(
-                                            horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(VuedSurface)
+                                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
                                             verticalAlignment = Alignment.CenterVertically,
                                         ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(9.dp)
-                                                    .background(presentation.color, CircleShape),
-                                            )
                                             Text(
-                                                text = presentation.label,
-                                                color = presentation.color,
-                                                fontSize = 13.sp,
+                                                text = room.displayName,
+                                                color = VuedTextPrimary,
+                                                fontSize = 14.sp,
                                                 fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.weight(1f),
                                             )
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                if (room.status == "meeting_recording") {
+                                                    MeetingRecordingDot()
+                                                }
+                                                AudioMuteButton(
+                                                    unmuted = recording,
+                                                    enabled = muteEnabled && pending == null,
+                                                    buttonSize = 46.dp,
+                                                    iconSize = 25.dp,
+                                                    onClick = { dispatchCommand(room, muteCommand) },
+                                                )
+                                            }
                                         }
-                                        OutlinedButton(
-                                            onClick = { /* Command wiring comes next. */ },
-                                            enabled = meetingRunning,
-                                            shape = RoundedCornerShape(8.dp),
-                                            border = BorderStroke(1.dp, VuedHairline),
-                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
-                                        ) {
-                                            Text(
-                                                text = "End meeting",
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                            )
-                                        }
-                                        OutlinedButton(
-                                            onClick = { /* Command wiring comes next. */ },
-                                            enabled = muteEnabled,
-                                            shape = RoundedCornerShape(8.dp),
-                                            border = BorderStroke(1.dp, VuedHairline),
-                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
-                                        ) {
-                                            Text(
-                                                text = if (muted) "Unmute" else "Mute",
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.SemiBold,
-                                            )
-                                        }
+                                    }
+                                    if (error != null) {
+                                        Text(
+                                            text = "Live updates: $error",
+                                            color = VuedDanger,
+                                            fontSize = 12.sp,
+                                        )
+                                    }
+                                    if (commandError != null) {
+                                        Text(
+                                            text = commandError.orEmpty(),
+                                            color = VuedDanger,
+                                            fontSize = 12.sp,
+                                        )
                                     }
                                 }
                             }
-                            if (error != null) {
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            Button(
+                                onClick = { closeDrawer() },
+                                shape = RoundedCornerShape(8.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = VuedTextPrimary,
+                                    contentColor = Color.White,
+                                ),
+                                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 9.dp),
+                            ) {
                                 Text(
-                                    text = "Refresh failed: $error",
-                                    color = VuedDanger,
-                                    fontSize = 12.sp,
+                                    text = "Done",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
                                 )
                             }
                         }
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    Button(
-                        onClick = onDismiss,
-                        shape = RoundedCornerShape(8.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = VuedTextPrimary,
-                            contentColor = Color.White,
-                        ),
-                        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 9.dp),
-                    ) {
-                        Text(
-                            text = "Done",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
                     }
                 }
             }
@@ -1948,6 +2057,8 @@ private fun AudioMuteButton(
     unmuted: Boolean,
     enabled: Boolean,
     modifier: Modifier = Modifier,
+    buttonSize: Dp = 112.dp,
+    iconSize: Dp = 60.dp,
     onClick: () -> Unit,
 ) {
     val iconColor = Color.White
@@ -1957,7 +2068,7 @@ private fun AudioMuteButton(
         enabled = enabled,
         shape = CircleShape,
         modifier = modifier
-            .size(112.dp)
+            .size(buttonSize)
             .semantics { contentDescription = if (unmuted) "Mute" else "Unmute" },
         colors = ButtonDefaults.buttonColors(
             containerColor = containerColor,
@@ -1969,11 +2080,11 @@ private fun AudioMuteButton(
         elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp),
     ) {
         Box(
-            modifier = Modifier.size(60.dp),
+            modifier = Modifier.size(iconSize),
             contentAlignment = Alignment.Center,
         ) {
             Canvas(Modifier.fillMaxSize()) {
-                val stroke = 4.dp.toPx()
+                val stroke = size.minDimension * (4f / 60f)
                 val micCenterX = size.width * 0.5f
                 val micTop = size.height * 0.13f
                 val micSize = Size(size.width * 0.34f, size.height * 0.48f)
