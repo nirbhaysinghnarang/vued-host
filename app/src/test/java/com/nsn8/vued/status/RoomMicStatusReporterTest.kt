@@ -43,6 +43,30 @@ class RoomMicStatusReporterTest {
         )
     }
 
+    @Test
+    fun disconnectedMicHasItsOwnAmbientStatus() {
+        assertEquals(
+            RoomMicStatus.MIC_DISCONNECTED,
+            deriveRoomMicStatus(
+                RecorderState.Status(micDisconnected = true),
+                manualMeetingActive = false,
+                nowMs = nowMs,
+            ),
+        )
+    }
+
+    @Test
+    fun disconnectedMicOverridesFreshManualMeetingStatus() {
+        assertEquals(
+            RoomMicStatus.MIC_DISCONNECTED,
+            deriveRoomMicStatus(
+                freshCapture().copy(micDisconnected = true),
+                manualMeetingActive = true,
+                nowMs = nowMs,
+            ),
+        )
+    }
+
     private fun freshCapture() = RecorderState.Status(
         running = true,
         captureReady = true,

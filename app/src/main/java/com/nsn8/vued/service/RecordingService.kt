@@ -43,6 +43,12 @@ import kotlin.math.log10
  * [VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK] is enabled, Android microphone capture
  * backs up unavailable arrays; otherwise UMA availability is required.
  */
+internal fun canStartRecordingCapture(
+    allowBuiltInMicFallback: Boolean,
+    umaConnected: Boolean,
+    usbPermissionGranted: Boolean,
+): Boolean = allowBuiltInMicFallback || (umaConnected && usbPermissionGranted)
+
 class RecordingService : Service() {
 
     @Volatile
@@ -65,7 +71,35 @@ class RecordingService : Service() {
         }
         if (running) return START_STICKY
 
-        startForegroundNotification()
+        if (!isCaptureStartEligible(this)) {
+            RecorderState.markMicDisconnected(captureWasRunning = false)
+            DiagnosticsLogger.warn("recording_start_rejected", mapOf("reason" to "mic_disconnected"))
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+
+        try {
+            startForegroundNotification()
+        } catch (error: SecurityException) {
+            if (!VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && !hasAuthorizedUma(this)) {
+                RecorderState.markMicDisconnected(captureWasRunning = false)
+            } else {
+                RecorderState.update {
+                    it.copy(
+                        running = false,
+                        captureReady = false,
+                        error = error.message ?: "Unable to start recording",
+                    )
+                }
+            }
+            DiagnosticsLogger.warn(
+                "recording_foreground_start_rejected",
+                mapOf("message" to (error.message ?: "")),
+                error,
+            )
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
         acquireWakeLock()
         running = true
         RecorderState.reset()
@@ -412,9 +446,14 @@ class RecordingService : Service() {
         private const val USB_PERMISSION_REQUEST_INTERVAL_MS = 30_000L
         private const val TAG = "VuedRecordingService"
 
-        fun start(context: Context) {
+        fun start(context: Context): Boolean {
+            if (!isCaptureStartEligible(context)) {
+                RecorderState.markMicDisconnected(captureWasRunning = false)
+                return false
+            }
             val intent = Intent(context, RecordingService::class.java)
             context.startForegroundService(intent)
+            return true
         }
 
         fun stop(context: Context) {
@@ -424,6 +463,30 @@ class RecordingService : Service() {
             context.startService(
                 Intent(context, RecordingService::class.java).setAction(ACTION_STOP)
             )
+        }
+
+        internal fun isCaptureStartEligible(context: Context): Boolean {
+            val allowFallback = VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK
+            if (allowFallback) {
+                return canStartRecordingCapture(
+                    allowBuiltInMicFallback = true,
+                    umaConnected = false,
+                    usbPermissionGranted = false,
+                )
+            }
+            val capture = Uma8Capture(context.applicationContext)
+            val device = capture.findDevice()
+            return canStartRecordingCapture(
+                allowBuiltInMicFallback = false,
+                umaConnected = device != null,
+                usbPermissionGranted = device?.let(capture::hasPermission) == true,
+            )
+        }
+
+        private fun hasAuthorizedUma(context: Context): Boolean {
+            val capture = Uma8Capture(context.applicationContext)
+            val device = capture.findDevice() ?: return false
+            return capture.hasPermission(device)
         }
     }
 }

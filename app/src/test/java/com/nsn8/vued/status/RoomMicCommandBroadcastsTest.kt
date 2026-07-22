@@ -26,6 +26,7 @@ class RoomMicCommandBroadcastsTest {
     @Test
     fun muteConfirmsOnlyAfterAmbientCaptureStops() {
         assertTrue(isMicCommandConfirmed(RoomMicCommand.MUTE, "ambient_muted"))
+        assertFalse(isMicCommandConfirmed(RoomMicCommand.MUTE, "mic_disconnected"))
         assertFalse(isMicCommandConfirmed(RoomMicCommand.MUTE, "ambient_recording"))
         assertFalse(isMicCommandConfirmed(RoomMicCommand.MUTE, "meeting_muted"))
     }
@@ -35,5 +36,13 @@ class RoomMicCommandBroadcastsTest {
         assertTrue(isMicCommandConfirmed(RoomMicCommand.UNMUTE, "ambient_recording"))
         assertTrue(isMicCommandConfirmed(RoomMicCommand.UNMUTE, "meeting_recording"))
         assertFalse(isMicCommandConfirmed(RoomMicCommand.UNMUTE, "ambient_muted"))
+        assertFalse(isMicCommandConfirmed(RoomMicCommand.UNMUTE, "mic_disconnected"))
+    }
+
+    @Test
+    fun disconnectedMicRejectsOnlyUnmute() {
+        assertTrue(isMicCommandRejectedAsDisconnected(RoomMicCommand.UNMUTE, "mic_disconnected"))
+        assertFalse(isMicCommandRejectedAsDisconnected(RoomMicCommand.MUTE, "mic_disconnected"))
+        assertFalse(isMicCommandRejectedAsDisconnected(RoomMicCommand.UNMUTE, "ambient_muted"))
     }
 }

@@ -49,6 +49,9 @@ internal fun isMicCommandConfirmed(command: RoomMicCommand, status: String?): Bo
         RoomMicCommand.UNMUTE -> status in setOf("ambient_recording", "meeting_recording")
     }
 
+internal fun isMicCommandRejectedAsDisconnected(command: RoomMicCommand, status: String?): Boolean =
+    command == RoomMicCommand.UNMUTE && status == RoomMicStatus.MIC_DISCONNECTED.apiValue
+
 /** Maintains this tablet's private, app-scoped command subscription. */
 object RoomMicCommandBroadcasts {
     private const val EVENT = "mic_command"
@@ -147,13 +150,16 @@ object RoomMicCommandBroadcasts {
     ) {
         if (message.roomId != assignment.roomId || !markUnseen(message.commandId)) return
 
-        val applied = when (message.command) {
-            RoomMicCommand.MUTE -> MeetingController.runIfNoActiveMeeting {
-                RecordingService.stop(context)
+        val (applied, rejectionReason) = when (message.command) {
+            RoomMicCommand.MUTE -> {
+                val stopped = MeetingController.runIfNoActiveMeeting {
+                    RecordingService.stop(context)
+                }
+                stopped to if (stopped) "" else "local_state_changed"
             }
             RoomMicCommand.UNMUTE -> {
-                RecordingService.start(context)
-                true
+                val started = RecordingService.start(context)
+                started to if (started) "" else "mic_disconnected"
             }
         }
 
@@ -163,7 +169,7 @@ object RoomMicCommandBroadcasts {
                 "roomId" to assignment.roomId,
                 "commandId" to message.commandId,
                 "command" to message.command.apiValue,
-                "reason" to if (applied) "" else "local_state_changed",
+                "reason" to rejectionReason,
             ),
         )
         RoomMicStatusReporter.requestImmediateUpdate()

@@ -133,9 +133,11 @@ import com.nsn8.vued.ui.SpeakerEnrollmentDialog
 import com.nsn8.vued.service.RecorderState
 import com.nsn8.vued.service.RecordingService
 import com.nsn8.vued.status.RoomMicCommand
+import com.nsn8.vued.status.RoomMicStatus
 import com.nsn8.vued.status.RoomMicStatusBroadcast
 import com.nsn8.vued.status.RoomMicStatusBroadcasts
 import com.nsn8.vued.status.isMicCommandConfirmed
+import com.nsn8.vued.status.isMicCommandRejectedAsDisconnected
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
 import com.nsn8.vued.update.SelfUpdateManager
@@ -248,6 +250,9 @@ class MainActivity : ComponentActivity() {
                     pendingKioskAfterUsbPermission = false
                     pendingRecorderStartAfterUsbPermission = false
                     pendingRecorderStartRequiresResumeState = false
+                    if (granted) {
+                        dismissMicDisconnectedIfUmaDetected(device, trigger = "usb_permission_granted")
+                    }
                     if (granted && shouldStartRecorder) {
                         if (requiresResumeState) {
                             resumeRecorderAfterUmaReconnect("usb_permission_granted", device)
@@ -510,11 +515,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun dismissMicDisconnectedIfUmaDetected(device: UsbDevice?, trigger: String) {
-        if (!device.matchesUmaSafely()) return
+        val umaDevice = device?.takeIf { it.matchesUmaSafely() } ?: return
+        if (!Uma8Capture(this).hasPermission(umaDevice)) {
+            logKioskUsbEvent(
+                "kiosk_usb_detected_waiting_for_permission",
+                umaDevice,
+                mapOf("trigger" to trigger),
+            )
+            return
+        }
         val status = RecorderState.state.value
         if (!status.micDisconnected) return
         RecorderState.markMicReconnected()
-        logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", device, mapOf("trigger" to trigger))
+        logKioskUsbEvent("kiosk_usb_detected_dismissed_disconnect", umaDevice, mapOf("trigger" to trigger))
     }
 
     private fun hideStatusBar() {
@@ -1652,6 +1665,47 @@ private data class PendingMicCommand(
     val token: Long,
 )
 
+internal data class MicCommandError(
+    val roomId: String,
+    val message: String,
+    val clearsWhenMicReconnects: Boolean = false,
+)
+
+internal fun micCommandFailureMessage(
+    command: RoomMicCommand,
+    status: String?,
+    roomName: String,
+): String? = if (isMicCommandRejectedAsDisconnected(command, status)) {
+    "$roomName's microphone is disconnected."
+} else {
+    null
+}
+
+internal fun messageForDisconnectedApiFailure(
+    command: RoomMicCommand,
+    apiMessage: String?,
+    roomName: String,
+): String? = if (
+    command == RoomMicCommand.UNMUTE &&
+    apiMessage?.contains("microphone is disconnected", ignoreCase = true) == true
+) {
+    micCommandFailureMessage(
+        command = command,
+        status = RoomMicStatus.MIC_DISCONNECTED.apiValue,
+        roomName = roomName,
+    )
+} else {
+    null
+}
+
+internal fun shouldClearMicCommandError(error: MicCommandError, room: OrgApi.Room): Boolean =
+    error.clearsWhenMicReconnects &&
+        error.roomId == room.id &&
+        room.status != RoomMicStatus.MIC_DISCONNECTED.apiValue
+
+internal fun isMicDisconnectedStatus(status: String?): Boolean =
+    status == RoomMicStatus.MIC_DISCONNECTED.apiValue
+
 private fun isMicOnline(room: OrgApi.Room, nowMs: Long): Boolean {
     val updatedAtMs = room.statusUpdatedAt?.times(1_000.0)?.toLong()
     return updatedAtMs != null &&
@@ -1686,12 +1740,45 @@ internal fun visibleMicRooms(
     room.status != null && room.id != currentRoomId
 }
 
+private fun isNewerMicStatus(existingTimestamp: Double?, candidateTimestamp: Double?): Boolean =
+    when {
+        existingTimestamp == null -> true
+        candidateTimestamp == null -> false
+        else -> candidateTimestamp > existingTimestamp
+    }
+
+internal fun mergeMicStatusSnapshot(
+    rooms: List<OrgApi.Room>,
+    snapshot: List<OrgApi.Room>,
+    currentRoomId: String?,
+): List<OrgApi.Room> = visibleMicRooms(snapshot, currentRoomId).map { candidate ->
+    val existing = rooms.firstOrNull { it.id == candidate.id }
+    if (existing != null && !isNewerMicStatus(existing.statusUpdatedAt, candidate.statusUpdatedAt)) {
+        candidate.copy(
+            status = existing.status,
+            statusUpdatedAt = existing.statusUpdatedAt,
+        )
+    } else {
+        candidate
+    }
+}
+
+internal fun isMicStatusBroadcastNewer(
+    rooms: List<OrgApi.Room>,
+    update: RoomMicStatusBroadcast,
+    currentRoomId: String?,
+): Boolean {
+    if (update.roomId == currentRoomId) return false
+    val existing = rooms.firstOrNull { it.id == update.roomId }
+    return existing == null || isNewerMicStatus(existing.statusUpdatedAt, update.statusUpdatedAt)
+}
+
 internal fun mergeMicStatusBroadcast(
     rooms: List<OrgApi.Room>,
     update: RoomMicStatusBroadcast,
     currentRoomId: String?,
 ): List<OrgApi.Room> {
-    if (update.roomId == currentRoomId) return rooms
+    if (!isMicStatusBroadcastNewer(rooms, update, currentRoomId)) return rooms
     val updatedRoom = OrgApi.Room(
         id = update.roomId,
         microphoneId = update.microphoneId,
@@ -1716,7 +1803,7 @@ private fun MicStatusesDrawer(
     var rooms by remember { mutableStateOf<List<OrgApi.Room>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
-    var commandError by remember { mutableStateOf<String?>(null) }
+    var commandError by remember { mutableStateOf<MicCommandError?>(null) }
     var resolvedOrgId by remember(initialOrgId) {
         mutableStateOf(initialOrgId?.takeIf { it.isNotBlank() })
     }
@@ -1749,7 +1836,18 @@ private fun MicStatusesDrawer(
             } catch (failure: Throwable) {
                 if (pendingCommands[room.id]?.token == pending.token) {
                     pendingCommands = pendingCommands - room.id
-                    commandError = failure.message ?: "Could not send microphone command."
+                    val disconnectedFailure = messageForDisconnectedApiFailure(
+                        pending.command,
+                        failure.message,
+                        room.displayName,
+                    )
+                    commandError = MicCommandError(
+                        roomId = room.id,
+                        message = disconnectedFailure
+                            ?: failure.message
+                            ?: "Could not send microphone command.",
+                        clearsWhenMicReconnects = disconnectedFailure != null,
+                    )
                 }
                 return@launch
             }
@@ -1757,7 +1855,10 @@ private fun MicStatusesDrawer(
             delay(MIC_COMMAND_CONFIRM_TIMEOUT_MS)
             if (pendingCommands[room.id]?.token == pending.token) {
                 pendingCommands = pendingCommands - room.id
-                commandError = "${room.displayName} did not confirm the command."
+                commandError = MicCommandError(
+                    roomId = room.id,
+                    message = "${room.displayName} did not confirm the command.",
+                )
             }
         }
     }
@@ -1775,11 +1876,32 @@ private fun MicStatusesDrawer(
         suspend fun refreshSnapshot() {
             runCatching { OrgApi.getRooms(orgId) }
                 .onSuccess { fetched ->
-                    val visible = visibleMicRooms(fetched, currentRoomId)
+                    val visible = mergeMicStatusSnapshot(rooms, fetched, currentRoomId)
                     rooms = visible
-                    pendingCommands = pendingCommands.filter { (roomId, pending) ->
-                        val status = visible.firstOrNull { it.id == roomId }?.status
-                        !isMicCommandConfirmed(pending.command, status)
+                    val unresolved = pendingCommands.toMutableMap()
+                    pendingCommands.forEach { (roomId, pending) ->
+                        val room = visible.firstOrNull { it.id == roomId } ?: return@forEach
+                        val failureMessage = micCommandFailureMessage(
+                            pending.command,
+                            room.status,
+                            room.displayName,
+                        )
+                        if (failureMessage != null) {
+                            unresolved.remove(roomId)
+                            commandError = MicCommandError(
+                                roomId = roomId,
+                                message = failureMessage,
+                                clearsWhenMicReconnects = true,
+                            )
+                        } else if (isMicCommandConfirmed(pending.command, room.status)) {
+                            unresolved.remove(roomId)
+                        }
+                    }
+                    pendingCommands = unresolved
+                    commandError?.let { currentError ->
+                        if (visible.any { shouldClearMicCommandError(currentError, it) }) {
+                            commandError = null
+                        }
                     }
                     error = null
                 }
@@ -1796,10 +1918,31 @@ private fun MicStatusesDrawer(
             RoomMicStatusBroadcasts.listen(
                 orgId = orgId,
                 onConnected = { refreshSnapshot() },
-                onStatus = { update ->
+                onStatus = statusUpdate@{ update ->
+                    if (!isMicStatusBroadcastNewer(rooms, update, currentRoomId)) {
+                        return@statusUpdate
+                    }
                     rooms = mergeMicStatusBroadcast(rooms, update, currentRoomId)
+                    commandError?.let { currentError ->
+                        val updatedRoom = rooms.firstOrNull { it.id == update.roomId }
+                        if (updatedRoom != null && shouldClearMicCommandError(currentError, updatedRoom)) {
+                            commandError = null
+                        }
+                    }
                     pendingCommands[update.roomId]?.let { pending ->
-                        if (isMicCommandConfirmed(pending.command, update.status)) {
+                        val failureMessage = micCommandFailureMessage(
+                            pending.command,
+                            update.status,
+                            update.displayName,
+                        )
+                        if (failureMessage != null) {
+                            pendingCommands = pendingCommands - update.roomId
+                            commandError = MicCommandError(
+                                roomId = update.roomId,
+                                message = failureMessage,
+                                clearsWhenMicReconnects = true,
+                            )
+                        } else if (isMicCommandConfirmed(pending.command, update.status)) {
                             pendingCommands = pendingCommands - update.roomId
                         }
                     }
@@ -1929,6 +2072,7 @@ private fun MicStatusesDrawer(
                                 else -> {
                                     rooms.forEach { room ->
                                         val online = isMicOnline(room, nowMs)
+                                        val disconnected = isMicDisconnectedStatus(room.status)
                                         val recording = room.status in
                                             setOf("ambient_recording", "meeting_recording")
                                         val muted = room.status in setOf("ambient_muted", "meeting_muted")
@@ -1963,13 +2107,17 @@ private fun MicStatusesDrawer(
                                                 if (room.status == "meeting_recording") {
                                                     MeetingRecordingDot()
                                                 }
-                                                AudioMuteButton(
-                                                    unmuted = recording,
-                                                    enabled = muteEnabled && pending == null,
-                                                    buttonSize = 46.dp,
-                                                    iconSize = 25.dp,
-                                                    onClick = { dispatchCommand(room, muteCommand) },
-                                                )
+                                                if (disconnected) {
+                                                    MicDisconnectedIndicator()
+                                                } else {
+                                                    AudioMuteButton(
+                                                        unmuted = recording,
+                                                        enabled = muteEnabled && pending == null,
+                                                        buttonSize = 46.dp,
+                                                        iconSize = 25.dp,
+                                                        onClick = { dispatchCommand(room, muteCommand) },
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -1982,7 +2130,7 @@ private fun MicStatusesDrawer(
                                     }
                                     if (commandError != null) {
                                         Text(
-                                            text = commandError.orEmpty(),
+                                            text = commandError?.message.orEmpty(),
                                             color = VuedDanger,
                                             fontSize = 12.sp,
                                         )
@@ -2167,6 +2315,36 @@ private fun AudioMuteButton(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+internal fun MicDisconnectedIndicator(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .size(46.dp)
+            .semantics { contentDescription = "Microphone disconnected" },
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(30.dp)) {
+            val stroke = size.minDimension * 0.09f
+            drawCircle(
+                color = VuedDanger,
+                style = Stroke(width = stroke),
+            )
+            drawLine(
+                color = VuedDanger,
+                start = Offset(size.width * 0.5f, size.height * 0.24f),
+                end = Offset(size.width * 0.5f, size.height * 0.58f),
+                strokeWidth = stroke,
+                cap = StrokeCap.Round,
+            )
+            drawCircle(
+                color = VuedDanger,
+                radius = stroke * 0.62f,
+                center = Offset(size.width * 0.5f, size.height * 0.74f),
+            )
         }
     }
 }
