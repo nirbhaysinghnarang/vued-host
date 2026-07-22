@@ -114,6 +114,51 @@ class MicStatusBroadcastUiTest {
     }
 
     @Test
+    fun staleHeartbeatUsesUnavailableIndicator() {
+        val nowMs = 200_000L
+        val room = OrgApi.Room(
+            id = "room-2",
+            microphoneId = "mic-2",
+            displayName = "Conference Room",
+            status = "ambient_recording",
+            statusUpdatedAt = (nowMs - 60_001L) / 1_000.0,
+        )
+
+        assertEquals(false, isMicOnline(room, nowMs))
+        assertEquals(true, shouldShowMicUnavailableIndicator(room, nowMs))
+    }
+
+    @Test
+    fun freshDisconnectedMicUsesUnavailableIndicator() {
+        val nowMs = 200_000L
+        val room = OrgApi.Room(
+            id = "room-2",
+            microphoneId = "mic-2",
+            displayName = "Conference Room",
+            status = "mic_disconnected",
+            statusUpdatedAt = nowMs / 1_000.0,
+        )
+
+        assertEquals(true, isMicOnline(room, nowMs))
+        assertEquals(true, shouldShowMicUnavailableIndicator(room, nowMs))
+    }
+
+    @Test
+    fun freshConnectedMicKeepsItsStatusControl() {
+        val nowMs = 200_000L
+        val room = OrgApi.Room(
+            id = "room-2",
+            microphoneId = "mic-2",
+            displayName = "Conference Room",
+            status = "ambient_recording",
+            statusUpdatedAt = nowMs / 1_000.0,
+        )
+
+        assertEquals(true, isMicOnline(room, nowMs))
+        assertEquals(false, shouldShowMicUnavailableIndicator(room, nowMs))
+    }
+
+    @Test
     fun disconnectedStatusReturnsFriendlyUnmuteFailure() {
         assertEquals(true, isMicDisconnectedStatus("mic_disconnected"))
         assertEquals(false, isMicDisconnectedStatus("ambient_muted"))

@@ -1379,12 +1379,13 @@ private fun ProdRecorderMainScreen() {
     }
     val showMicDisconnected = !VuedConfig.ALLOW_BUILT_IN_MIC_FALLBACK && status.micDisconnected
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(VuedBackground)
-            .padding(horizontal = 36.dp, vertical = 20.dp),
-    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(VuedBackground)
+                .padding(horizontal = 36.dp, vertical = 20.dp),
+        ) {
         if (roomName.isNotBlank()) {
             Text(
                 text = roomName,
@@ -1567,10 +1568,18 @@ private fun ProdRecorderMainScreen() {
             },
         )
 
+            if (!showMicStatuses) {
+                MicStatusEdgeSwipeDetector(
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd),
+                    onOpen = { showMicStatuses = true },
+                )
+            }
+        }
+
         if (!showMicStatuses) {
-            MicStatusEdgeSwipeDetector(
-                modifier = Modifier
-                    .align(Alignment.CenterEnd),
+            MicStatusPhysicalEdgeSwipeDetector(
+                modifier = Modifier.align(Alignment.CenterEnd),
                 onOpen = { showMicStatuses = true },
             )
         }
@@ -1597,6 +1606,32 @@ private fun ProdRecorderMainScreen() {
             },
         )
     }
+}
+
+@Composable
+internal fun MicStatusPhysicalEdgeSwipeDetector(
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit,
+) {
+    val thresholdPx = with(LocalDensity.current) { 36.dp.toPx() }
+    Spacer(
+        modifier = modifier
+            .fillMaxHeight()
+            .width(36.dp)
+            .semantics { contentDescription = "Swipe left to open microphone statuses" }
+            .pointerInput(onOpen, thresholdPx) {
+                var dragDistance = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { dragDistance = 0f },
+                    onHorizontalDrag = { _, dragAmount -> dragDistance += dragAmount },
+                    onDragEnd = {
+                        if (dragDistance <= -thresholdPx) onOpen()
+                        dragDistance = 0f
+                    },
+                    onDragCancel = { dragDistance = 0f },
+                )
+            },
+    )
 }
 
 @Composable
@@ -1706,11 +1741,14 @@ internal fun shouldClearMicCommandError(error: MicCommandError, room: OrgApi.Roo
 internal fun isMicDisconnectedStatus(status: String?): Boolean =
     status == RoomMicStatus.MIC_DISCONNECTED.apiValue
 
-private fun isMicOnline(room: OrgApi.Room, nowMs: Long): Boolean {
+internal fun isMicOnline(room: OrgApi.Room, nowMs: Long): Boolean {
     val updatedAtMs = room.statusUpdatedAt?.times(1_000.0)?.toLong()
     return updatedAtMs != null &&
         nowMs - updatedAtMs <= MIC_STATUS_OFFLINE_AFTER_MS
 }
+
+internal fun shouldShowMicUnavailableIndicator(room: OrgApi.Room, nowMs: Long): Boolean =
+    !isMicOnline(room, nowMs) || isMicDisconnectedStatus(room.status)
 
 @Composable
 private fun MeetingRecordingDot() {
@@ -2072,7 +2110,7 @@ private fun MicStatusesDrawer(
                                 else -> {
                                     rooms.forEach { room ->
                                         val online = isMicOnline(room, nowMs)
-                                        val disconnected = isMicDisconnectedStatus(room.status)
+                                        val unavailable = shouldShowMicUnavailableIndicator(room, nowMs)
                                         val recording = room.status in
                                             setOf("ambient_recording", "meeting_recording")
                                         val muted = room.status in setOf("ambient_muted", "meeting_muted")
@@ -2104,11 +2142,17 @@ private fun MicStatusesDrawer(
                                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                                 verticalAlignment = Alignment.CenterVertically,
                                             ) {
-                                                if (room.status == "meeting_recording") {
+                                                if (online && room.status == "meeting_recording") {
                                                     MeetingRecordingDot()
                                                 }
-                                                if (disconnected) {
-                                                    MicDisconnectedIndicator()
+                                                if (unavailable) {
+                                                    MicDisconnectedIndicator(
+                                                        contentDescription = if (online) {
+                                                            "Microphone disconnected"
+                                                        } else {
+                                                            "Tablet offline"
+                                                        },
+                                                    )
                                                 } else {
                                                     AudioMuteButton(
                                                         unmuted = recording,
@@ -2320,11 +2364,14 @@ private fun AudioMuteButton(
 }
 
 @Composable
-internal fun MicDisconnectedIndicator(modifier: Modifier = Modifier) {
+internal fun MicDisconnectedIndicator(
+    modifier: Modifier = Modifier,
+    contentDescription: String = "Microphone disconnected",
+) {
     Box(
         modifier = modifier
             .size(46.dp)
-            .semantics { contentDescription = "Microphone disconnected" },
+            .semantics { this.contentDescription = contentDescription },
         contentAlignment = Alignment.Center,
     ) {
         Canvas(Modifier.size(30.dp)) {
