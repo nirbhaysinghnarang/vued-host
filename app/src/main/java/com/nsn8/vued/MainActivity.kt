@@ -1158,6 +1158,7 @@ private fun ProdRecorderMainScreen() {
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showEnroll by remember { mutableStateOf(false) }
     var showMicStatuses by remember { mutableStateOf(false) }
+    var hasMultipleOrganizationMics by remember { mutableStateOf(false) }
     var wifiStatus by remember { mutableStateOf(currentWifiStatus(context)) }
     var batteryStatus by remember { mutableStateOf(currentBatteryStatus(context)) }
     var micArrayPresent by remember { mutableStateOf(isUmaMicPresent(context)) }
@@ -1268,7 +1269,9 @@ private fun ProdRecorderMainScreen() {
             val orgId = assignedOrgId?.takeIf { it.isNotBlank() }
                 ?: OrgApi.getOrgs().firstOrNull()?.id
                 ?: return@runCatching
-            OrgApi.getRooms(orgId).firstOrNull { it.id == assignedRoomId }?.let { room ->
+            val organizationRooms = OrgApi.getRooms(orgId)
+            hasMultipleOrganizationMics = hasMultipleOrganizationMicrophones(organizationRooms)
+            organizationRooms.firstOrNull { it.id == assignedRoomId }?.let { room ->
                 if (room.displayName.isNotBlank() && room.displayName != roomName) {
                     RoomConfig.set(context, room.id, room.displayName, orgId, room.microphoneId)
                     roomName = room.displayName
@@ -1569,7 +1572,7 @@ private fun ProdRecorderMainScreen() {
 
         }
 
-        if (!showMicStatuses) {
+        if (hasMultipleOrganizationMics && !showMicStatuses) {
             MicStatusPhysicalEdgeSwipeDetector(
                 modifier = Modifier.align(Alignment.CenterEnd),
                 onOpen = { showMicStatuses = true },
@@ -1584,7 +1587,7 @@ private fun ProdRecorderMainScreen() {
     if (showEnroll) {
         ProdSpeakerEnrollmentDialog(onDismiss = { showEnroll = false })
     }
-    if (showMicStatuses) {
+    if (hasMultipleOrganizationMics && showMicStatuses) {
         MicStatusesDrawer(
             initialOrgId = assignedOrgId,
             currentRoomId = assignedRoomId,
@@ -1779,6 +1782,14 @@ internal fun visibleMicRooms(
 ): List<OrgApi.Room> = rooms.filter { room ->
     room.status != null && room.id != currentRoomId
 }
+
+internal fun hasMultipleOrganizationMicrophones(rooms: List<OrgApi.Room>): Boolean =
+    rooms.asSequence()
+        .map { it.microphoneId.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .take(2)
+        .count() > 1
 
 private fun isNewerMicStatus(existingTimestamp: Double?, candidateTimestamp: Double?): Boolean =
     when {
