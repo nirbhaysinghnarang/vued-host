@@ -6,6 +6,7 @@ import com.nsn8.vued.meeting.MeetingController
 import com.nsn8.vued.net.OrgApi
 import com.nsn8.vued.net.RoomConfig
 import com.nsn8.vued.service.RecorderState
+import com.nsn8.vued.service.RecordingService
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -19,6 +20,7 @@ enum class RoomMicStatus(val apiValue: String) {
     AMBIENT_MUTED("ambient_muted"),
     MEETING_RECORDING("meeting_recording"),
     MEETING_MUTED("meeting_muted"),
+    MIC_DISCONNECTED("mic_disconnected"),
 }
 
 internal fun deriveRoomMicStatus(
@@ -28,6 +30,7 @@ internal fun deriveRoomMicStatus(
 ): RoomMicStatus {
     val captureActive = recorder.running && recorder.hasFreshAudio(nowMs)
     return when {
+        recorder.micDisconnected -> RoomMicStatus.MIC_DISCONNECTED
         manualMeetingActive && captureActive -> RoomMicStatus.MEETING_RECORDING
         manualMeetingActive -> RoomMicStatus.MEETING_MUTED
         captureActive -> RoomMicStatus.AMBIENT_RECORDING
@@ -80,6 +83,9 @@ object RoomMicStatusReporter {
     }
 
     private suspend fun publishCurrentStatus(context: Context) {
+        if (!RecordingService.isCaptureStartEligible(context)) {
+            RecorderState.markMicDisconnected()
+        }
         val orgId = RoomConfig.orgId(context)?.trim().orEmpty()
         val roomId = RoomConfig.roomId(context)?.trim().orEmpty()
         if (orgId.isEmpty() || roomId.isEmpty()) return
