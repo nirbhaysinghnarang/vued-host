@@ -1557,8 +1557,7 @@ private fun ProdRecorderMainScreen() {
         if (!showMicStatuses) {
             MicStatusEdgeSwipeDetector(
                 modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .offset(x = 36.dp),
+                    .align(Alignment.CenterEnd),
                 onOpen = { showMicStatuses = true },
             )
         }
