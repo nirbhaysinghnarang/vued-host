@@ -136,7 +136,6 @@ import com.nsn8.vued.status.RoomMicCommand
 import com.nsn8.vued.status.RoomMicStatus
 import com.nsn8.vued.status.RoomMicStatusBroadcast
 import com.nsn8.vued.status.RoomMicStatusBroadcasts
-import com.nsn8.vued.status.isMicCommandConfirmed
 import com.nsn8.vued.status.isMicCommandRejectedAsDisconnected
 import com.nsn8.vued.ui.LoginScreen
 import com.nsn8.vued.ui.theme.VuedTheme
@@ -1568,17 +1567,14 @@ private fun ProdRecorderMainScreen() {
             },
         )
 
-            if (!showMicStatuses) {
-                MicStatusEdgeSwipeDetector(
-                    modifier = Modifier
-                        .align(Alignment.CenterEnd),
-                    onOpen = { showMicStatuses = true },
-                )
-            }
         }
 
         if (!showMicStatuses) {
             MicStatusPhysicalEdgeSwipeDetector(
+                modifier = Modifier.align(Alignment.CenterEnd),
+                onOpen = { showMicStatuses = true },
+            )
+            MicStatusEdgeSwipeDetector(
                 modifier = Modifier.align(Alignment.CenterEnd),
                 onOpen = { showMicStatuses = true },
             )
@@ -1697,6 +1693,7 @@ private fun MicStatusEdgeSwipeDetector(
 
 private data class PendingMicCommand(
     val command: RoomMicCommand,
+    val statusAtDispatch: String?,
     val token: Long,
 )
 
@@ -1740,6 +1737,11 @@ internal fun shouldClearMicCommandError(error: MicCommandError, room: OrgApi.Roo
 
 internal fun isMicDisconnectedStatus(status: String?): Boolean =
     status == RoomMicStatus.MIC_DISCONNECTED.apiValue
+
+internal fun hasMicStatusChangedSinceDispatch(
+    statusAtDispatch: String?,
+    currentStatus: String?,
+): Boolean = currentStatus != statusAtDispatch
 
 internal fun isMicOnline(room: OrgApi.Room, nowMs: Long): Boolean {
     val updatedAtMs = room.statusUpdatedAt?.times(1_000.0)?.toLong()
@@ -1865,7 +1867,11 @@ private fun MicStatusesDrawer(
     fun dispatchCommand(room: OrgApi.Room, command: RoomMicCommand) {
         val orgId = resolvedOrgId
         if (orgId.isNullOrBlank() || pendingCommands.containsKey(room.id)) return
-        val pending = PendingMicCommand(command, System.nanoTime())
+        val pending = PendingMicCommand(
+            command = command,
+            statusAtDispatch = room.status,
+            token = System.nanoTime(),
+        )
         pendingCommands = pendingCommands + (room.id to pending)
         commandError = null
         scope.launch {
@@ -1931,7 +1937,9 @@ private fun MicStatusesDrawer(
                                 message = failureMessage,
                                 clearsWhenMicReconnects = true,
                             )
-                        } else if (isMicCommandConfirmed(pending.command, room.status)) {
+                        } else if (
+                            hasMicStatusChangedSinceDispatch(pending.statusAtDispatch, room.status)
+                        ) {
                             unresolved.remove(roomId)
                         }
                     }
@@ -1980,7 +1988,9 @@ private fun MicStatusesDrawer(
                                 message = failureMessage,
                                 clearsWhenMicReconnects = true,
                             )
-                        } else if (isMicCommandConfirmed(pending.command, update.status)) {
+                        } else if (
+                            hasMicStatusChangedSinceDispatch(pending.statusAtDispatch, update.status)
+                        ) {
                             pendingCommands = pendingCommands - update.roomId
                         }
                     }
@@ -2145,7 +2155,13 @@ private fun MicStatusesDrawer(
                                                 if (online && room.status == "meeting_recording") {
                                                     MeetingRecordingDot()
                                                 }
-                                                if (unavailable) {
+                                                if (pending != null) {
+                                                    MicCommandLoadingIndicator(
+                                                        unmuted = recording,
+                                                        contentDescription =
+                                                            "Updating ${room.displayName} microphone",
+                                                    )
+                                                } else if (unavailable) {
                                                     MicDisconnectedIndicator(
                                                         contentDescription = if (online) {
                                                             "Microphone disconnected"
@@ -2156,7 +2172,7 @@ private fun MicStatusesDrawer(
                                                 } else {
                                                     AudioMuteButton(
                                                         unmuted = recording,
-                                                        enabled = muteEnabled && pending == null,
+                                                        enabled = muteEnabled,
                                                         buttonSize = 46.dp,
                                                         iconSize = 25.dp,
                                                         onClick = { dispatchCommand(room, muteCommand) },
@@ -2360,6 +2376,29 @@ private fun AudioMuteButton(
                 }
             }
         }
+    }
+}
+
+@Composable
+internal fun MicCommandLoadingIndicator(
+    unmuted: Boolean,
+    contentDescription: String = "Updating microphone",
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .size(46.dp)
+            .clip(CircleShape)
+            .background(if (unmuted) VuedSuccess else VuedDanger),
+        contentAlignment = Alignment.Center,
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier
+                .size(25.dp)
+                .semantics { this.contentDescription = contentDescription },
+            color = Color.White,
+            strokeWidth = 2.5.dp,
+        )
     }
 }
 

@@ -159,6 +159,22 @@ class MicStatusBroadcastUiTest {
     }
 
     @Test
+    fun pendingCommandResolvesOnlyAfterStatusValueChanges() {
+        assertEquals(
+            false,
+            hasMicStatusChangedSinceDispatch("ambient_muted", "ambient_muted"),
+        )
+        assertEquals(
+            true,
+            hasMicStatusChangedSinceDispatch("ambient_muted", "ambient_recording"),
+        )
+        assertEquals(
+            true,
+            hasMicStatusChangedSinceDispatch("ambient_muted", "meeting_muted"),
+        )
+    }
+
+    @Test
     fun disconnectedStatusReturnsFriendlyUnmuteFailure() {
         assertEquals(true, isMicDisconnectedStatus("mic_disconnected"))
         assertEquals(false, isMicDisconnectedStatus("ambient_muted"))
