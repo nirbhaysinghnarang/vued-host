@@ -23,4 +23,19 @@ class MicDisconnectedIndicatorTest {
             .assertIsDisplayed()
             .assertHasNoClickAction()
     }
+
+    @Test
+    fun pendingCommandIndicatorIsVisibleAndNotClickable() {
+        composeRule.setContent {
+            MicCommandLoadingIndicator(
+                unmuted = false,
+                contentDescription = "Updating Conference Room microphone",
+            )
+        }
+
+        composeRule
+            .onNodeWithContentDescription("Updating Conference Room microphone")
+            .assertIsDisplayed()
+            .assertHasNoClickAction()
+    }
 }
