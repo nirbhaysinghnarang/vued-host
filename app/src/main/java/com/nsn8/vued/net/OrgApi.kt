@@ -105,6 +105,14 @@ object OrgApi {
         )
     }
 
+    /** Ask the API to transiently broadcast a command to the assigned tablet. */
+    suspend fun sendRoomMicCommand(orgId: String, roomId: String, command: String) {
+        postJson(
+            "/api/v1/orgs/$orgId/rooms/$roomId/mic-command",
+            JSONObject().put("command", command),
+        )
+    }
+
     private suspend fun postJson(path: String, body: JSONObject): JSONObject = withContext(Dispatchers.IO) {
         val token = VuedAuth.currentAccessTokenReady() ?: throw VuedApi.ApiException("not signed in")
         val request = Request.Builder()
